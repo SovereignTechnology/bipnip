@@ -46,8 +46,10 @@ await page.screenshot({ path: garagePng });
 let garageKeyMode = false;
 try {
   await page.getByRole('button', { name: /garage key/i }).first().click({ timeout: 15_000 });
-  garageKeyMode = true;
-  await page.waitForTimeout(3_000);
+  // "Change Robot Generation Mode?" — confirming clears the (empty) local garage and switches mode.
+  await page.getByRole('button', { name: /confirm and restart/i }).click({ timeout: 15_000 });
+  await page.waitForTimeout(5_000);
+  garageKeyMode = !(await page.getByText(/You are in Legacy mode/i).count());
 } catch {
   // keep going: the Offers click below reports whether the book became reachable
 }
