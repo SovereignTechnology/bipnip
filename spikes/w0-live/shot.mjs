@@ -41,6 +41,16 @@ await page.goto(`${origin}/`, { waitUntil: 'domcontentloaded', timeout: 60_000 }
 await page.waitForTimeout(15_000);
 await page.screenshot({ path: garagePng });
 
+// RoboSats starts in Legacy garage mode, where the Offers route redirects to the garage. Switching the
+// toggle to Garage Key mode is a UI mode only: no key, no robot, nothing sent to a coordinator.
+let garageKeyMode = false;
+try {
+  await page.getByRole('button', { name: /garage key/i }).first().click({ timeout: 15_000 });
+  garageKeyMode = true;
+  await page.waitForTimeout(3_000);
+} catch {
+  // keep going: the Offers click below reports whether the book became reachable
+}
 const offersTab = page.getByRole('button', { name: /offers/i }).or(page.getByRole('tab', { name: /offers/i }));
 let clicked = false;
 try {
@@ -67,6 +77,7 @@ await page.screenshot({ path: offersPng });
 
 console.log(
   JSON.stringify({
+    garage_key_mode: garageKeyMode,
     clicked_offers: clicked,
     rows,
     seconds: Math.round((Date.now() - started) / 1000),
