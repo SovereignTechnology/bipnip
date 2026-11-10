@@ -316,6 +316,9 @@ async fn unknown_routes_and_traversal_are_404() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, "console.log(1)");
     assert!(hv(&h, "content-type").starts_with("text/javascript"));
+    // A worker script under a COEP page must carry COEP itself, or Chromium blocks it.
+    assert_eq!(hv(&h, "cross-origin-embedder-policy"), "require-corp");
+    assert_eq!(hv(&h, "cross-origin-resource-policy"), "same-origin");
 }
 
 #[tokio::test]

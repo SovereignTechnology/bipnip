@@ -107,6 +107,12 @@ pub fn common_headers(headers: &mut HeaderMap) {
         "cross-origin-resource-policy",
         HeaderValue::from_static("same-origin"),
     );
+    // On every response, not only pages: a dedicated worker created by a COEP page (RoboSats builds
+    // robot avatars in one) is blocked unless its own script carries a matching COEP.
+    headers.insert(
+        "cross-origin-embedder-policy",
+        HeaderValue::from_static("require-corp"),
+    );
     headers.insert(
         "permissions-policy",
         HeaderValue::from_static(
