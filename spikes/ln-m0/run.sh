@@ -166,8 +166,12 @@ LDK_PID=$!
 wait_until 120 test -s "$W/dave/node_id" || { log "ldk-node did not start"; tail -30 "$W/dave/ldk.log"; exit 1; }
 DAVE=$(cat "$W/dave/node_id")
 cat "$W/dave/vector.json" >> "$OUT/vectors.jsonl"; echo >> "$OUT/vectors.jsonl"
-lnc alice connect "$DAVE@127.0.0.1:9738" >/dev/null
-lnc alice openchannel --node_key "$DAVE" --local_amt 500000 >/dev/null
+# ldk-node refuses inbound *announced* channels unless it announces itself (alias + addresses), so
+# this channel is private, as a lease to an unannounced node would be.
+lnc alice connect "$DAVE@127.0.0.1:9738" >/dev/null || true
+if ! lnc alice openchannel --node_key "$DAVE" --local_amt 500000 --private > "$W/open-dave.json" 2>&1; then
+  result "ldk-node accepts a channel from LND" fail "$(head -c 300 "$W/open-dave.json")"
+fi
 mine 6
 if wait_until 180 test -s "$W/dave/invoice"; then
   (lnc alice payinvoice --force "$(cat "$W/dave/invoice")" > "$W/pay-dave.json" 2>&1 || true) &
