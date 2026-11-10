@@ -1,0 +1,12 @@
+/target
+**/*.rs.bk
+.cargo-home/
+*.swp
+.DS_Store
+# Never commit seeds, macaroons, runes, cookies, preimages or keys.
+*.macaroon
+*.rune
+.cookie
+*.seed
+*.nsec
+settings.toml

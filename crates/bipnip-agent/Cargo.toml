@@ -1,0 +1,19 @@
+[package]
+name = "bipnip-agent"
+description = "The bipnip agent: runs next to a node runner's Lightning node, holds its keys, trades fiat and liquidity"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "bipnip-agent"
+path = "src/main.rs"
+
+[dependencies]
+bipnip-ln.workspace = true
+
+[lints]
+workspace = true

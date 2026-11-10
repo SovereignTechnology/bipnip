@@ -1,0 +1,37 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/bipnip-ln",
+    "crates/bipnip-agent",
+    "crates/bipnip-cli",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+# Matches the Mostro fork's toolchain (bipnipd builds bipnip-ln too).
+rust-version = "1.94"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/SovereignTechnology/bipnip"
+publish = false
+
+[workspace.dependencies]
+bipnip-ln = { path = "crates/bipnip-ln" }
+async-trait = "0.1.83"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unexpected_cfgs = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unwrap_used = "deny"
+expect_used = "warn"
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"
