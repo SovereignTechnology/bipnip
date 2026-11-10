@@ -13,10 +13,16 @@ const csp = [];
 const failed = [];
 const errors = [];
 const offOrigin = [];
+const non2xx = [];
+const consoleAll = [];
 const origin = new URL(url).origin;
 
+page.on('response', (r) => {
+  if (r.status() >= 300) non2xx.push(`${r.status()} ${new URL(r.url()).pathname}`);
+});
 page.on('console', (m) => {
   const t = m.text();
+  consoleAll.push(`${m.type()}: ${t.slice(0, 160)}`);
   if (/Content[- ]Security[- ]Policy|Refused to/i.test(t)) csp.push(t.slice(0, 300));
   else if (m.type() === 'error') errors.push(t.slice(0, 200));
 });
@@ -50,6 +56,8 @@ console.log(
     off_origin: offOrigin.slice(0, 10),
     failed: failed.slice(0, 20),
     errors: errors.slice(0, 10),
+    non2xx: non2xx.slice(0, 20),
+    console: consoleAll.slice(0, 25),
   }),
 );
 await browser.close();
