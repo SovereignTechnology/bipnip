@@ -116,8 +116,8 @@ pub fn common_headers(headers: &mut HeaderMap) {
     headers.insert(
         "permissions-policy",
         HeaderValue::from_static(
-            "camera=(), microphone=(), geolocation=(), payment=(), usb=(), serial=(), bluetooth=(), \
-             hid=(), midi=(), display-capture=(), clipboard-read=(), interest-cohort=()",
+            "camera=(), microphone=(), geolocation=(), payment=(), usb=(), serial=(), hid=(), midi=(), \
+             display-capture=(), clipboard-read=()",
         ),
     );
 }
