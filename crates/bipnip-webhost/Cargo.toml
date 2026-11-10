@@ -17,6 +17,8 @@ path = "src/main.rs"
 arti-client = { version = "=0.47.0", default-features = false, features = ["tokio", "rustls", "compression", "onion-service-client", "static-sqlite"] }
 # The runtime type arti's TorClient is generic over (same release as arti-client).
 tor-rtcompat = { version = "=0.47.0", default-features = false, features = ["tokio", "rustls"] }
+# arti's TLS (rustls 0.23) needs a process-wide crypto provider; ring is the one already in the tree.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "ws"] }
 base64 = "0.22"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }

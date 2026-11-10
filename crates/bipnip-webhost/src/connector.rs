@@ -29,9 +29,16 @@ pub struct Tor {
     prefs: arti_client::StreamPrefs,
 }
 
+/// Installs rustls' process-wide crypto provider (ring) once. arti's TLS needs one, and with no
+/// provider feature chosen by default rustls panics at the first handshake. Safe to call again.
+pub fn install_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 impl Tor {
     /// Bootstraps a Tor client keeping its state and directory cache under `dir`.
     pub async fn bootstrap(dir: &Path) -> Result<Self, String> {
+        install_crypto_provider();
         let config = arti_client::config::TorClientConfigBuilder::from_directories(
             dir.join("state"),
             dir.join("cache"),
@@ -70,5 +77,17 @@ impl Connector for LoopbackForTests {
             let s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
             Ok(Box::new(s) as BoxIo)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crypto_provider_is_installed() {
+        install_crypto_provider();
+        install_crypto_provider();
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
     }
 }
