@@ -10,7 +10,7 @@
 use std::fs;
 
 use mostro_core::node_binding::{recover_ln_signer, SignedStatement, Statement};
-use nostr::prelude::{Event, JsonUtil};
+use nostr::prelude::Event;
 use serde_json::Value;
 
 fn lines(dir: &str, name: &str) -> Vec<Value> {
