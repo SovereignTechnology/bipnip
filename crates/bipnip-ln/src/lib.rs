@@ -165,7 +165,10 @@ mod tests {
     #[test]
     fn errors_display_without_secrets() {
         let e = BackendError::Unsupported("hold invoices");
-        assert_eq!(e.to_string(), "not supported by this backend: hold invoices");
+        assert_eq!(
+            e.to_string(),
+            "not supported by this backend: hold invoices"
+        );
     }
 
     #[test]

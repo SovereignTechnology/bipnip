@@ -1,0 +1,35 @@
+[package]
+name = "bipnip-webhost"
+description = "Serves the bipnip-web UI (RoboSats fork) from disk and proxies coordinators over Tor, with strict headers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "bipnip-webhost"
+path = "src/main.rs"
+
+[dependencies]
+# Tor: 0.47.0 is the newest release at least 7 days old (2026-11-10); 0.48.0 is 6 days old.
+arti-client = { version = "=0.47.0", default-features = false, features = ["tokio", "rustls", "compression", "onion-service-client", "static-sqlite"] }
+# The runtime type arti's TorClient is generic over (same release as arti-client).
+tor-rtcompat = { version = "=0.47.0", default-features = false, features = ["tokio", "rustls"] }
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "ws"] }
+base64 = "0.22"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+getrandom = "0.3"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "io-util", "time", "signal"] }
+tokio-tungstenite = "0.29"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "io-util", "time", "test-util"] }
+
+[lints]
+workspace = true
