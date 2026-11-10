@@ -87,6 +87,11 @@ fn plain(status: StatusCode, msg: &'static str) -> Response {
 enum Page {
     Basic,
     Pro,
+    /// A UI deep link (`/offers`, `/garage/<token>`, …): redirect to `/`. In self-hosted mode the
+    /// UI runs on an in-memory router that always starts at `/` while its page state is read from
+    /// the URL, so a deep link renders a blank page. Redirecting also keeps a robot token that
+    /// arrived in a `/garage/<token>` URL out of the app.
+    Root,
 }
 
 /// The UI page for a browser route (RoboSats' Django routes), if `path` is one.
@@ -99,7 +104,7 @@ fn page_for(path: &str) -> Option<Page> {
         return Some(Page::Pro);
     }
     let first = p.trim_start_matches('/').split('/').next().unwrap_or("");
-    matches!(first, "create" | "garage" | "offers" | "order" | "settings").then_some(Page::Basic)
+    matches!(first, "create" | "garage" | "offers" | "order" | "settings").then_some(Page::Root)
 }
 
 /// `/<network>/<alias>/<rest>` → `(network, alias, "/<rest>")` for a known network and a plain alias.
@@ -165,14 +170,20 @@ async fn route(st: &Arc<AppState>, req: Request) -> Response {
 }
 
 fn html_page(st: &AppState, page: Page) -> Response {
+    let source = match page {
+        Page::Basic => &st.basic,
+        Page::Pro => &st.pro,
+        Page::Root => {
+            let mut resp = StatusCode::SEE_OTHER.into_response();
+            resp.headers_mut()
+                .insert(header::LOCATION, HeaderValue::from_static("/"));
+            resp.headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            return resp;
+        }
+    };
     let nonce = security::nonce();
-    let body = prepare_page(
-        match page {
-            Page::Basic => &st.basic,
-            Page::Pro => &st.pro,
-        },
-        &nonce,
-    );
+    let body = prepare_page(source, &nonce);
     let mut resp = (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
@@ -420,8 +431,9 @@ mod tests {
     fn pages_follow_robosats_routes() {
         assert_eq!(page_for("/"), Some(Page::Basic));
         assert_eq!(page_for("/pro/"), Some(Page::Pro));
-        assert_eq!(page_for("/garage/abc/"), Some(Page::Basic));
-        assert_eq!(page_for("/order/temple/42/"), Some(Page::Basic));
+        assert_eq!(page_for("/garage/abc/"), Some(Page::Root));
+        assert_eq!(page_for("/order/temple/42/"), Some(Page::Root));
+        assert_eq!(page_for("/offers"), Some(Page::Root));
         assert_eq!(page_for("/mainnet/temple/api/info/"), None);
         assert_eq!(page_for("/static/x.js"), None);
         assert_eq!(page_for("/professional"), None);
