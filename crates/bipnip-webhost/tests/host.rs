@@ -161,7 +161,10 @@ fn hv<'a>(h: &'a HeaderMap, k: &str) -> &'a str {
 #[tokio::test]
 async fn pages_carry_a_nonce_matching_the_csp() {
     let addr = host().await;
-    let (status, h, body) = call(addr, "GET", "/garage/", &[], "").await;
+    let (status, h, _) = call(addr, "GET", "/garage/sometoken/", &[], "").await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "deep links go to /");
+    assert_eq!(hv(&h, "location"), "/");
+    let (status, h, body) = call(addr, "GET", "/", &[], "").await;
     assert_eq!(status, StatusCode::OK);
     let csp = hv(&h, "content-security-policy");
     let nonce = csp
