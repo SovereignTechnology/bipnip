@@ -8,7 +8,7 @@
 # 2. starts the host with a fresh Tor client; coordinators come from the UI's federation.json;
 # 3. asks each mainnet/testnet coordinator for its public info and order book through the host
 #    (read only: no robot, no order, no trade);
-# 4. loads http://127.0.0.1:12596/offers/ in headless Chromium (Playwright), waits for the book,
+# 4. opens http://127.0.0.1:12596/ in headless Chromium (Playwright), clicks Offers, waits for the book,
 #    records CSP violations, off-origin requests, failed requests and page errors;
 # 5. prints the summary and the screenshot (base64, between markers) for the laptop to save.
 # Nothing here runs on the laptop.
@@ -80,15 +80,17 @@ mkdir -p "$W/pw"
 cp "$HERE/shot.mjs" "$W/pw/"
 (cd "$W/pw" && npm init -y >/dev/null && npm i --no-audit --no-fund --loglevel=error "playwright@$PW" >/dev/null \
   && npx --yes "playwright@$PW" install --with-deps chromium >/dev/null 2>&1)
-(cd "$W/pw" && node shot.mjs "http://127.0.0.1:$PORT/offers/" "$W/shot.png") | tee "$W/summary.json"
+(cd "$W/pw" && node shot.mjs "http://127.0.0.1:$PORT" "$W/garage.png" "$W/offers.png") | tee "$W/summary.json"
 
 log "host log (no headers or bodies are ever logged)"
 tail -5 "$W/host.log"
 kill "$HOST_PID" 2>/dev/null || true
 
-echo "=== W0 SCREENSHOT BASE64 BEGIN"
-base64 -w 0 "$W/shot.png"; echo
-echo "=== W0 SCREENSHOT BASE64 END"
+for shot in garage offers; do
+  echo "=== W0 SCREENSHOT $shot BASE64 BEGIN"
+  base64 -w 0 "$W/$shot.png"; echo
+  echo "=== W0 SCREENSHOT $shot BASE64 END"
+done
 python3 - "$W/summary.json" <<'PY'
 import json, sys
 s = json.load(open(sys.argv[1]))

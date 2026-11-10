@@ -1,21 +1,22 @@
-// Loads the bipnip-web UI through bipnip-webhost in headless Chromium, waits for the live order book
-// (fetched from RoboSats coordinators over Tor by the host), and records what the browser saw:
-// rows rendered, CSP violations, failed requests, page errors. Writes a screenshot.
+// Loads the bipnip-web UI through bipnip-webhost in headless Chromium the way a user does: open "/"
+// (the garage), then click the Offers tab and wait for the live order book, which the host fetches
+// from RoboSats coordinators over Tor. Records what the browser saw (rows, CSP violations,
+// off-origin requests, failed and non-2xx requests, console) and writes two screenshots.
 //
-// Usage: node shot.mjs <url> <png out>
+// Usage: node shot.mjs <base url> <garage png> <offers png>
 
 import { chromium } from 'playwright';
 
-const [url, out] = process.argv.slice(2);
+const [base, garagePng, offersPng] = process.argv.slice(2);
 const browser = await chromium.launch();
 const page = await browser.newPage({ viewport: { width: 1366, height: 860 } });
+const origin = new URL(base).origin;
 const csp = [];
 const failed = [];
 const errors = [];
 const offOrigin = [];
 const non2xx = [];
 const consoleAll = [];
-const origin = new URL(url).origin;
 
 page.on('response', (r) => {
   if (r.status() >= 300) non2xx.push(`${r.status()} ${new URL(r.url()).pathname}`);
@@ -35,19 +36,38 @@ page.on('requestfailed', (r) =>
   failed.push(`${r.method()} ${new URL(r.url()).pathname} ${r.failure()?.errorText ?? ''}`),
 );
 
-await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60_000 });
-let rows = 0;
 const started = Date.now();
-while (Date.now() - started < 300_000) {
+await page.goto(`${origin}/`, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+await page.waitForTimeout(15_000);
+await page.screenshot({ path: garagePng });
+
+const offersTab = page.getByRole('button', { name: /offers/i }).or(page.getByRole('tab', { name: /offers/i }));
+let clicked = false;
+try {
+  await offersTab.first().click({ timeout: 15_000 });
+  clicked = true;
+} catch {
+  await page.getByText(/^offers$/i).first().click({ timeout: 15_000 }).then(
+    () => (clicked = true),
+    () => {},
+  );
+}
+
+let rows = 0;
+const t0 = Date.now();
+while (Date.now() - t0 < 240_000) {
   rows = await page.locator('[role="row"]').count();
   if (rows > 3) break;
   await page.waitForTimeout(5_000);
 }
 await page.waitForTimeout(8_000);
 rows = await page.locator('[role="row"]').count();
-await page.screenshot({ path: out });
+const text = (await page.locator('body').innerText()).replace(/\s+/g, ' ').slice(0, 400);
+await page.screenshot({ path: offersPng });
+
 console.log(
   JSON.stringify({
+    clicked_offers: clicked,
     rows,
     seconds: Math.round((Date.now() - started) / 1000),
     csp_violations: csp.length,
@@ -55,9 +75,10 @@ console.log(
     off_origin_requests: offOrigin.length,
     off_origin: offOrigin.slice(0, 10),
     failed: failed.slice(0, 20),
-    errors: errors.slice(0, 10),
     non2xx: non2xx.slice(0, 20),
+    errors: errors.slice(0, 10),
     console: consoleAll.slice(0, 25),
+    text,
   }),
 );
 await browser.close();
