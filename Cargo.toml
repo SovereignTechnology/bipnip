@@ -4,6 +4,7 @@ members = [
     "crates/bipnip-ln",
     "crates/bipnip-agent",
     "crates/bipnip-cli",
+    "crates/bipnip-webhost",
 ]
 
 [workspace.package]
