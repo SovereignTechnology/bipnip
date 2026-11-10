@@ -138,16 +138,21 @@ wait_until 60 funded
 lnc alice connect "${PK[bob]}@127.0.0.1:${P2P[bob]}" >/dev/null
 lnc alice openchannel --node_key "${PK[bob]}" --local_amt 1000000 >/dev/null
 mine 6
-active_with() { [ "$(lnc alice listchannels --active_only --peer "$1" | python3 -c 'import json,sys;print(len(json.load(sys.stdin)["channels"]))')" -ge 1 ]; }
-wait_until 120 active_with "${PK[bob]}"
+active_with() { [ "$(lnc "$1" listchannels --active_only --peer "$2" | python3 -c 'import json,sys;print(len(json.load(sys.stdin)["channels"]))')" -ge 1 ]; }
+wait_until 120 active_with alice "${PK[bob]}"
+wait_until 120 active_with bob "${PK[alice]}"   # the payee must see it active too
 
 log "LND hold invoice on a payer-chosen hash"
 P=$(python3 -c 'import os;print(os.urandom(32).hex())')
 H=$(python3 -c 'import hashlib,sys;print(hashlib.sha256(bytes.fromhex(sys.argv[1])).hexdigest())' "$P")
 PR=$(lnc bob addholdinvoice "$H" 1000 | jget payment_request)
-(lnc alice payinvoice --force "$PR" > "$W/pay-bob.json" 2>&1 || true) &
 state() { [ "$(lnc bob lookupinvoice "$H" | jget state)" = "$1" ]; }
-if wait_until 60 state ACCEPTED; then
+for attempt in 1 2 3; do   # a fresh channel can refuse the first HTLC; payinvoice blocks while held
+  (lnc alice payinvoice --force "$PR" > "$W/pay-bob-$attempt.txt" 2>&1 || true) &
+  wait_until 30 state ACCEPTED && break
+  log "attempt $attempt: $(tail -c 300 "$W/pay-bob-$attempt.txt" | tr '\n' ' ')"
+done
+if wait_until 30 state ACCEPTED; then
   result "LND hold invoice: payer's HTLC held (ACCEPTED) without the preimage" ok "hash chosen by the payer"
   lnc bob settleinvoice "$P" >/dev/null
   wait_until 60 state SETTLED && result "LND hold invoice: settled with the payer-released preimage" ok "SETTLED" \
@@ -192,7 +197,7 @@ log "Core Lightning $CLN_V"
 if fetch "https://github.com/ElementsProject/lightning/releases/download/$CLN_V/clightning-$CLN_V-Ubuntu-24.04-amd64.tar.xz" "$CLN_SHA" "$W/dl/cln.txz"; then
   mkdir -p "$W/cln-root" "$W/carol"
   tar xJf "$W/dl/cln.txz" -C "$W/cln-root"
-  (apt-get install -y -qq libsodium23 libsqlite3-0 libpq5 zlib1g >/dev/null 2>&1 || true)
+  (apt-get update -qq >/dev/null 2>&1; apt-get install -y -qq libsodium23 libsqlite3-0 libpq5 zlib1g >/dev/null 2>&1 || true)
   LD=$(find "$W/cln-root" -type f -name lightningd -path '*bin*' | head -1)
   CLI=$(find "$W/cln-root" -type f -name lightning-cli | head -1)
   if [ -n "$LD" ] && "$LD" --network=regtest --lightning-dir="$W/carol" --bitcoin-rpcuser=spike \
