@@ -82,7 +82,9 @@ A client MUST reject the event unless all of the following hold:
 ## Resolution and revocation
 
 The node key is the authority over its bindings. Among the valid events for one node, the statement with
-the greatest `created_at` decides; at equal `created_at` a `revoke` wins over a `bind`. A node binds one
+the greatest `created_at` decides; at equal `created_at` a `revoke` wins over a `bind`. Clients MUST ignore
+statements dated more than 600 seconds ahead of their own clock: otherwise a statement dated far in the
+future would outrank every later revocation. A node binds one
 Nostr key at a time: a newer `bind` to another key replaces the older one.
 
 To revoke, the node signs a `revoke` statement and the Nostr key publishes it under the same `d`. Because
@@ -90,6 +92,12 @@ the node signature is checked, a party holding only a stolen Nostr key cannot pu
 different binding, and a replayed older `bind` loses to the newer `revoke`. A node that has lost its
 Nostr key can still revoke: any Nostr key may publish a revocation whose statement names the old key, and
 clients MUST accept a valid node-signed `revoke` regardless of which key published it.
+
+## Signature malleability
+
+An ECDSA signature `(r, s)` has a twin `(r, n − s)` with the other recovery id that recovers the same key.
+Both are valid node signatures over the same statement, so two binding events can differ only in
+`node_sig`. Clients MUST NOT treat the signature text as an identifier; the statement decides.
 
 ## Privacy
 
