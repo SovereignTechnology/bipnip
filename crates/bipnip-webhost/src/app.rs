@@ -181,10 +181,6 @@ fn html_page(st: &AppState, page: Page) -> Response {
         .into_response();
     let h = resp.headers_mut();
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    h.insert(
-        "cross-origin-embedder-policy",
-        HeaderValue::from_static("require-corp"),
-    );
     if let Ok(v) = HeaderValue::from_str(&security::csp(&nonce)) {
         h.insert(header::CONTENT_SECURITY_POLICY, v);
     }
