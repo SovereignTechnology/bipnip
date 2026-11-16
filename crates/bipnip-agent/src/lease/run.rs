@@ -9,6 +9,8 @@
 //! - It cannot move a step forward: every message is checked for its sender
 //!   ([`crate::lease_wire::sender_ok`]), the seller checks the take itself, the buyer's node checks
 //!   the invoice and the channel.
+//! - Nor can a seller be paid for a channel it opened earlier: the buyer notes the channels its
+//!   node has with the seller when it takes the order, and refuses a report that names one.
 //! - It cannot end a lease in which money is locked. A `canceled` from the instance stops a lease
 //!   before the buyer has paid. After that, each side asks its own node: the buyer goes on while
 //!   its payment is still locked, and the seller, once it has opened the channel, keeps waiting
@@ -427,13 +429,16 @@ pub struct BuyerRun {
     lease: BuyerLease,
     state: BuyerState,
     seller_trade: Option<PublicKey>,
+    /// Funding outpoints of the channels our node already had with the seller at the take.
+    channels_before: Vec<String>,
     outpoint: Option<String>,
     waiting_on: Option<String>,
 }
 
 impl BuyerRun {
     /// Starts by taking an order on `instance`: draws the preimage, writes the contract dated
-    /// `now`, and returns the run and the take message to send.
+    /// `now`, and returns the run and the take message to send. The channels our node already
+    /// has with the seller are noted, so none of them can be passed off as the leased one.
     pub async fn take(
         backend: &dyn LightningBackend,
         instance: PublicKey,
@@ -449,6 +454,13 @@ impl BuyerRun {
             now,
         )
         .await?;
+        let channels_before = backend
+            .channels_with(&request.seller_node)
+            .await
+            .map_err(LeaseStepError::from)?
+            .into_iter()
+            .map(|channel| channel.funding_outpoint)
+            .collect();
         let message = lease_wire::take(
             request.order_id,
             request.request_id,
@@ -464,6 +476,7 @@ impl BuyerRun {
             lease,
             state: BuyerState::Taking,
             seller_trade: None,
+            channels_before,
             outpoint: None,
             waiting_on: None,
         };
@@ -554,7 +567,15 @@ impl BuyerRun {
             }
             (Incoming::ChannelOpened { channel, .. }, BuyerState::Paid) => {
                 lease_wire::check_names(self.lease.contract(), &channel.lease_id)?;
-                self.outpoint = Some(channel.channel_point());
+                let outpoint = channel.channel_point();
+                // A channel we already had is not the one this lease pays for, however well it
+                // matches the terms.
+                if self.channels_before.contains(&outpoint) {
+                    return Err(RunError::Step(LeaseStepError::Channel(
+                        "the channel existed before this lease".into(),
+                    )));
+                }
+                self.outpoint = Some(outpoint);
                 self.state = BuyerState::Verifying;
                 Ok(Vec::new())
             }
