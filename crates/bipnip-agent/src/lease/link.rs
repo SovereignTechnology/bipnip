@@ -1,0 +1,285 @@
+//! A lease run on relays: brings a run the messages the relays hold for it, saves the run, and
+//! sends what it answers.
+//!
+//! The order within a step is the point of this module:
+//!
+//! 1. a message is handed to the run, or the run looks at its node (`tick`);
+//! 2. the run is saved;
+//! 3. only then are its answers sent.
+//!
+//! So a crash never leaves a message out that the stored run does not know it sent, and a
+//! buyer's take ([`launch_buyer`]) never leaves before its preimage is on disk. A failed save
+//! stops the step: a run that cannot be saved must not go on.
+//!
+//! Relays are polled, not subscribed to. A lease moves at the pace of payments and block
+//! confirmations, so a few seconds between looks cost nothing, and a poll needs no connection
+//! state to get wrong.
+//!
+//! Not here yet: sending again what a relay did not take. A failed send is reported in the
+//! [`StepReport`]; the run has moved on, and the lease then waits until it times out.
+
+use std::collections::HashSet;
+
+use bipnip_ln::LightningBackend;
+use nostr_sdk::prelude::{Client, EventId, Filter, Keys, Kind, PublicKey, Timestamp};
+
+use super::run::{BuyerRun, Outgoing, RunError, SellerRun};
+use super::store::{LeaseStore, StoreError};
+use crate::lease_wire::{self, Incoming};
+use crate::relay::{RELAY_TIMEOUT, connected};
+
+/// A message a poll found, not handled yet.
+#[derive(Debug)]
+pub struct Received {
+    /// The event that carried it.
+    pub id: EventId,
+    /// The message, with its own fields checked.
+    pub incoming: Incoming,
+    /// The key that authored the event.
+    pub sender: PublicKey,
+}
+
+/// One run's connection to its instance's relays, under one trade key.
+pub struct Link {
+    client: Client,
+    identity: Keys,
+    trade: Keys,
+    instance: PublicKey,
+    pow: u8,
+    since: Timestamp,
+    done: HashSet<EventId>,
+}
+
+impl std::fmt::Debug for Link {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Link(trade key {})", self.trade.public_key())
+    }
+}
+
+impl Link {
+    /// Connects to `relays`. Messages are read for the `trade` key from `since` (unix seconds)
+    /// on; after a restart, pass a time before the run's last save, and the run itself refuses
+    /// what it already handled. `pow` is the proof of work the instance asks for.
+    pub async fn connect(
+        relays: &[String],
+        identity: Keys,
+        trade: Keys,
+        instance: PublicKey,
+        pow: u8,
+        since: u64,
+    ) -> Result<Self, String> {
+        Ok(Link {
+            client: connected(relays).await?,
+            identity,
+            trade,
+            instance,
+            pow,
+            since: Timestamp::from(since),
+            done: HashSet::new(),
+        })
+    }
+
+    /// Wraps a message for its receiver and sends it. `Ok` means at least one relay took it.
+    /// The error names relays and their reasons, never the message.
+    pub async fn send(&self, outgoing: &Outgoing) -> Result<(), String> {
+        let event = outgoing
+            .seal(&self.identity, &self.trade, self.instance, self.pow)
+            .map_err(|e| e.to_string())?;
+        match tokio::time::timeout(RELAY_TIMEOUT, self.client.send_event(&event)).await {
+            Err(_) => Err("no relay answered in time".into()),
+            Ok(Err(e)) => Err(format!("publish: {e}")),
+            Ok(Ok(output)) if output.success.is_empty() => {
+                Err(format!("no relay accepted the event: {:?}", output.failed))
+            }
+            Ok(Ok(_)) => Ok(()),
+        }
+    }
+
+    /// The messages the relays hold for our trade key that are not marked done, oldest first.
+    /// Events that are not for us, or do not open as a lease message, are marked done and
+    /// skipped.
+    pub async fn poll(&mut self) -> Result<Vec<Received>, String> {
+        let filter = Filter::new()
+            .kind(Kind::PrivateDirectMessage)
+            .pubkey(self.trade.public_key())
+            .since(self.since);
+        let events = self
+            .client
+            .fetch_events(filter)
+            .timeout(RELAY_TIMEOUT)
+            .await
+            .map_err(|e| format!("fetch: {e}"))?;
+        let mut fresh: Vec<_> = events
+            .iter()
+            .filter(|event| !self.done.contains(&event.id))
+            .collect();
+        fresh.sort_by_key(|event| (event.created_at, event.id));
+        let mut received = Vec::new();
+        for event in fresh {
+            match lease_wire::open(event, &self.trade) {
+                Ok(Some((incoming, sender))) => received.push(Received {
+                    id: event.id,
+                    incoming,
+                    sender,
+                }),
+                Ok(None) | Err(_) => {
+                    self.done.insert(event.id);
+                }
+            }
+        }
+        Ok(received)
+    }
+
+    /// Marks an event as handled: later polls skip it.
+    pub fn mark_done(&mut self, id: EventId) {
+        self.done.insert(id);
+    }
+
+    /// Disconnects from the relays.
+    pub async fn close(self) {
+        self.client.shutdown().await;
+    }
+}
+
+/// What one step did.
+#[derive(Debug, Default)]
+pub struct StepReport {
+    /// Messages the run acted on.
+    pub handled: usize,
+    /// Answers sent.
+    pub sent: usize,
+    /// What did not work: a poll that failed, a message the run refused, an answer no relay
+    /// took. Never holds message contents.
+    pub problems: Vec<String>,
+}
+
+async fn send_all(link: &Link, outgoing: &[Outgoing], report: &mut StepReport) {
+    for message in outgoing {
+        match link.send(message).await {
+            Ok(()) => report.sent += 1,
+            Err(e) => report.problems.push(format!("not sent: {e}")),
+        }
+    }
+}
+
+/// Whether a refused message should be looked at again. Only one that came too early may fit
+/// later: relays do not promise an order.
+fn retry_later(error: &RunError) -> bool {
+    matches!(error, RunError::OutOfOrder(_))
+}
+
+/// Saves a seller's new run, then sends its offer.
+pub async fn launch_seller(
+    run: &SellerRun,
+    offer: &Outgoing,
+    link: &Link,
+    store: &LeaseStore,
+) -> Result<StepReport, StoreError> {
+    store.save_seller(run)?;
+    let mut report = StepReport::default();
+    send_all(link, std::slice::from_ref(offer), &mut report).await;
+    Ok(report)
+}
+
+/// Saves a buyer's new run, preimage included, then sends its take.
+pub async fn launch_buyer(
+    run: &BuyerRun,
+    take: &Outgoing,
+    link: &Link,
+    store: &LeaseStore,
+) -> Result<StepReport, StoreError> {
+    store.save_buyer(run)?;
+    let mut report = StepReport::default();
+    send_all(link, std::slice::from_ref(take), &mut report).await;
+    Ok(report)
+}
+
+/// One step of a seller's run at `now` (unix seconds): the messages waiting on the relays, then
+/// a look at the node. Fails only when the run cannot be saved.
+pub async fn step_seller(
+    run: &mut SellerRun,
+    link: &mut Link,
+    backend: &dyn LightningBackend,
+    store: &LeaseStore,
+    now: u64,
+) -> Result<StepReport, StoreError> {
+    let mut report = StepReport::default();
+    match link.poll().await {
+        Err(e) => report.problems.push(e),
+        Ok(received) => {
+            for message in received {
+                match run
+                    .on_message(message.incoming, &message.sender, backend, now)
+                    .await
+                {
+                    Ok(outgoing) => {
+                        store.save_seller(run)?;
+                        link.mark_done(message.id);
+                        report.handled += 1;
+                        send_all(link, &outgoing, &mut report).await;
+                    }
+                    Err(e) => {
+                        // A refusal can still change the run (a refused offer ends it).
+                        store.save_seller(run)?;
+                        if !retry_later(&e) {
+                            link.mark_done(message.id);
+                            report.problems.push(format!("refused a message: {e}"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    match run.tick(backend).await {
+        Ok(outgoing) => {
+            store.save_seller(run)?;
+            send_all(link, &outgoing, &mut report).await;
+        }
+        Err(e) => report.problems.push(format!("node: {e}")),
+    }
+    Ok(report)
+}
+
+/// One step of a buyer's run: the messages waiting on the relays, then a look at the node.
+/// Fails only when the run cannot be saved.
+pub async fn step_buyer(
+    run: &mut BuyerRun,
+    link: &mut Link,
+    backend: &dyn LightningBackend,
+    store: &LeaseStore,
+) -> Result<StepReport, StoreError> {
+    let mut report = StepReport::default();
+    match link.poll().await {
+        Err(e) => report.problems.push(e),
+        Ok(received) => {
+            for message in received {
+                match run
+                    .on_message(message.incoming, &message.sender, backend)
+                    .await
+                {
+                    Ok(outgoing) => {
+                        store.save_buyer(run)?;
+                        link.mark_done(message.id);
+                        report.handled += 1;
+                        send_all(link, &outgoing, &mut report).await;
+                    }
+                    Err(e) => {
+                        store.save_buyer(run)?;
+                        if !retry_later(&e) {
+                            link.mark_done(message.id);
+                            report.problems.push(format!("refused a message: {e}"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    match run.tick(backend).await {
+        Ok(outgoing) => {
+            store.save_buyer(run)?;
+            send_all(link, &outgoing, &mut report).await;
+        }
+        Err(e) => report.problems.push(format!("node: {e}")),
+    }
+    Ok(report)
+}

@@ -15,6 +15,7 @@
 //! in two ways only: through [`BuyerLease::release`], and into the owner-only file
 //! [`BuyerLease::save_new`] writes so that a restarted agent can still finish the lease.
 
+pub mod link;
 pub mod run;
 pub mod store;
 
