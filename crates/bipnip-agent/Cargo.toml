@@ -25,11 +25,15 @@ async-trait.workspace = true
 # The crate nostr's NIP-06 uses; `rand` to generate a new mnemonic.
 bip39 = { version = "2.1", features = ["rand"] }
 libc = "0.2"
+getrandom = "0.3"
+# BOLT 11 decoding, to check a seller's invoice before paying it.
+lightning-invoice = { version = "0.34", features = ["std"] }
+sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 toml = "0.8"
-# bipnip-core main (#2): Mostro's protocol types plus the node binding.
-mostro-core = { git = "https://github.com/SovereignTechnology/bipnip-core", rev = "282e28b6c6a4b3020ee2f9d4e4f385e0d2373564" }
+# bipnip-core main (#3): Mostro's protocol types, the node binding and lease terms.
+mostro-core = { git = "https://github.com/SovereignTechnology/bipnip-core", rev = "5daa0124b5ecb86bb32dc947a3d5659e7e1c8d64" }
 # The versions bipnip-core resolves, so key and event types are the same types.
 nostr-sdk = "0.45.1"
 # NIP-06 (mnemonic → keys) is a feature of the nostr crate nostr-sdk re-exports.
@@ -38,6 +42,8 @@ zeroize = "1"
 secp256k1 = "0.30"
 
 [dev-dependencies]
+# To sign test invoices.
+bitcoin = { version = "0.32", default-features = false, features = ["std", "secp-recovery"] }
 nostr-sdk = { version = "0.45.1", features = ["local-relay"] }
 
 [lints]

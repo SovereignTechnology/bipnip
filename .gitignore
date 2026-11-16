@@ -10,3 +10,6 @@
 *.seed
 *.nsec
 settings.toml
+# Local agent tooling.
+.claude/
+.mcp.json

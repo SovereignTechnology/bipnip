@@ -98,6 +98,18 @@ B_P2P=127.0.0.1:${P2P[bob]} HASHES="$(pair),$(pair),$(pair)" \
 MINE="$W/mine.sh" \
   "$W/target/release/lnd-conformance"
 
+# --- a whole lease between the two nodes ------------------------------------------------------
+log "fund the seller (bob) on chain"
+$BCLI -rpcwallet=miner sendtoaddress "$(lnc bob newaddress p2wkh | jget address)" 5 >/dev/null
+$BCLI generatetoaddress 6 "$MADDR" >/dev/null
+bob_funded() { [ "$(lnc bob walletbalance | jget confirmed_balance)" -gt 0 ]; }
+wait_until 60 bob_funded
+log "lease end to end"
+A_ADDR=https://127.0.0.1:${RPC[alice]} A_CERT=$W/alice/tls.cert A_MAC=$(mac alice) \
+B_ADDR=https://127.0.0.1:${RPC[bob]} B_CERT=$W/bob/tls.cert B_MAC=$(mac bob) \
+A_P2P=127.0.0.1:${P2P[alice]} MINE="$W/mine.sh" \
+  "$W/target/release/lease-e2e"
+
 # --- the agent, end to end: init, bind + publish, verify from a second agent, revoke -----------
 log "build bipnip-agent with LND support"
 cargo build --quiet --release --manifest-path "$HERE/../../Cargo.toml" -p bipnip-agent --features lnd --target-dir "$W/target-ws"
