@@ -30,6 +30,9 @@
 //! hold invoice and before saving cannot create it again, so that lease stalls until the
 //! instance times it out. No money is at stake there, since the buyer never saw an invoice.
 //!
+//! An answer no relay took is not lost: each run can make the message its state implies again
+//! ([`SellerRun::pending`], [`BuyerRun::pending`]), and remembers on disk that it still owes it.
+//!
 //! Not here yet: the completion invoice at the end of the lease.
 
 use std::path::Path;
@@ -188,6 +191,10 @@ pub struct SellerRun {
     channels_before: Vec<String>,
     outpoint: Option<String>,
     canceled_by_instance: bool,
+    /// The upfront hold invoice, kept so it can be sent again.
+    invoice: Option<String>,
+    /// True when the answer the current state implies has not reached a relay.
+    unsent: bool,
 }
 
 /// A seller's run as stored. Nothing in it is secret.
@@ -209,6 +216,8 @@ struct SellerRecord {
     channels_before: Vec<String>,
     outpoint: Option<String>,
     canceled_by_instance: bool,
+    invoice: Option<String>,
+    unsent: bool,
 }
 
 /// The version of the stored records.
@@ -256,6 +265,8 @@ impl SellerRun {
             channels_before: Vec::new(),
             outpoint: None,
             canceled_by_instance: false,
+            invoice: None,
+            unsent: false,
         };
         (run, Outgoing::ToInstance(message))
     }
@@ -288,6 +299,8 @@ impl SellerRun {
             channels_before: self.channels_before.clone(),
             outpoint: self.outpoint.clone(),
             canceled_by_instance: self.canceled_by_instance,
+            invoice: self.invoice.clone(),
+            unsent: self.unsent,
         })
     }
 
@@ -331,6 +344,7 @@ impl SellerRun {
         if (needs_order && order_id.is_none())
             || (needs_lease && lease.is_none())
             || (needs_outpoint && record.outpoint.is_none())
+            || (state == SellerState::Invoiced && record.invoice.is_none())
         {
             return Err(corrupt("the state does not fit the rest of the record"));
         }
@@ -351,6 +365,8 @@ impl SellerRun {
             channels_before: record.channels_before,
             outpoint: record.outpoint,
             canceled_by_instance: record.canceled_by_instance,
+            invoice: record.invoice,
+            unsent: record.unsent,
         })
     }
 
@@ -410,6 +426,39 @@ impl SellerRun {
     /// waiting for the preimage regardless.
     pub fn canceled_by_instance(&self) -> bool {
         self.canceled_by_instance
+    }
+
+    /// True when the answer the current state implies has not reached a relay yet.
+    pub fn unsent(&self) -> bool {
+        self.unsent
+    }
+
+    /// Records whether the current state's answer still has to be sent. Stored with the run.
+    pub fn set_unsent(&mut self, unsent: bool) {
+        self.unsent = unsent;
+    }
+
+    /// The message the current state implies, made again: the offer while it is unanswered, the
+    /// hold invoice once a take was accepted, the channel report once the channel is opening,
+    /// and the active notice once settled. Empty for states that say nothing. The instance
+    /// refuses a message it already acted on, so sending one twice changes nothing.
+    pub fn pending(&self) -> Result<Vec<Outgoing>, RunError> {
+        let message = match (self.state, self.order_id, self.contract()) {
+            (SellerState::Offering, _, _) => {
+                Some(lease_wire::offer(self.request_id, self.offer.clone()))
+            }
+            (SellerState::Invoiced, Some(order_id), Some(contract)) => self
+                .invoice
+                .clone()
+                .map(|bolt11| lease_wire::upfront_invoice(order_id, contract, bolt11)),
+            (SellerState::Opened, Some(order_id), Some(contract)) => match &self.outpoint {
+                Some(outpoint) => Some(lease_wire::channel_opened(order_id, contract, outpoint)?),
+                None => None,
+            },
+            (SellerState::Active, Some(order_id), _) => Some(lease_wire::active(order_id)),
+            _ => None,
+        };
+        Ok(message.into_iter().map(Outgoing::ToInstance).collect())
     }
 
     /// Handles one message that `sender` authored, at `now` (unix seconds).
@@ -474,6 +523,7 @@ impl SellerRun {
                     .await?;
                 self.buyer_addr = take.node_address;
                 self.lease = Some(lease);
+                self.invoice = Some(bolt11.clone());
                 self.state = SellerState::Invoiced;
                 Ok(vec![Outgoing::ToInstance(lease_wire::upfront_invoice(
                     order_id, &contract, bolt11,
@@ -680,6 +730,11 @@ pub struct BuyerRun {
     channels_before: Vec<String>,
     outpoint: Option<String>,
     waiting_on: Option<String>,
+    /// Our node binding event and node address, kept so the take can be sent again.
+    binding: String,
+    node_address: Option<String>,
+    /// True when the answer the current state implies has not reached a relay.
+    unsent: bool,
 }
 
 /// A buyer's run as stored. The preimage is not in it: that lives in the lease's own file.
@@ -698,6 +753,9 @@ struct BuyerRecord {
     seller_trade: Option<String>,
     channels_before: Vec<String>,
     outpoint: Option<String>,
+    binding: String,
+    node_address: Option<String>,
+    unsent: bool,
 }
 
 impl BuyerRun {
@@ -728,6 +786,9 @@ impl BuyerRun {
             seller_trade: self.seller_trade.map(|key| key.to_hex()),
             channels_before: self.channels_before.clone(),
             outpoint: self.outpoint.clone(),
+            binding: self.binding.clone(),
+            node_address: self.node_address.clone(),
+            unsent: self.unsent,
         })
     }
 
@@ -766,6 +827,9 @@ impl BuyerRun {
             channels_before: record.channels_before,
             outpoint: record.outpoint,
             waiting_on: None,
+            binding: record.binding,
+            node_address: record.node_address,
+            unsent: record.unsent,
         })
     }
 
@@ -798,8 +862,8 @@ impl BuyerRun {
             request.order_id,
             request.request_id,
             lease.contract(),
-            request.binding,
-            request.node_address,
+            request.binding.clone(),
+            request.node_address.clone(),
         );
         let run = BuyerRun {
             instance,
@@ -813,6 +877,9 @@ impl BuyerRun {
             channels_before,
             outpoint: None,
             waiting_on: None,
+            binding: request.binding,
+            node_address: request.node_address,
+            unsent: false,
         };
         Ok((run, Outgoing::ToInstance(message)))
     }
@@ -845,6 +912,43 @@ impl BuyerRun {
     /// Why the channel the seller reported has not passed our node's check yet, if it has not.
     pub fn waiting_on(&self) -> Option<&str> {
         self.waiting_on.as_deref()
+    }
+
+    /// True when the answer the current state implies has not reached a relay yet.
+    pub fn unsent(&self) -> bool {
+        self.unsent
+    }
+
+    /// Records whether the current state's answer still has to be sent. Stored with the run.
+    pub fn set_unsent(&mut self, unsent: bool) {
+        self.unsent = unsent;
+    }
+
+    /// The message the current state implies, made again: the take while it is unanswered, and
+    /// the preimage once released. Empty for states that say nothing.
+    ///
+    /// The preimage is made again the way it was made the first time: our node checks the
+    /// channel, and only a passed check lets it out. A channel that no longer passes is an
+    /// error, and nothing is sent.
+    pub async fn pending(&self, backend: &dyn LightningBackend) -> Result<Vec<Outgoing>, RunError> {
+        match (self.state, &self.outpoint, self.seller_trade) {
+            (BuyerState::Taking, _, _) => Ok(vec![Outgoing::ToInstance(lease_wire::take(
+                self.order_id,
+                self.request_id,
+                self.lease.contract(),
+                self.binding.clone(),
+                self.node_address.clone(),
+            ))]),
+            (BuyerState::Released, Some(outpoint), Some(seller_trade)) => {
+                let proof = self.lease.verify_channel(backend, outpoint).await?;
+                let secret = self.lease.release(&proof)?;
+                Ok(vec![Outgoing::ToPeer {
+                    to: seller_trade,
+                    message: lease_wire::preimage(self.order_id, self.lease.contract(), secret),
+                }])
+            }
+            _ => Ok(Vec::new()),
+        }
     }
 
     /// Handles one message that `sender` authored.

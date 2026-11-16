@@ -200,7 +200,7 @@ async fn a_lease_runs_over_a_relay_and_survives_both_agents_restarting() {
         SELLER,
     );
     let mut seller_link = wired.seller_link().await;
-    let report = launch_seller(&seller, &offer, &seller_link, &wired.seller_store)
+    let report = launch_seller(&mut seller, &offer, &seller_link, &wired.seller_store)
         .await
         .expect("launch");
     assert_eq!((report.sent, report.problems.len()), (1, 0));
@@ -233,7 +233,7 @@ async fn a_lease_runs_over_a_relay_and_survives_both_agents_restarting() {
     .await
     .expect("take");
     let mut buyer_link = wired.buyer_link().await;
-    launch_buyer(&buyer, &take, &buyer_link, &wired.buyer_store)
+    launch_buyer(&mut buyer, &take, &buyer_link, &wired.buyer_store)
         .await
         .expect("launch");
     // On disk before anything else happens, preimage included.
@@ -314,6 +314,69 @@ async fn a_lease_runs_over_a_relay_and_survives_both_agents_restarting() {
             Action::LeaseActive,
         ]
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_that_is_owed_is_sent_at_the_next_step() {
+    let mut wired = Wired::new("owed").await;
+    let (mut seller, offer) = SellerRun::offer(
+        wired.stage.instance_key(),
+        wired.stage.offer.clone(),
+        1,
+        7,
+        SELLER,
+    );
+    let mut seller_link = wired.seller_link().await;
+    launch_seller(&mut seller, &offer, &seller_link, &wired.seller_store)
+        .await
+        .expect("launch");
+    assert!(!seller.unsent());
+
+    // As if no relay had taken the offer: the run is stored as owing it.
+    seller.set_unsent(true);
+    wired.seller_store.save_seller(&seller).expect("save");
+    let mut seller = wired
+        .seller_store
+        .load()
+        .expect("load")
+        .sellers
+        .pop()
+        .expect("the seller's run");
+    assert!(seller.unsent(), "what is owed survives a restart");
+
+    let report = step_seller(
+        &mut seller,
+        &mut seller_link,
+        &wired.stage.seller_node,
+        &wired.seller_store,
+        super::super::NOW,
+    )
+    .await
+    .expect("step");
+    assert_eq!(report.sent, 1);
+    assert!(!seller.unsent());
+    let stored = wired.seller_store.load().expect("load").sellers;
+    assert!(!stored[0].unsent(), "and the store knows it was sent");
+
+    // The instance got the offer twice and answered both; the run takes one answer.
+    wired.instance.step().await;
+    assert_eq!(
+        wired.instance.saw,
+        vec![Action::LeaseOffer, Action::LeaseOffer]
+    );
+    for _ in 0..3 {
+        step_seller(
+            &mut seller,
+            &mut seller_link,
+            &wired.stage.seller_node,
+            &wired.seller_store,
+            super::super::NOW,
+        )
+        .await
+        .expect("step");
+    }
+    assert_eq!(seller.state(), SellerState::Open);
+    assert_eq!(seller.order_id(), Some(wired.stage.order_id));
 }
 
 #[tokio::test(flavor = "multi_thread")]

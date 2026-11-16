@@ -15,8 +15,10 @@
 //! confirmations, so a few seconds between looks cost nothing, and a poll needs no connection
 //! state to get wrong.
 //!
-//! Not here yet: sending again what a relay did not take. A failed send is reported in the
-//! [`StepReport`]; the run has moved on, and the lease then waits until it times out.
+//! An answer no relay took is owed, not lost. The run is marked and saved, and the next step
+//! starts by making the message its state implies again and sending that. What is sent twice
+//! does no harm: the instance refuses a step it already recorded, and a run refuses a message
+//! it already handled.
 
 use std::collections::HashSet;
 
@@ -153,13 +155,19 @@ pub struct StepReport {
     pub problems: Vec<String>,
 }
 
-async fn send_all(link: &Link, outgoing: &[Outgoing], report: &mut StepReport) {
+/// Sends each message; true when every one reached a relay.
+async fn send_all(link: &Link, outgoing: &[Outgoing], report: &mut StepReport) -> bool {
+    let mut all_sent = true;
     for message in outgoing {
         match link.send(message).await {
             Ok(()) => report.sent += 1,
-            Err(e) => report.problems.push(format!("not sent: {e}")),
+            Err(e) => {
+                all_sent = false;
+                report.problems.push(format!("not sent: {e}"));
+            }
         }
     }
+    all_sent
 }
 
 /// Whether a refused message should be looked at again. Only one that came too early may fit
@@ -168,29 +176,37 @@ fn retry_later(error: &RunError) -> bool {
     matches!(error, RunError::OutOfOrder(_))
 }
 
-/// Saves a seller's new run, then sends its offer.
+/// Saves a seller's new run, then sends its offer. If no relay takes it, the run is saved again
+/// as owing it, and the next step sends it.
 pub async fn launch_seller(
-    run: &SellerRun,
+    run: &mut SellerRun,
     offer: &Outgoing,
     link: &Link,
     store: &LeaseStore,
 ) -> Result<StepReport, StoreError> {
     store.save_seller(run)?;
     let mut report = StepReport::default();
-    send_all(link, std::slice::from_ref(offer), &mut report).await;
+    if !send_all(link, std::slice::from_ref(offer), &mut report).await {
+        run.set_unsent(true);
+        store.save_seller(run)?;
+    }
     Ok(report)
 }
 
-/// Saves a buyer's new run, preimage included, then sends its take.
+/// Saves a buyer's new run, preimage included, then sends its take. If no relay takes it, the
+/// run is saved again as owing it, and the next step sends it.
 pub async fn launch_buyer(
-    run: &BuyerRun,
+    run: &mut BuyerRun,
     take: &Outgoing,
     link: &Link,
     store: &LeaseStore,
 ) -> Result<StepReport, StoreError> {
     store.save_buyer(run)?;
     let mut report = StepReport::default();
-    send_all(link, std::slice::from_ref(take), &mut report).await;
+    if !send_all(link, std::slice::from_ref(take), &mut report).await {
+        run.set_unsent(true);
+        store.save_buyer(run)?;
+    }
     Ok(report)
 }
 
@@ -204,6 +220,17 @@ pub async fn step_seller(
     now: u64,
 ) -> Result<StepReport, StoreError> {
     let mut report = StepReport::default();
+    if run.unsent() {
+        match run.pending() {
+            Ok(owed) => {
+                if send_all(link, &owed, &mut report).await {
+                    run.set_unsent(false);
+                    store.save_seller(run)?;
+                }
+            }
+            Err(e) => report.problems.push(format!("cannot send again: {e}")),
+        }
+    }
     match link.poll().await {
         Err(e) => report.problems.push(e),
         Ok(received) => {
@@ -213,10 +240,15 @@ pub async fn step_seller(
                     .await
                 {
                     Ok(outgoing) => {
+                        // A new answer replaces whatever was owed before it.
+                        run.set_unsent(false);
                         store.save_seller(run)?;
                         link.mark_done(message.id);
                         report.handled += 1;
-                        send_all(link, &outgoing, &mut report).await;
+                        if !send_all(link, &outgoing, &mut report).await {
+                            run.set_unsent(true);
+                            store.save_seller(run)?;
+                        }
                     }
                     Err(e) => {
                         // A refusal can still change the run (a refused offer ends it).
@@ -233,7 +265,10 @@ pub async fn step_seller(
     match run.tick(backend).await {
         Ok(outgoing) => {
             store.save_seller(run)?;
-            send_all(link, &outgoing, &mut report).await;
+            if !send_all(link, &outgoing, &mut report).await {
+                run.set_unsent(true);
+                store.save_seller(run)?;
+            }
         }
         Err(e) => report.problems.push(format!("node: {e}")),
     }
@@ -249,6 +284,17 @@ pub async fn step_buyer(
     store: &LeaseStore,
 ) -> Result<StepReport, StoreError> {
     let mut report = StepReport::default();
+    if run.unsent() {
+        match run.pending(backend).await {
+            Ok(owed) => {
+                if send_all(link, &owed, &mut report).await {
+                    run.set_unsent(false);
+                    store.save_buyer(run)?;
+                }
+            }
+            Err(e) => report.problems.push(format!("cannot send again: {e}")),
+        }
+    }
     match link.poll().await {
         Err(e) => report.problems.push(e),
         Ok(received) => {
@@ -258,10 +304,14 @@ pub async fn step_buyer(
                     .await
                 {
                     Ok(outgoing) => {
+                        run.set_unsent(false);
                         store.save_buyer(run)?;
                         link.mark_done(message.id);
                         report.handled += 1;
-                        send_all(link, &outgoing, &mut report).await;
+                        if !send_all(link, &outgoing, &mut report).await {
+                            run.set_unsent(true);
+                            store.save_buyer(run)?;
+                        }
                     }
                     Err(e) => {
                         store.save_buyer(run)?;
@@ -277,7 +327,10 @@ pub async fn step_buyer(
     match run.tick(backend).await {
         Ok(outgoing) => {
             store.save_buyer(run)?;
-            send_all(link, &outgoing, &mut report).await;
+            if !send_all(link, &outgoing, &mut report).await {
+                run.set_unsent(true);
+                store.save_buyer(run)?;
+            }
         }
         Err(e) => report.problems.push(format!("node: {e}")),
     }
