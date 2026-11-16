@@ -9,16 +9,42 @@
 //! address = "https://127.0.0.1:10009"
 //! tls_cert = "/home/me/.lnd/tls.cert"
 //! macaroon = "/home/me/.lnd/bipnip.macaroon"
+//!
+//! [instance]                          # the bipnip instance leases run on
+//! pubkey = "npub1…"                   # its Nostr key, npub or hex
+//! pow = 0                             # proof of work it asks for, in bits
 //! ```
 
 use std::path::PathBuf;
 use std::str::FromStr;
 
 use mostro_core::node_binding::Network;
+use nostr_sdk::prelude::PublicKey;
 use serde::Deserialize;
 
 /// Name of the mnemonic file inside `data_dir`.
 pub const MNEMONIC_FILE: &str = "mnemonic";
+/// Name of the directory inside `data_dir` that holds lease runs.
+pub const LEASES_DIR: &str = "leases";
+/// Most proof of work an instance may ask for: above this a message would take hours to make.
+pub const MAX_POW_BITS: u8 = 32;
+
+/// The instance leases run on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstanceConfig {
+    /// The instance's Nostr key.
+    pub pubkey: PublicKey,
+    /// Proof of work the instance asks for on messages, in bits.
+    pub pow: u8,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawInstance {
+    pubkey: String,
+    #[serde(default)]
+    pow: u8,
+}
 
 /// How to reach an LND node.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -40,6 +66,7 @@ struct Raw {
     #[serde(default)]
     relays: Vec<String>,
     lnd: Option<LndConfig>,
+    instance: Option<RawInstance>,
 }
 
 /// The parsed, checked configuration.
@@ -53,6 +80,8 @@ pub struct Config {
     pub relays: Vec<String>,
     /// The LND node, if one is configured.
     pub lnd: Option<LndConfig>,
+    /// The instance leases run on, if one is configured.
+    pub instance: Option<InstanceConfig>,
 }
 
 impl Config {
@@ -84,12 +113,35 @@ impl Config {
                 return Err("config: lnd.tls_cert and lnd.macaroon must be absolute paths".into());
             }
         }
+        let instance = match raw.instance {
+            None => None,
+            Some(raw) => {
+                if raw.pow > MAX_POW_BITS {
+                    return Err(format!(
+                        "config: instance.pow is {} bits; at most {MAX_POW_BITS}",
+                        raw.pow
+                    ));
+                }
+                let pubkey = PublicKey::parse(&raw.pubkey)
+                    .map_err(|_| "config: instance.pubkey must be an npub or 64 hex".to_string())?;
+                Some(InstanceConfig {
+                    pubkey,
+                    pow: raw.pow,
+                })
+            }
+        };
         Ok(Config {
             network,
             data_dir: raw.data_dir,
             relays: raw.relays,
             lnd: raw.lnd,
+            instance,
         })
+    }
+
+    /// Where lease runs are stored.
+    pub fn leases_dir(&self) -> PathBuf {
+        self.data_dir.join(LEASES_DIR)
     }
 
     /// Where the mnemonic lives.
@@ -120,6 +172,25 @@ macaroon = "/tmp/a.macaroon"
         assert_eq!(c.relays.len(), 2);
         assert_eq!(c.mnemonic_path(), PathBuf::from("/tmp/bipnip/mnemonic"));
         assert_eq!(c.lnd.expect("lnd").address, "https://127.0.0.1:10009");
+    }
+
+    #[test]
+    fn parses_the_instance() {
+        let key = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        let text = format!("{GOOD}\n[instance]\npubkey = \"{key}\"\npow = 12\n");
+        let c = Config::parse(&text).expect("parses");
+        let instance = c.instance.clone().expect("instance");
+        assert_eq!(instance.pubkey.to_hex(), key);
+        assert_eq!(instance.pow, 12);
+        assert_eq!(c.leases_dir(), PathBuf::from("/tmp/bipnip/leases"));
+        assert!(Config::parse(GOOD).expect("parses").instance.is_none());
+        for (bad, why) in [
+            (text.replace(key, "not-a-key"), "pubkey"),
+            (text.replace("pow = 12", "pow = 33"), "too much work"),
+            (text.replace("pow = 12", "secret = \"x\""), "unknown key"),
+        ] {
+            assert!(Config::parse(&bad).is_err(), "{why}");
+        }
     }
 
     #[test]

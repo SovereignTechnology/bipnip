@@ -54,7 +54,13 @@ async fn a_lease_survives_a_restart_at_every_step() {
         0o700
     );
 
-    let (seller, _) = SellerRun::offer(stage.instance_key(), stage.offer.clone(), 1, super::SELLER);
+    let (seller, _) = SellerRun::offer(
+        stage.instance_key(),
+        stage.offer.clone(),
+        1,
+        7,
+        super::SELLER,
+    );
     let mut seller = restart_seller(&store, seller);
     assert_eq!(seller.state(), SellerState::Offering);
     let echo = mostro_core::prelude::Message::new_order(

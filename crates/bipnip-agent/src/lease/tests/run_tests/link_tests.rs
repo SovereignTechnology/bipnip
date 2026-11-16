@@ -196,6 +196,7 @@ async fn a_lease_runs_over_a_relay_and_survives_both_agents_restarting() {
         wired.stage.instance_key(),
         wired.stage.offer.clone(),
         1,
+        7,
         SELLER,
     );
     let mut seller_link = wired.seller_link().await;

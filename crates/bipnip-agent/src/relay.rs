@@ -6,8 +6,10 @@
 
 use std::time::Duration;
 
+use mostro_core::lease_order::{KIND_LEASE_ORDER, LeaseOrder};
 use mostro_core::node_binding::{KIND_NODE_BINDING, SignedStatement};
-use nostr_sdk::prelude::{Client, Event, Filter, Kind};
+use nostr_sdk::prelude::{Client, Event, Filter, Kind, PublicKey};
+use uuid::Uuid;
 
 /// How long to wait for relays to connect, accept an event or answer a query.
 pub const RELAY_TIMEOUT: Duration = Duration::from_secs(20);
@@ -84,6 +86,33 @@ pub async fn fetch_statements(
     statements.sort_by_key(|s| s.statement.created_at);
     statements.dedup();
     Ok(statements)
+}
+
+/// The newest lease order `instance` published under `order_id`, if the relays hold one. Only
+/// events that verify, are signed by `instance` and name that order count, so a relay can
+/// withhold an order or serve an older one, but cannot invent one or change its terms.
+pub async fn fetch_lease_order(
+    order_id: Uuid,
+    instance: &PublicKey,
+    relays: &[String],
+) -> Result<Option<LeaseOrder>, String> {
+    let client = connected(relays).await?;
+    let filter = Filter::new()
+        .kind(Kind::Custom(KIND_LEASE_ORDER))
+        .author(*instance)
+        .identifier(order_id.to_string());
+    let fetched = client.fetch_events(filter).timeout(RELAY_TIMEOUT).await;
+    client.shutdown().await;
+    let events = fetched.map_err(|e| format!("fetch: {e}"))?;
+    Ok(events
+        .iter()
+        .filter(|event| event.pubkey == *instance)
+        .filter_map(|event| {
+            let order = LeaseOrder::from_event(event).ok()?;
+            (order.id == order_id).then_some((event.created_at, order))
+        })
+        .max_by_key(|(created_at, _)| *created_at)
+        .map(|(_, order)| order))
 }
 
 #[cfg(test)]
@@ -184,6 +213,81 @@ mod tests {
                 .expect("fetch")
                 .is_empty()
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reads_the_newest_order_the_instance_signed_and_nothing_forged() {
+        use mostro_core::lease_message::LeaseOffer;
+        use mostro_core::lease_order::LeaseOrderStatus;
+        use nostr_sdk::prelude::Timestamp;
+
+        let relay = MockRelay::run().await.expect("relay");
+        let relays = vec![relay.url().await.to_string()];
+        let (instance, seller, forger) = (Keys::generate(), Keys::generate(), Keys::generate());
+        let (_, node) = node_key(1);
+        let offer = LeaseOffer {
+            network: Network::Regtest,
+            seller_node: node.to_string(),
+            binding: binding(&seller, 1, Action::Bind, 1_000).as_json(),
+            min_capacity_sat: 1_000_000,
+            max_capacity_sat: 5_000_000,
+            duration_blocks: 4_320,
+            fee_base_sat: 1_000,
+            fee_ppm: 2_500,
+            upfront_percent: 100,
+            min_confirmations: 3,
+            announce: true,
+            expires_at: 2_000_000_000,
+        };
+        let id = Uuid::new_v4();
+        let order = |status, at: u64, keys: &Keys| {
+            LeaseOrder::from_offer(id, status, &offer)
+                .expect("order")
+                .to_event_builder()
+                .custom_created_at(Timestamp::from(at))
+                .finalize(keys)
+                .expect("event")
+        };
+
+        let none = fetch_lease_order(id, &instance.public_key(), &relays).await;
+        assert_eq!(none, Ok(None));
+
+        publish(&order(LeaseOrderStatus::Pending, 1_000, &instance), &relays)
+            .await
+            .expect("publish");
+        // A later "order" under the same id from someone else changes nothing.
+        let mut cheaper = offer.clone();
+        cheaper.fee_ppm = 1;
+        let forged = LeaseOrder::from_offer(id, LeaseOrderStatus::Pending, &cheaper)
+            .expect("order")
+            .to_event_builder()
+            .custom_created_at(Timestamp::from(5_000))
+            .finalize(&forger)
+            .expect("event");
+        publish(&forged, &relays).await.expect("publish");
+        let found = fetch_lease_order(id, &instance.public_key(), &relays)
+            .await
+            .expect("fetch")
+            .expect("the order");
+        assert_eq!(found.status, LeaseOrderStatus::Pending);
+        assert_eq!(found.fee_ppm, 2_500);
+        assert_eq!(found.seller_node, node);
+
+        // The instance's own newer status replaces the old one.
+        publish(
+            &order(LeaseOrderStatus::InProgress, 2_000, &instance),
+            &relays,
+        )
+        .await
+        .expect("publish");
+        let found = fetch_lease_order(id, &instance.public_key(), &relays)
+            .await
+            .expect("fetch")
+            .expect("the order");
+        assert_eq!(found.status, LeaseOrderStatus::InProgress);
+        // Another order id is not found.
+        let other = fetch_lease_order(Uuid::new_v4(), &instance.public_key(), &relays).await;
+        assert_eq!(other, Ok(None));
     }
 
     #[tokio::test]

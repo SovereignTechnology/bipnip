@@ -9,23 +9,43 @@
 //!                                              make the node binding event; --publish sends it
 //! bipnip-agent --config FILE verify-binding NODE_PUBKEY
 //!                                              read a node's bindings from the relays and resolve them
+//! bipnip-agent --config FILE lease offer --min-capacity SAT --max-capacity SAT --duration BLOCKS
+//!         --fee-base SAT --fee-ppm PPM --feerate SAT_PER_VB [--upfront PERCENT] [--confs N]
+//!         [--private] [--expires-in SECS] [--cltv-delta BLOCKS] [--poll SECS]
+//!                                              offer liquidity and see the lease through
+//! bipnip-agent --config FILE lease take ORDER_ID --capacity SAT [--node-address HOST:PORT]
+//!         [--max-fee-msat MSAT] [--max-cltv-delta BLOCKS] [--poll SECS]
+//!                                              take an order and see the lease through
+//! bipnip-agent --config FILE lease resume [--poll SECS]
+//!                                              carry on with stored leases after a restart
+//! bipnip-agent --config FILE lease list        show the stored leases
 //! ```
+//!
+//! The `lease` commands need an `[instance]` section and a node. They run until the lease is
+//! active or over; a lease interrupted before that is picked up again by `lease resume`.
 //!
 //! Nothing here prints the mnemonic or any credential.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::str::FromStr;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bipnip_agent::binding::make_binding_event;
 use bipnip_agent::config::Config;
 use bipnip_agent::keys::Wallet;
+use bipnip_agent::lease::cmd::{self, OfferParams, Session, TakeParams};
+use bipnip_agent::lease::run::{BuyerConfig, SellerConfig};
+use bipnip_agent::lease::{DEFAULT_MAX_CLTV_DELTA, DEFAULT_SELLER_CLTV_DELTA};
 use bipnip_agent::{relay, secretfile};
 use bipnip_ln::LightningBackend;
 use mostro_core::node_binding::{Action, latest_for_node};
 use nostr_sdk::prelude::ToBech32;
 
 fn usage() -> String {
-    "usage: bipnip-agent --config FILE <init | whoami | bind [--revoke] [--publish] | verify-binding NODE_PUBKEY>"
+    "usage: bipnip-agent --config FILE <init | whoami | bind [--revoke] [--publish] | \
+     verify-binding NODE_PUBKEY | lease <offer | take ORDER_ID | resume | list> [options]> \
+     (the options are listed at the top of the agent's source and in the README)"
         .to_string()
 }
 
@@ -166,6 +186,161 @@ async fn verify_binding(config: &Config, node_pubkey: &str) -> Result<(), String
     }
 }
 
+/// Command-line options of the form `--name value`, plus the switches named in `switches` and
+/// any other words in order.
+struct Options {
+    values: HashMap<String, String>,
+    switches: Vec<String>,
+    words: Vec<String>,
+}
+
+impl Options {
+    fn parse(args: &[String], switches: &[&str]) -> Result<Self, String> {
+        let mut options = Options {
+            values: HashMap::new(),
+            switches: Vec::new(),
+            words: Vec::new(),
+        };
+        let mut args = args.iter();
+        while let Some(arg) = args.next() {
+            match arg.strip_prefix("--") {
+                None => options.words.push(arg.clone()),
+                Some(name) if switches.contains(&name) => options.switches.push(name.to_string()),
+                Some(name) => {
+                    let value = args.next().ok_or(format!("--{name} needs a value"))?;
+                    if options
+                        .values
+                        .insert(name.to_string(), value.clone())
+                        .is_some()
+                    {
+                        return Err(format!("--{name} is given twice"));
+                    }
+                }
+            }
+        }
+        Ok(options)
+    }
+
+    /// Takes the value of `--name`, if given.
+    fn take<T: FromStr>(&mut self, name: &str) -> Result<Option<T>, String> {
+        match self.values.remove(name) {
+            None => Ok(None),
+            Some(text) => text
+                .parse()
+                .map(Some)
+                .map_err(|_| format!("--{name}: {text:?} is not a valid value")),
+        }
+    }
+
+    fn required<T: FromStr>(&mut self, name: &str) -> Result<T, String> {
+        self.take(name)?.ok_or(format!("--{name} is required"))
+    }
+
+    fn or<T: FromStr>(&mut self, name: &str, default: T) -> Result<T, String> {
+        Ok(self.take(name)?.unwrap_or(default))
+    }
+
+    fn switch(&self, name: &str) -> bool {
+        self.switches.iter().any(|s| s == name)
+    }
+
+    /// Refuses options nobody took, so a typo is an error and not a silent default.
+    fn done(self) -> Result<Vec<String>, String> {
+        match self.values.keys().next() {
+            Some(name) => Err(format!("unknown option --{name}")),
+            None => Ok(self.words),
+        }
+    }
+}
+
+fn say(line: String) {
+    println!("{line}");
+}
+
+async fn lease(config: &Config, args: &[String]) -> Result<(), String> {
+    let Some((command, rest)) = args.split_first() else {
+        return Err(usage());
+    };
+    if command == "list" && rest.is_empty() {
+        for line in cmd::list(config)? {
+            println!("{line}");
+        }
+        return Ok(());
+    }
+    let mut options = Options::parse(rest, &["private"])?;
+    let poll = Duration::from_secs(options.or("poll", 5u64)?.max(1));
+    let wallet = load_wallet(config)?;
+    let node = backend(config).await?;
+    let session = Session {
+        config,
+        wallet: &wallet,
+        backend: node.as_ref(),
+    };
+    match command.as_str() {
+        "offer" => {
+            let params = OfferParams {
+                min_capacity_sat: options.required("min-capacity")?,
+                max_capacity_sat: options.required("max-capacity")?,
+                duration_blocks: options.required("duration")?,
+                fee_base_sat: options.required("fee-base")?,
+                fee_ppm: options.required("fee-ppm")?,
+                // The completion share is not collected yet, so by default all of it is upfront.
+                upfront_percent: options.or("upfront", 100u8)?,
+                min_confirmations: options.or("confs", 3u32)?,
+                announce: !options.switch("private"),
+                expires_in_secs: options.or("expires-in", 86_400u64)?,
+            };
+            let seller = SellerConfig {
+                cltv_delta: options.or("cltv-delta", DEFAULT_SELLER_CLTV_DELTA)?,
+                feerate_sat_vb: options.required("feerate")?,
+            };
+            if !options.done()?.is_empty() {
+                return Err(usage());
+            }
+            if params.upfront_percent < 100 {
+                eprintln!(
+                    "note: this version does not send the completion invoice yet; the share not \
+                     paid upfront will not be collected"
+                );
+            }
+            let (mut run, mut link) = cmd::offer(&session, params, seller).await?;
+            let result = cmd::run_seller(&session, &mut run, &mut link, poll, &mut say).await;
+            link.close().await;
+            result
+        }
+        "take" => {
+            let capacity_sat = options.required("capacity")?;
+            let node_address = options.take("node-address")?;
+            let buyer = BuyerConfig {
+                max_fee_msat: options.or("max-fee-msat", 10_000u64)?,
+                max_cltv_delta: options.or("max-cltv-delta", DEFAULT_MAX_CLTV_DELTA)?,
+            };
+            let words = options.done()?;
+            let [order_id] = words.as_slice() else {
+                return Err(usage());
+            };
+            let params = TakeParams {
+                order_id: order_id
+                    .parse()
+                    .map_err(|_| format!("{order_id:?} is not an order id"))?,
+                capacity_sat,
+                node_address,
+            };
+            let (mut run, mut link) = cmd::take(&session, params, buyer).await?;
+            let result = cmd::run_buyer(&session, &mut run, &mut link, poll, &mut say).await;
+            link.close().await;
+            result
+        }
+        "resume" => {
+            if !options.done()?.is_empty() {
+                return Err(usage());
+            }
+            cmd::resume(&session, poll, &mut say).await
+        }
+        _ => Err(usage()),
+    }
+}
+
 async fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (config_path, rest) = match args.as_slice() {
@@ -184,6 +359,7 @@ async fn run() -> Result<(), String> {
             bind(&config, has("--revoke"), has("--publish")).await
         }
         [cmd, node] if cmd == "verify-binding" => verify_binding(&config, node).await,
+        [cmd, rest @ ..] if cmd == "lease" => lease(&config, rest).await,
         _ => Err(usage()),
     }
 }
