@@ -8,12 +8,24 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "bipnip-agent"
 path = "src/main.rs"
 
 [dependencies]
 bipnip-ln.workspace = true
+# bipnip-core main (#2): Mostro's protocol types plus the node binding.
+mostro-core = { git = "https://github.com/SovereignTechnology/bipnip-core", rev = "282e28b6c6a4b3020ee2f9d4e4f385e0d2373564" }
+# The versions bipnip-core resolves, so key and event types are the same types.
+nostr-sdk = "0.45.1"
+secp256k1 = "0.30"
+
+[dev-dependencies]
+async-trait.workspace = true
+tokio = { version = "1", features = ["rt", "macros"] }
 
 [lints]
 workspace = true

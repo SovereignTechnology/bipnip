@@ -6,7 +6,6 @@
 //! `docs/decisions/0009-web-client-security.md`).
 
 fn main() {
-    let _contract: Option<&dyn bipnip_ln::LightningBackend> = None;
     eprintln!("bipnip-agent: not built yet (milestone M1); see docs/decisions/");
     std::process::exit(2);
 }
