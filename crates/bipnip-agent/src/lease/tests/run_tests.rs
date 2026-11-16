@@ -3,7 +3,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use bipnip_ln::{HoldState, LightningBackend, PaymentState};
+use bipnip_ln::{HoldState, LightningBackend, OpenRequest, PaymentState};
 use mostro_core::lease_message::{LeaseOffer, LeasePayload};
 use mostro_core::node_binding::{
     Action as BindingAction, Network, SignedStatement, Statement, sign_ln_message,
@@ -17,7 +17,7 @@ use crate::lease::run::{
     BuyerConfig, BuyerRun, BuyerState, Outgoing, RunError, SellerConfig, SellerRun, SellerState,
     TakeRequest,
 };
-use crate::lease::{DEFAULT_MAX_CLTV_DELTA, DEFAULT_SELLER_CLTV_DELTA};
+use crate::lease::{DEFAULT_MAX_CLTV_DELTA, DEFAULT_SELLER_CLTV_DELTA, LeaseStepError};
 use crate::lease_wire::{self, Incoming, WireError};
 
 const SELLER: SellerConfig = SellerConfig {
@@ -501,6 +501,45 @@ async fn an_invoice_for_another_lease_is_not_paid() {
     );
     assert_eq!(buyer.state(), BuyerState::Taking);
     assert!(stage.world.lock().expect("world").payments.is_empty());
+}
+
+#[tokio::test]
+async fn a_channel_that_existed_before_the_lease_is_not_paid_for() {
+    let stage = Stage::new();
+    // The seller opened a channel to the buyer some time ago, with the very terms on offer.
+    let old = stage
+        .seller_node
+        .open_channel(&OpenRequest {
+            remote_pubkey: stage.buyer_node.id(),
+            remote_addr: None,
+            capacity_sat: 2_000_000,
+            announce: true,
+            feerate_sat_vb: 2,
+        })
+        .await
+        .expect("an earlier channel");
+    confirm(&stage.world, &old, 500);
+
+    let (seller, mut buyer, invoice) = stage.taken().await;
+    stage.to_buyer(&mut buyer, &invoice).await.expect("invoice");
+    // It reports the old channel instead of opening one.
+    let report =
+        lease_wire::channel_opened(stage.order_id, buyer.contract(), &old).expect("report");
+    let result = stage.to_buyer(&mut buyer, &report).await;
+    assert!(
+        matches!(result, Err(RunError::Step(LeaseStepError::Channel(_)))),
+        "{result:?}"
+    );
+    assert_eq!(buyer.state(), BuyerState::Paid);
+    assert!(
+        buyer
+            .tick(&stage.buyer_node)
+            .await
+            .expect("tick")
+            .is_empty()
+    );
+    assert_eq!(stage.payment(&buyer).await, PaymentState::InFlight);
+    assert_eq!(seller.state(), SellerState::Invoiced);
 }
 
 #[tokio::test]
