@@ -16,12 +16,17 @@ name = "lnd-conformance"
 path = "src/lnd.rs"
 
 [[bin]]
+name = "lease-e2e"
+path = "src/lease.rs"
+
+[[bin]]
 name = "test-relay"
 path = "src/relay.rs"
 
 [dependencies]
 nostr-sdk = { version = "0.45.1", features = ["local-relay"] }
 bipnip-ln = { path = "../../crates/bipnip-ln", features = ["lnd"] }
-# bipnip-core main (#2): node signatures are checked with the same code verifiers use.
-mostro-core = { git = "https://github.com/SovereignTechnology/bipnip-core", rev = "282e28b6c6a4b3020ee2f9d4e4f385e0d2373564" }
+bipnip-agent = { path = "../../crates/bipnip-agent", features = ["lnd"] }
+# bipnip-core main (#3): the same revision the agent uses.
+mostro-core = { git = "https://github.com/SovereignTechnology/bipnip-core", rev = "5daa0124b5ecb86bb32dc947a3d5659e7e1c8d64" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }

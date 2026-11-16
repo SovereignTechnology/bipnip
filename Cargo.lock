@@ -449,12 +449,16 @@ dependencies = [
  "async-trait",
  "bip39",
  "bipnip-ln",
+ "bitcoin",
+ "getrandom 0.3.4",
  "libc",
+ "lightning-invoice",
  "mostro-core",
  "nostr",
  "nostr-sdk",
  "secp256k1 0.30.0",
  "serde",
+ "sha2 0.10.9",
  "tokio",
  "toml 0.8.23",
  "zeroize",
@@ -2592,6 +2596,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "lightning-invoice"
+version = "0.34.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5e874476e461bcca94ae30335bc5263f126f9219fdbd7bde6e02b530dbaa6567"
+dependencies = [
+ "bech32 0.11.1",
+ "bitcoin",
+ "lightning-types",
+]
+
+[[package]]
+name = "lightning-types"
+version = "0.3.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c77c676d4a34cceb2ae3756916e446b4d17f9430a24107e099981f0f9aec77e6"
+dependencies = [
+ "bitcoin",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2703,7 +2727,7 @@ dependencies = [
 [[package]]
 name = "mostro-core"
 version = "0.17.3"
-source = "git+https://github.com/SovereignTechnology/bipnip-core?rev=282e28b6c6a4b3020ee2f9d4e4f385e0d2373564#282e28b6c6a4b3020ee2f9d4e4f385e0d2373564"
+source = "git+https://github.com/SovereignTechnology/bipnip-core?rev=5daa0124b5ecb86bb32dc947a3d5659e7e1c8d64#5daa0124b5ecb86bb32dc947a3d5659e7e1c8d64"
 dependencies = [
  "bitcoin",
  "chrono",
