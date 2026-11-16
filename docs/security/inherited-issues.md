@@ -1,7 +1,7 @@
 # Security issues inherited from Mostro
 
 Open upstream issues in `MostroP2P/mostro` that the fork (`bipnipd`, v0.20.2) inherits, checked on
-2026-11-10 (all OPEN). Rule: each is fixed, or gated so the affected path cannot run, **before any bipnip
+2026-11-15 (all OPEN). Rule: each is fixed, or gated so the affected path cannot run, **before any bipnip
 money path ships** (M2). A fix is first looked for upstream (merged → take it on the next release merge);
 otherwise bipnip fixes it with a regression test first, and offers it upstream after the duplicate check
 and after the project owner reads it.
@@ -20,3 +20,19 @@ and after the project owner reads it.
 Also, by design rather than a filed issue: escrow preimages (fiat trades) sit in SQLite in cleartext.
 bipnipd keeps the database 0600 and adds encryption at rest for the preimage column (M1). Lease and ring
 preimages never reach the instance (ADR 0003).
+
+## Status on 2026-11-15
+
+Checked with the duplicate guard before any work (`guard-pr-duplicate.py MostroP2P/mostro N`):
+
+- **Claimed upstream, not duplicated here:** #807 by PR #877 (open, stale since 2026-09-03, conflicting,
+  changes requested; it makes an enabled RPC without a token fatal) and #1014 by PR #890 (open). bipnipd keeps
+  the RPC off by default until one of them lands or the project owner decides to carry a fork-only gate.
+- **#836:** not claimed, but PR #842 (open) touches it; read it before starting.
+- **Free:** #1102, #808, #904, #1078, #954.
+- **#904:** fix on bipnipd branch `fix/904-release-claim-before-settle` (regression test first, failing on the
+  old order with 2 settles; then claim-before-settle). One deliberate difference from the issue text: a failed
+  settle hands the claim back by compare-and-swap so the seller can retry, since no path recovers an order
+  left in `settled-hold-invoice` with an unsettled invoice. Money path: waits for the project owner's read.
+- **#1078:** `bipnip-ln`'s LND backend reads hold-invoice state by lookup, with no subscription to lose
+  (conformance run in `itest/ln`); it takes effect in bipnipd when the daemon moves onto the backend.

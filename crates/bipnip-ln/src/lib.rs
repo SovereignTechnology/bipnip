@@ -3,13 +3,17 @@
 //! [`LightningBackend`] widens Mostro's `EscrowBackend` (hold invoices with the instance's own
 //! preimage) with what bipnip's liquidity trades need: hold invoices **on a hash someone else
 //! chose** (the lease buyer keeps the preimage), channel opens and inspection, graph lookups,
-//! and the node's `signmessage` for node ↔ Nostr key bindings. Implementations for LND, Core
-//! Lightning and LDK land in M1; this crate fixes the contract first.
+//! and the node's `signmessage` for node ↔ Nostr key bindings. The LND implementation is `lnd::LndBackend`
+//! (feature `lnd`; building it needs `protoc`); Core Lightning and LDK follow.
 //!
 //! Keys and identifiers cross this boundary as hex strings, so the trait does not tie callers to
 //! one secp256k1 version (rust-bitcoin 0.32 and rust-nostr 0.45 carry two).
 
 use async_trait::async_trait;
+
+pub mod hexutil;
+#[cfg(feature = "lnd")]
+pub mod lnd;
 
 /// Why a backend call failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +62,23 @@ pub enum HoldState {
     Settled,
     /// Cancelled, or expired; the payer is refunded.
     Canceled,
+}
+
+/// An outgoing payment's state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaymentState {
+    /// HTLCs are out and unresolved (for a hold invoice: locked at the payee).
+    InFlight,
+    /// Paid; the payee revealed the preimage (64 lower-case hex).
+    Succeeded {
+        /// The payment preimage.
+        preimage: String,
+    },
+    /// Failed or cancelled; the funds are back.
+    Failed {
+        /// The node's reason, for logs.
+        reason: String,
+    },
 }
 
 /// Parameters for a hold invoice.
@@ -133,8 +154,19 @@ pub trait LightningBackend: Send + Sync {
     /// Cancels a hold invoice, refunding the payer.
     async fn cancel_hold_invoice(&self, payment_hash: &str) -> Result<(), BackendError>;
 
-    /// Pays a BOLT 11 invoice; returns the preimage once paid.
-    async fn pay_invoice(&self, bolt11: &str, max_fee_msat: u64) -> Result<String, BackendError>;
+    /// Starts paying a BOLT 11 invoice and waits up to `wait_secs` for it to finish. A payment to a
+    /// hold invoice stays [`PaymentState::InFlight`] until the payee settles or cancels, so callers
+    /// follow it with [`LightningBackend::payment_state`]. Returning `InFlight` never cancels the
+    /// payment.
+    async fn pay_invoice(
+        &self,
+        bolt11: &str,
+        max_fee_msat: u64,
+        wait_secs: u32,
+    ) -> Result<PaymentState, BackendError>;
+
+    /// Current state of an outgoing payment, by its payment hash (64 lower-case hex).
+    async fn payment_state(&self, payment_hash: &str) -> Result<PaymentState, BackendError>;
 
     /// A plain BOLT 11 invoice for `amount_msat` (the node picks the preimage).
     async fn add_invoice(

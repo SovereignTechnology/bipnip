@@ -35,3 +35,14 @@ the agent (hold invoices by external hash, opens, channel checks, `signmessage`)
 
 - The fork's largest upstream diff is this refactor; it is also the most useful piece to offer upstream.
 - Each backend gets the same conformance tests in the regtest harness.
+
+## Notes from the LND implementation (2026-11-15)
+
+- `pay_invoice` returns a `PaymentState` after a bounded wait and `payment_state(hash)` follows it: a payment
+  to a hold invoice stays in flight until the payee settles, so "pay and return the preimage" cannot be the
+  contract. A wait that runs out never cancels the payment.
+- The LND backend is behind the `lnd` cargo feature because building `fedimint-tonic-lnd` needs `protoc`;
+  the default workspace build (web host, offline builders) does not.
+- Measured on LND v0.21.5-beta (`itest/ln`): settling an already-settled hold invoice again succeeds (a retry
+  after a lost reply is safe); a preimage matching no invoice, and the right preimage for an unpaid invoice,
+  are refused; a brand-new channel can fail the first payment (`failure reason 5`), so callers retry.

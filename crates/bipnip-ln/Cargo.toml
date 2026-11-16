@@ -8,8 +8,17 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+# The LND backend. Off by default: building fedimint-tonic-lnd needs `protoc`.
+lnd = ["dep:fedimint-tonic-lnd", "dep:rustls", "dep:tokio"]
+
 [dependencies]
 async-trait.workspace = true
+# The LND client mostrod uses (bipnipd moves onto this backend).
+fedimint-tonic-lnd = { version = "0.4.0", optional = true }
+# fedimint-tonic-lnd's TLS (rustls 0.23) needs a process-wide crypto provider.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
+tokio = { version = "1", features = ["time"], optional = true }
 
 [lints]
 workspace = true
