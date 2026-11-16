@@ -241,7 +241,10 @@ async fn main() {
         HoldState::Canceled
     );
 
-    step("settling with a wrong preimage is rejected");
+    step("settle is idempotent; a preimage matching no invoice is refused");
+    // Settling an already-settled invoice again is accepted by LND: a retry after a lost reply is safe.
+    let again = b.settle_hold_invoice(pre).await;
+    assert!(again.is_ok(), "repeat settle: {again:?}");
     let (_, hash3) = &hashes[2];
     b.add_hold_invoice(&HoldInvoiceRequest {
         payment_hash: hash3.clone(),
@@ -249,14 +252,16 @@ async fn main() {
     })
     .await
     .expect("add hold");
-    assert!(matches!(
-        b.settle_hold_invoice(pre).await,
-        Err(BackendError::Rejected(_))
-    ));
+    let stranger = "5a".repeat(32);
+    let refused = b.settle_hold_invoice(&stranger).await;
+    assert!(refused.is_err(), "unknown preimage: {refused:?}");
     assert_eq!(
         b.hold_invoice_state(hash3).await.expect("state"),
         HoldState::Open
     );
+    // An open (unpaid) hold invoice cannot be settled even with its own preimage.
+    let unpaid = b.settle_hold_invoice(&hashes[2].0).await;
+    assert!(unpaid.is_err(), "settle of an unpaid invoice: {unpaid:?}");
 
     step("plain invoice paid within the wait");
     let invoice = b
