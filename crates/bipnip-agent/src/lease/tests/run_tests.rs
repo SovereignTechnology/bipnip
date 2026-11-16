@@ -20,6 +20,8 @@ use crate::lease::run::{
 use crate::lease::{DEFAULT_MAX_CLTV_DELTA, DEFAULT_SELLER_CLTV_DELTA, LeaseStepError};
 use crate::lease_wire::{self, Incoming, WireError};
 
+mod store_tests;
+
 const SELLER: SellerConfig = SellerConfig {
     cltv_delta: DEFAULT_SELLER_CLTV_DELTA,
     feerate_sat_vb: 2,
@@ -231,11 +233,22 @@ impl Stage {
         let (mut seller, mut buyer, invoice) = self.taken().await;
         self.to_buyer(&mut buyer, &invoice).await.expect("invoice");
         assert_eq!(buyer.state(), BuyerState::Paid);
-        let report = to_instance(seller.tick(&self.seller_node).await.expect("tick"));
+        let report = self.open(&mut seller).await;
         assert_eq!(seller.state(), SellerState::Opened);
         self.to_buyer(&mut buyer, &report).await.expect("report");
         assert_eq!(buyer.state(), BuyerState::Verifying);
         (seller, buyer)
+    }
+
+    /// The seller notices the locked payment, then opens the channel: two looks at its node,
+    /// with room for a save in between.
+    async fn open(&self, seller: &mut SellerRun) -> Message {
+        let noticed = seller.tick(&self.seller_node).await.expect("tick");
+        assert!(noticed.is_empty());
+        assert_eq!(seller.state(), SellerState::Opening);
+        let report = to_instance(seller.tick(&self.seller_node).await.expect("tick"));
+        assert_eq!(seller.state(), SellerState::Opened);
+        report
     }
 
     fn confirm(&self, seller: &SellerRun) {
@@ -332,7 +345,7 @@ async fn a_lease_runs_from_offer_to_active_on_messages_alone() {
     assert_eq!(buyer.state(), BuyerState::Paid);
     assert_eq!(stage.hold_state(&buyer).await, HoldState::Accepted);
 
-    let report = to_instance(seller.tick(&stage.seller_node).await.expect("tick"));
+    let report = stage.open(&mut seller).await;
     assert_eq!(seller.state(), SellerState::Opened);
     // Opened once, however often the seller looks.
     assert!(
@@ -407,7 +420,7 @@ async fn messages_from_the_wrong_sender_do_nothing() {
     assert!(stage.world.lock().expect("world").payments.is_empty());
 
     stage.to_buyer(&mut buyer, &invoice).await.expect("invoice");
-    let report = to_instance(seller.tick(&stage.seller_node).await.expect("tick"));
+    let report = stage.open(&mut seller).await;
     stage.to_buyer(&mut buyer, &report).await.expect("report");
     stage.confirm(&seller);
     let out = buyer.tick(&stage.buyer_node).await.expect("tick");

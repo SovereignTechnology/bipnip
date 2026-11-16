@@ -30,6 +30,8 @@ getrandom = "0.3"
 lightning-invoice = { version = "0.34", features = ["std"] }
 sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
+# Lease state on disk.
+serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 toml = "0.8"
 # bipnip-core main (#5): Mostro's protocol types and transport, the node binding, lease terms,

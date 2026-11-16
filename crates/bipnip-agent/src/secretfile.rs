@@ -61,6 +61,29 @@ pub fn create_secret(path: &Path, contents: &str) -> Result<(), SecretFileError>
         .map_err(|e| SecretFileError::Io(e.to_string()))
 }
 
+/// Writes `contents` to `path` with mode 600, replacing whatever is there in one step: a reader
+/// sees the old file or the new one, never half of either. For files that change (lease state);
+/// a secret that must never change is written once with [`create_secret`].
+pub fn replace_private(path: &Path, contents: &str) -> Result<(), SecretFileError> {
+    let io = |e: std::io::Error| SecretFileError::Io(e.to_string());
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(SecretFileError::Io("not a file path".into()));
+    };
+    let tmp = dir.join(format!(".{}.tmp", name.to_string_lossy()));
+    // A leftover from a write that was cut short.
+    match std::fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(io(e)),
+    }
+    create_secret(&tmp, contents)?;
+    std::fs::rename(&tmp, path).map_err(io)?;
+    // The rename itself must survive a power cut.
+    std::fs::File::open(dir)
+        .and_then(|d| d.sync_all())
+        .map_err(io)
+}
+
 /// Reads a secret file after checking it is a regular file only its owner can access. The check is
 /// made on the opened file, so the file read is the file checked.
 pub fn read_secret(path: &Path) -> Result<String, SecretFileError> {
@@ -112,6 +135,29 @@ mod tests {
         assert_eq!(read_secret(&f).expect("read"), "words words");
         assert_eq!(create_secret(&f, "other"), Err(SecretFileError::Exists));
         assert_eq!(read_secret(&f).expect("read"), "words words");
+    }
+
+    #[test]
+    fn replaces_in_one_step_and_stays_owner_only() {
+        let d = dir("replace");
+        let f = d.join("state.json");
+        replace_private(&f, "one").expect("first write");
+        replace_private(&f, "two").expect("second write");
+        assert_eq!(read_secret(&f).expect("read"), "two");
+        assert_eq!(std::fs::metadata(&f).expect("meta").mode() & 0o777, 0o600);
+        // A leftover temporary file from a cut-short write does not get in the way.
+        std::fs::write(d.join(".state.json.tmp"), "half").expect("leftover");
+        replace_private(&f, "three").expect("third write");
+        assert_eq!(read_secret(&f).expect("read"), "three");
+        assert!(!d.join(".state.json.tmp").exists());
+        // A symlink at the target is replaced, not followed.
+        let elsewhere = d.join("elsewhere");
+        create_secret(&elsewhere, "untouched").expect("create");
+        let link = d.join("link.json");
+        std::os::unix::fs::symlink(&elsewhere, &link).expect("symlink");
+        replace_private(&link, "four").expect("replace the link");
+        assert_eq!(read_secret(&link).expect("a regular file now"), "four");
+        assert_eq!(read_secret(&elsewhere).expect("read"), "untouched");
     }
 
     #[test]
