@@ -1,7 +1,7 @@
 //! Lease tests on a two-node simulator: hold invoices are real, signed BOLT 11 invoices; payments,
 //! invoice states and channels live in one shared table both nodes read and write.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -32,6 +32,8 @@ struct World {
     invoices: HashMap<String, HoldState>,
     payments: HashMap<String, PaymentState>,
     channels: Vec<Channel>,
+    /// Payment hashes of plain (not hold) invoices: paying one settles it at once.
+    plain: HashSet<String>,
 }
 
 struct Node {
@@ -155,6 +157,14 @@ impl LightningBackend for Node {
         let parsed = Bolt11Invoice::from_str(bolt11).expect("invoice");
         let hash = parsed.payment_hash().to_string();
         let mut w = self.world.lock().expect("world");
+        if w.plain.contains(&hash) {
+            let paid = PaymentState::Succeeded {
+                preimage: "00".repeat(32),
+            };
+            w.invoices.insert(hash.clone(), HoldState::Settled);
+            w.payments.insert(hash, paid.clone());
+            return Ok(paid);
+        }
         if w.invoices.get(&hash) == Some(&HoldState::Open) {
             w.invoices.insert(hash.clone(), HoldState::Accepted);
         }
@@ -168,8 +178,24 @@ impl LightningBackend for Node {
             .cloned()
             .ok_or(BackendError::Rejected("no such payment".into()))
     }
-    async fn add_invoice(&self, _: u64, _: u32, _: &str) -> Result<String, BackendError> {
-        unsupported()
+    async fn add_invoice(
+        &self,
+        amount_msat: u64,
+        expiry_secs: u32,
+        _: &str,
+    ) -> Result<String, BackendError> {
+        let mut w = self.world.lock().expect("world");
+        let hash = sha256_hex(format!("plain invoice {}", w.plain.len()).as_bytes());
+        w.invoices.insert(hash.clone(), HoldState::Open);
+        w.plain.insert(hash.clone());
+        Ok(invoice(
+            &self.secret,
+            Currency::Regtest,
+            &hash,
+            amount_msat,
+            expiry_secs,
+            18,
+        ))
     }
     async fn connect(&self, _: &str, _: &str) -> Result<(), BackendError> {
         Ok(())

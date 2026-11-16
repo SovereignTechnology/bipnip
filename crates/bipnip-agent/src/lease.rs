@@ -167,6 +167,41 @@ pub fn check_upfront_invoice(
     Ok(())
 }
 
+/// How long a completion invoice stays payable: a day.
+pub const COMPLETION_INVOICE_EXPIRY_SECS: u32 = 24 * 3600;
+
+/// Checks the seller's completion invoice against the contract: the payee is the seller's node,
+/// the amount is exactly the completion share, and the network matches. Returns its payment hash
+/// (64 hex). Whether the lease has earned it is the caller's check, on its own node.
+pub fn check_completion_invoice(
+    bolt11: &str,
+    contract: &LeaseContract,
+) -> Result<String, LeaseStepError> {
+    let refuse = |why: &str| Err(LeaseStepError::Invoice(why.to_string()));
+    let invoice = match Bolt11Invoice::from_str(bolt11) {
+        Ok(invoice) => invoice,
+        Err(_) => return refuse("not a valid BOLT 11 invoice"),
+    };
+    if invoice.get_payee_pub_key().to_string() != contract.seller_node.to_string() {
+        return refuse("it pays a different node than the seller");
+    }
+    let completion_msat = contract
+        .terms
+        .completion_sat()?
+        .checked_mul(1000)
+        .ok_or(LeaseError::Fee("completion overflow"))?;
+    if completion_msat == 0 {
+        return refuse("this lease has no completion share");
+    }
+    if invoice.amount_milli_satoshis() != Some(completion_msat) {
+        return refuse("its amount is not the agreed completion share");
+    }
+    if Some(invoice.currency()) != currency_of(contract.network) {
+        return refuse("it is for another network");
+    }
+    Ok(invoice.payment_hash().to_string())
+}
+
 /// Checks a channel, as the buyer's own node reports it, against the contract and the funding
 /// outpoint the seller announced.
 pub fn check_channel(
@@ -511,6 +546,27 @@ impl SellerLease {
             feerate_sat_vb,
         };
         Ok(backend.open_channel(&request).await?)
+    }
+
+    /// Has the seller's own node create a plain invoice for the completion share. Whether the
+    /// lease has run its length is the caller's check.
+    pub async fn completion_invoice(
+        &self,
+        backend: &dyn LightningBackend,
+    ) -> Result<String, LeaseStepError> {
+        let amount_msat = self
+            .contract
+            .terms
+            .completion_sat()?
+            .checked_mul(1000)
+            .ok_or(LeaseError::Fee("completion overflow"))?;
+        if amount_msat == 0 {
+            return Err(LeaseError::Fee("this lease has no completion share").into());
+        }
+        let description = format!("bipnip lease {} completion", &self.contract.id()[..16]);
+        Ok(backend
+            .add_invoice(amount_msat, COMPLETION_INVOICE_EXPIRY_SECS, &description)
+            .await?)
     }
 
     /// Settles the hold invoice with the preimage the buyer released, after checking it is this

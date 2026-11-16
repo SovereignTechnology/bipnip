@@ -18,9 +18,10 @@ conformance run against real nodes; `bipnip-agent` can create a mnemonic, bind a
 binding. A whole lease now runs end to end on regtest: a seller's agent offers liquidity on an instance,
 a buyer's agent takes the order, pays the seller's hold invoice, checks the channel on its own node and
 releases the preimage, between real LND nodes and through a real `bipnipd`, which never sees the preimage.
-The instance side of that is still in review (`bipnipd` pull requests 4 and 5). Not written yet: the
-completion payment at the end of a lease, sending again what a relay did not take, rings, and the Core
-Lightning and LDK backends. Nothing here is ready for real funds.
+When part of the fee is due at the end, the seller bills it once the channel is as old as the lease is
+long, and the buyer pays if its node still has the channel. The instance side is still in review
+(`bipnipd` pull requests 4 and 5). Not written yet: rings, and the Core Lightning and LDK backends.
+Nothing here is ready for real funds.
 
 ## Try the agent (regtest or signet only)
 
@@ -68,7 +69,8 @@ bipnip-agent --config agent.toml lease list      # the stored leases and where t
 bipnip-agent --config agent.toml lease resume    # carry on after a restart
 ```
 
-Both commands run until the lease is active or over. The buyer's agent keeps the lease's preimage in an
+Both commands run until the lease is finished: active, when all of the fee was upfront (the default), or
+paid in full at the end of the lease when `--upfront` is below 100. The buyer's agent keeps the lease's preimage in an
 owner-only file under `data_dir/leases` from before it sends the take, so a restart does not lose it.
 
 ## Repositories
