@@ -13,6 +13,8 @@ use lightning_invoice::{InvoiceBuilder, PaymentSecret};
 
 use super::*;
 
+mod run_tests;
+
 const NOW: u64 = 1_794_800_000;
 
 #[derive(Clone)]
