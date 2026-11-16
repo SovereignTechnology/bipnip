@@ -37,9 +37,31 @@ unless noted):
 | `bond` | buyer bond in sat, or `0` |
 | `expiration` | NIP-40 |
 
-Implemented so far (`bipnip-core`, `lease` and `lease_message`): `node`, `network`, `capacity`,
-`duration`, `fee`, `split`, `confs`, `announce` and the expiry. `fee_caps`, `channel_type`, `rules` and
-`bond` are not part of the v1 contract yet.
+Implemented so far (`bipnip-core`, `lease`, `lease_message` and `lease_order`): `node`, `network`,
+`capacity`, `duration`, `fee`, `split`, `confs`, `announce` and the expiry. `fee_caps`, `channel_type`,
+`rules` and `bond` are not part of the v1 contract yet.
+
+### Status
+
+| `s` | when |
+|---|---|
+| `pending` | the offer is open |
+| `in-progress` | a buyer took it; the lease is being set up |
+| `success` | the seller reported the lease active |
+| `canceled` | withdrawn by the seller, canceled by either party before the lease was active, or stalled |
+| `expired` | nobody took it in time |
+
+- The instance republishes the order when its status changes, each event dated after the last, so a relay
+  always keeps the newest.
+- `expiration` is the offer's expiry, whatever the status. Relays drop the event then, so the instance
+  publishes nothing for the order after that point; in practice `expired` is implied by the event
+  disappearing, and a client must treat a `pending` order past its `expiration` as closed.
+- An order that is canceled before its first event reached a relay is never published.
+- A lease with no setup step for 48 hours (the longest a hold invoice lives) is canceled by the instance and
+  both parties are told. This is bookkeeping: by then the buyer's payment has timed out and been refunded.
+  If the seller settled but never reported the lease active, the channel and the payment stand between the
+  two nodes regardless of what the instance records.
+- An instance in maintenance mode accepts no new offers and no new takes; leases under way continue.
 
 ## The contract
 
