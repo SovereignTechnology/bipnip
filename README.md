@@ -15,9 +15,12 @@ leases and rings but never hold lease money.
 
 Status: **M1 and M2 in progress**. M0 (forks, specs, spikes) is done. The LND backend passes its
 conformance run against real nodes; `bipnip-agent` can create a mnemonic, bind a node and publish the
-binding; and the lease engine (both sides) completes a lease between two real LND nodes on regtest,
-refunding the buyer when the seller never opens or opens the wrong channel. Instances do not coordinate
-leases yet, and the Core Lightning and LDK backends are not written. Nothing here is ready for real funds.
+binding. A whole lease now runs end to end on regtest: a seller's agent offers liquidity on an instance,
+a buyer's agent takes the order, pays the seller's hold invoice, checks the channel on its own node and
+releases the preimage, between real LND nodes and through a real `bipnipd`, which never sees the preimage.
+The instance side of that is still in review (`bipnipd` pull requests 4 and 5). Not written yet: the
+completion payment at the end of a lease, sending again what a relay did not take, rings, and the Core
+Lightning and LDK backends. Nothing here is ready for real funds.
 
 ## Try the agent (regtest or signet only)
 
@@ -42,6 +45,31 @@ bipnip-agent --config agent.toml verify-binding <node pubkey>
 ```
 
 Publishing a binding links your node's public key to a Nostr key for everyone to see.
+
+### Leases
+
+Add the instance to the config (its Nostr key, and the proof of work it asks for, if any):
+
+```toml
+[instance]
+pubkey = "npub1…"
+pow = 0
+```
+
+```sh
+# Seller: offer 0.5 to 1 million sat channels for 144 blocks, and see the lease through.
+bipnip-agent --config agent.toml lease offer --min-capacity 500000 --max-capacity 1000000 \
+    --duration 144 --fee-base 1000 --fee-ppm 2000 --feerate 2
+
+# Buyer: take an order the instance published, at a capacity inside its range.
+bipnip-agent --config agent.toml lease take <order id> --capacity 600000 --node-address host:9735
+
+bipnip-agent --config agent.toml lease list      # the stored leases and where they stand
+bipnip-agent --config agent.toml lease resume    # carry on after a restart
+```
+
+Both commands run until the lease is active or over. The buyer's agent keeps the lease's preimage in an
+owner-only file under `data_dir/leases` from before it sends the take, so a restart does not lose it.
 
 ## Repositories
 

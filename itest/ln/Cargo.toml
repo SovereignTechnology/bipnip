@@ -23,6 +23,10 @@ path = "src/lease.rs"
 name = "test-relay"
 path = "src/relay.rs"
 
+[[bin]]
+name = "test-key"
+path = "src/key.rs"
+
 [dependencies]
 nostr-sdk = { version = "0.45.1", features = ["local-relay"] }
 bipnip-ln = { path = "../../crates/bipnip-ln", features = ["lnd"] }
