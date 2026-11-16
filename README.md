@@ -13,7 +13,33 @@ Nostr-native peer-to-peer Lightning exchange) that keeps all of Mostro and adds:
 Everything travels over Nostr relays. Anyone who runs a node can run an instance; instances coordinate
 leases and rings but never hold lease money.
 
-Status: **M0** (forks, specs, spikes). Nothing here is ready for real funds.
+Status: **M1 in progress**. M0 (forks, specs, spikes) is done; the LND backend passes its conformance run
+against real nodes, and `bipnip-agent` can create a mnemonic, bind a node and publish the binding.
+Nothing here is ready for real funds.
+
+## Try the agent (regtest or signet only)
+
+Build with `cargo build --release -p bipnip-agent --features lnd` (needs `protoc`), then write a config:
+
+```toml
+network = "regtest"
+data_dir = "/home/me/.bipnip"
+relays = ["wss://relay.example"]
+
+[lnd]
+address = "https://127.0.0.1:10009"
+tls_cert = "/home/me/.lnd/tls.cert"
+macaroon = "/home/me/.lnd/data/chain/bitcoin/regtest/admin.macaroon"
+```
+
+```sh
+bipnip-agent --config agent.toml init              # new mnemonic file, mode 600; back it up
+bipnip-agent --config agent.toml whoami
+bipnip-agent --config agent.toml bind --publish    # the node signs; the event goes to the relays
+bipnip-agent --config agent.toml verify-binding <node pubkey>
+```
+
+Publishing a binding links your node's public key to a Nostr key for everyone to see.
 
 ## Repositories
 

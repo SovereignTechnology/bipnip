@@ -12,6 +12,12 @@ use nostr::nips::nip06::FromMnemonic;
 use nostr_sdk::prelude::Keys;
 use zeroize::Zeroize;
 
+/// NIP-06 account of the liquidity identity: the key a Lightning node binds
+/// (`docs/decisions/0004-node-binding-and-privacy.md`). A different account from Mostro's, so the
+/// node-bound key shares no derivation branch with the fiat identity or trade keys and is never
+/// the same key, while one mnemonic still backs everything up.
+pub const LIQUIDITY_ACCOUNT: u32 = 38735;
+
 /// Largest trade index: BIP-32 non-hardened children stop below 2^31.
 pub const MAX_TRADE_INDEX: u32 = (1 << 31) - 1;
 
@@ -54,15 +60,13 @@ impl Drop for Wallet {
     }
 }
 
+fn derive_in(mnemonic: &str, account: u32, index: u32) -> Result<Keys, KeyError> {
+    Keys::from_mnemonic_advanced(mnemonic, None, Some(account), Some(0), Some(index))
+        .map_err(|_| KeyError::Mnemonic)
+}
+
 fn derive(mnemonic: &str, index: u32) -> Result<Keys, KeyError> {
-    Keys::from_mnemonic_advanced(
-        mnemonic,
-        None,
-        Some(u32::from(NOSTR_ORDER_EVENT_KIND)),
-        Some(0),
-        Some(index),
-    )
-    .map_err(|_| KeyError::Mnemonic)
+    derive_in(mnemonic, u32::from(NOSTR_ORDER_EVENT_KIND), index)
 }
 
 impl Wallet {
@@ -79,6 +83,22 @@ impl Wallet {
                 Err(e)
             }
         }
+    }
+
+    /// A new wallet from 128 bits of operating-system randomness (12 words).
+    pub fn generate() -> Result<Self, KeyError> {
+        let mnemonic = bip39::Mnemonic::generate(12).map_err(|_| KeyError::Mnemonic)?;
+        Wallet::from_mnemonic(mnemonic.to_string())
+    }
+
+    /// The words, for writing to the owner-only mnemonic file. Never log or print the result.
+    pub fn expose_mnemonic(&self) -> &str {
+        &self.mnemonic
+    }
+
+    /// The liquidity identity: the key the Lightning node binds. Unrelated to the fiat identity.
+    pub fn liquidity(&self) -> Result<Keys, KeyError> {
+        derive_in(&self.mnemonic, LIQUIDITY_ACCOUNT, 0)
     }
 
     /// The identity key (`N = 0`): what reputation attaches to.
@@ -128,6 +148,39 @@ mod tests {
         assert_eq!(
             t1.public_key(),
             wallet.trade(1).expect("t1 again").public_key()
+        );
+    }
+
+    #[test]
+    fn the_liquidity_identity_is_its_own_key() {
+        let wallet = Wallet::from_mnemonic(NIP06_MNEMONIC.to_string()).expect("wallet");
+        let liquidity = wallet.liquidity().expect("liquidity");
+        assert_ne!(
+            liquidity.public_key(),
+            wallet.identity().expect("identity").public_key()
+        );
+        assert_ne!(
+            liquidity.public_key(),
+            wallet.trade(1).expect("trade").public_key()
+        );
+        assert_eq!(
+            liquidity.public_key(),
+            wallet.liquidity().expect("again").public_key()
+        );
+    }
+
+    #[test]
+    fn generated_wallets_are_valid_and_distinct() {
+        let (a, b) = (
+            Wallet::generate().expect("a"),
+            Wallet::generate().expect("b"),
+        );
+        assert_eq!(a.expose_mnemonic().split(' ').count(), 12);
+        assert_ne!(a.expose_mnemonic(), b.expose_mnemonic());
+        let again = Wallet::from_mnemonic(a.expose_mnemonic().to_string()).expect("restores");
+        assert_eq!(
+            again.identity().expect("i").public_key(),
+            a.identity().expect("i").public_key()
         );
     }
 

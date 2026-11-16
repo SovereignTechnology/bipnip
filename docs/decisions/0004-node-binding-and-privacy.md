@@ -43,3 +43,12 @@ Signed Message:" ‖ msg)))` (LND, Core Lightning's `zbase` field, LDK, ldk-node
   that is a decision he makes himself, later.
 - Verification needs no Lightning node and works in the browser (the code is pure and wasm-clean).
 - A node key compromise is fatal to the binding (as it is to the node).
+
+## Note (2026-11-15): where the liquidity identity comes from
+
+The agent derives the liquidity identity from the same mnemonic as the Mostro keys, on its own NIP-06
+account: `m/44'/1237'/38735'/0/0` (Mostro's identity and trade keys are on account 38383). One backup
+restores everything, and the node-bound key shares no derivation branch with the fiat identity, so the two
+are never the same key and cannot be linked without the mnemonic. The node-derived variant (the key held
+inside LND or derived by Core Lightning) remains an option on top; the M0 spike showed LND can sign Nostr
+events with a derived key that never leaves the node.

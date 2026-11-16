@@ -97,3 +97,67 @@ B_ADDR=https://127.0.0.1:${RPC[bob]} B_CERT=$W/bob/tls.cert B_MAC=$(mac bob) \
 B_P2P=127.0.0.1:${P2P[bob]} HASHES="$(pair),$(pair),$(pair)" \
 MINE="$W/mine.sh" \
   "$W/target/release/lnd-conformance"
+
+# --- the agent, end to end: init, bind + publish, verify from a second agent, revoke -----------
+log "build bipnip-agent with LND support"
+cargo build --quiet --release --manifest-path "$HERE/../../Cargo.toml" -p bipnip-agent --features lnd --target-dir "$W/target-ws"
+AGENT=$W/target-ws/release/bipnip-agent
+"$W/target/release/test-relay" 7777 > "$W/relay.log" 2>&1 &
+wait_until 30 grep -q listening "$W/relay.log"
+
+agent_conf() { # name
+  cat > "$W/$1.toml" <<CONF
+network = "regtest"
+data_dir = "$W/$1-agent"
+relays = ["ws://127.0.0.1:7777"]
+
+[lnd]
+address = "https://127.0.0.1:${RPC[$1]}"
+tls_cert = "$W/$1/tls.cert"
+macaroon = "$(mac "$1")"
+CONF
+}
+agent_conf alice; agent_conf bob
+fail() { log "FAIL: $*"; exit 1; }
+
+log "agent: init"
+"$AGENT" --config "$W/alice.toml" init > "$W/init.out"
+"$AGENT" --config "$W/bob.toml" init > /dev/null
+[ "$(stat -c %a "$W/alice-agent/mnemonic")" = 600 ] || fail "mnemonic file is not 600"
+[ "$(stat -c %a "$W/alice-agent")" = 700 ] || fail "data dir is not 700"
+[ "$(wc -w < "$W/alice-agent/mnemonic")" = 12 ] || fail "mnemonic is not 12 words"
+grep -qF -- "$(cut -d' ' -f1-3 "$W/alice-agent/mnemonic")" "$W/init.out" && fail "init printed mnemonic words"
+"$AGENT" --config "$W/alice.toml" init > /dev/null 2>&1 && fail "init overwrote an existing mnemonic"
+
+log "agent: a mnemonic file others can read is refused"
+chmod 644 "$W/alice-agent/mnemonic"
+"$AGENT" --config "$W/alice.toml" whoami > /dev/null 2> "$W/open.err" && fail "agent read a 644 mnemonic"
+grep -q "must be 600" "$W/open.err" || fail "no clear error for the open mnemonic file"
+chmod 600 "$W/alice-agent/mnemonic"
+
+log "agent: whoami"
+"$AGENT" --config "$W/alice.toml" whoami | sed 's/^/  /'
+APK=$(lnc alice getinfo | jget identity_pubkey)
+"$AGENT" --config "$W/alice.toml" whoami | grep -q "$APK" || fail "whoami does not show the node"
+
+log "agent: bind + publish, then verify from the other agent"
+"$AGENT" --config "$W/bob.toml" verify-binding "$APK" > /dev/null 2>&1 && fail "verified a binding before any was published"
+"$AGENT" --config "$W/alice.toml" bind --publish > "$W/bind.json" 2> "$W/bind.err" || { cat "$W/bind.err"; fail "bind"; }
+grep -q "accepted by" "$W/bind.err" || fail "no relay accepted the binding"
+"$AGENT" --config "$W/bob.toml" verify-binding "$APK" | tee "$W/verify.out" | sed 's/^/  /'
+grep -q "^bound: node $APK" "$W/verify.out" || fail "the other agent did not verify the binding"
+python3 - "$W/bind.json" "$APK" <<'PY'
+import json, sys
+e = json.load(open(sys.argv[1])); tags = {t[0]: t[1] for t in e["tags"]}
+assert e["kind"] == 31735 and tags["d"] == sys.argv[2] == tags["node"], "event shape"
+assert tags["statement"].startswith("nostr-node-binding:v1:bind:regtest:" + e["pubkey"] + ":" + sys.argv[2] + ":"), "statement"
+assert len(tags["node_sig"]) == 104, "zbase32 signature length"
+PY
+
+log "agent: revoke + publish; the other agent now refuses"
+sleep 2
+"$AGENT" --config "$W/alice.toml" bind --revoke --publish > /dev/null 2>&1 || fail "revoke"
+"$AGENT" --config "$W/bob.toml" verify-binding "$APK" > "$W/verify2.out" 2>&1 && fail "a revoked binding still verified"
+grep -q "revoked" "$W/verify2.out" || fail "no revocation reported"
+
+log "AGENT E2E PASS: init, bind, publish, verify, revoke against a real LND node"
