@@ -447,9 +447,11 @@ dependencies = [
  "async-trait",
  "bipnip-ln",
  "mostro-core",
+ "nostr",
  "nostr-sdk",
  "secp256k1 0.30.0",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]
