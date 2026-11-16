@@ -132,14 +132,15 @@ async fn link_for(
     .await
 }
 
-fn sent_or_refuse(report: &StepReport, what: &str) -> Result<(), String> {
+/// Says so when a first message reached no relay. The run is stored as owing it, and the loop
+/// that follows sends it again.
+fn owed_note(report: &StepReport, what: &str) {
     if report.sent == 0 {
-        return Err(format!(
-            "{what} was not sent: {}",
+        eprintln!(
+            "note: {what} reached no relay yet and will be sent again ({})",
             report.problems.join("; ")
-        ));
+        );
     }
-    Ok(())
 }
 
 /// Our node's binding to the liquidity identity, made now.
@@ -192,7 +193,7 @@ pub async fn offer(
     relay::publish(&binding, &config.relays).await?;
 
     let trade_index = next_trade_index(config)?;
-    let (run, first) = SellerRun::offer(instance.pubkey, offer, now, trade_index, seller);
+    let (mut run, first) = SellerRun::offer(instance.pubkey, offer, now, trade_index, seller);
     let link = link_for(
         session,
         instance,
@@ -200,10 +201,10 @@ pub async fn offer(
         now.saturating_sub(NEW_RUN_LOOKBACK_SECS),
     )
     .await?;
-    let report = launch_seller(&run, &first, &link, &store)
+    let report = launch_seller(&mut run, &first, &link, &store)
         .await
         .map_err(|e| e.to_string())?;
-    sent_or_refuse(&report, "the offer")?;
+    owed_note(&report, "the offer");
     Ok((run, link))
 }
 
@@ -258,7 +259,7 @@ pub async fn take(
         binding: binding.as_json(),
         node_address: params.node_address,
     };
-    let (run, first) = BuyerRun::take(session.backend, instance.pubkey, request, buyer, now)
+    let (mut run, first) = BuyerRun::take(session.backend, instance.pubkey, request, buyer, now)
         .await
         .map_err(|e| e.to_string())?;
     let link = link_for(
@@ -268,10 +269,10 @@ pub async fn take(
         now.saturating_sub(NEW_RUN_LOOKBACK_SECS),
     )
     .await?;
-    let report = launch_buyer(&run, &first, &link, &store)
+    let report = launch_buyer(&mut run, &first, &link, &store)
         .await
         .map_err(|e| e.to_string())?;
-    sent_or_refuse(&report, "the take")?;
+    owed_note(&report, "the take");
     Ok((run, link))
 }
 

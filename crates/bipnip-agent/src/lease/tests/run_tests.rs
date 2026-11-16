@@ -409,6 +409,113 @@ async fn a_lease_runs_from_offer_to_active_on_messages_alone() {
     assert_eq!(buyer.state(), BuyerState::Active);
 }
 
+/// The messages as they travel, for comparing two answers.
+fn wire(out: &[Outgoing]) -> Vec<String> {
+    out.iter()
+        .map(|outgoing| match outgoing {
+            Outgoing::ToInstance(message) | Outgoing::ToPeer { message, .. } => {
+                message.as_json().expect("json")
+            }
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn each_state_can_make_its_message_again() {
+    let stage = Stage::new();
+
+    // The seller: its offer, its invoice, its channel report, its active notice.
+    let (mut seller, offer) =
+        SellerRun::offer(stage.instance_key(), stage.offer.clone(), 1, 7, SELLER);
+    assert_eq!(wire(&seller.pending().expect("pending")), wire(&[offer]));
+    let echo = Message::new_order(
+        Some(stage.order_id),
+        Some(1),
+        None,
+        Action::LeaseOffer,
+        Some(Payload::Lease(LeasePayload::Offer(stage.offer.clone()))),
+    );
+    stage.to_seller(&mut seller, &echo).await.expect("echo");
+    assert!(
+        seller.pending().expect("pending").is_empty(),
+        "open says nothing"
+    );
+
+    let (mut buyer, take) = stage.take(stage.take_request()).await;
+    let again = buyer.pending(&stage.buyer_node).await.expect("pending");
+    assert_eq!(wire(&again), vec![take.as_json().expect("json")]);
+
+    let invoice = stage.to_seller(&mut seller, &take).await.expect("take");
+    assert_eq!(wire(&seller.pending().expect("pending")), wire(&invoice));
+    stage
+        .to_seller(&mut seller, &stage.peer_key(&stage.buyer.trade))
+        .await
+        .expect("peer key");
+    stage
+        .to_buyer(&mut buyer, &stage.peer_key(&stage.seller.trade))
+        .await
+        .expect("peer key");
+    stage
+        .to_buyer(&mut buyer, &to_instance(invoice))
+        .await
+        .expect("invoice");
+    let paid = buyer.pending(&stage.buyer_node).await.expect("pending");
+    assert!(paid.is_empty(), "paid says nothing");
+
+    assert!(
+        seller
+            .tick(&stage.seller_node)
+            .await
+            .expect("tick")
+            .is_empty()
+    );
+    assert!(
+        seller.pending().expect("pending").is_empty(),
+        "opening says nothing"
+    );
+    let report = seller.tick(&stage.seller_node).await.expect("tick");
+    assert_eq!(wire(&seller.pending().expect("pending")), wire(&report));
+
+    stage
+        .to_buyer(&mut buyer, &to_instance(report))
+        .await
+        .expect("report");
+    stage.confirm(&seller);
+    let released = buyer.tick(&stage.buyer_node).await.expect("tick");
+    assert_eq!(buyer.state(), BuyerState::Released);
+    // The preimage again, to the same key, through the same check of the channel.
+    let again = buyer.pending(&stage.buyer_node).await.expect("pending");
+    assert_eq!(wire(&again), wire(&released));
+    assert!(matches!(
+        again.as_slice(),
+        [Outgoing::ToPeer { to, .. }] if *to == stage.seller.trade.public_key()
+    ));
+    // If the channel no longer passes the check, nothing is made.
+    confirm(
+        &stage.world,
+        seller.funding_outpoint().expect("an outpoint"),
+        0,
+    );
+    let gone = buyer.pending(&stage.buyer_node).await;
+    assert!(
+        matches!(gone, Err(RunError::Step(LeaseStepError::Channel(_)))),
+        "{gone:?}"
+    );
+    stage.confirm(&seller);
+
+    let active = stage
+        .peer_to_seller(&mut seller, &released[0])
+        .await
+        .expect("preimage");
+    assert_eq!(wire(&seller.pending().expect("pending")), wire(&active));
+
+    // What is owed is part of the stored run.
+    seller.set_unsent(true);
+    let stored = SellerRun::from_json(&seller.to_json().expect("json")).expect("stored");
+    assert!(stored.unsent());
+    assert_eq!(wire(&stored.pending().expect("pending")), wire(&active));
+}
+
 #[tokio::test]
 async fn messages_from_the_wrong_sender_do_nothing() {
     let stage = Stage::new();
