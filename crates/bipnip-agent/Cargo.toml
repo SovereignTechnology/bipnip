@@ -32,12 +32,15 @@ sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 toml = "0.8"
-# bipnip-core main (#3): Mostro's protocol types, the node binding and lease terms.
-mostro-core = { git = "https://github.com/SovereignTechnology/bipnip-core", rev = "5daa0124b5ecb86bb32dc947a3d5659e7e1c8d64" }
+# bipnip-core main (#5): Mostro's protocol types and transport, the node binding, lease terms,
+# lease messages and the lease order event.
+mostro-core = { git = "https://github.com/SovereignTechnology/bipnip-core", rev = "bd6fa53c278d572980182b091e4bcae25fd1dd41" }
 # The versions bipnip-core resolves, so key and event types are the same types.
 nostr-sdk = "0.45.1"
 # NIP-06 (mnemonic → keys) is a feature of the nostr crate nostr-sdk re-exports.
 nostr = { version = "0.45.1", features = ["nip06"] }
+# Order ids in Mostro messages.
+uuid = "1"
 zeroize = "1"
 secp256k1 = "0.30"
 

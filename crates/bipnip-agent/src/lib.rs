@@ -5,5 +5,6 @@ pub mod binding;
 pub mod config;
 pub mod keys;
 pub mod lease;
+pub mod lease_wire;
 pub mod relay;
 pub mod secretfile;
