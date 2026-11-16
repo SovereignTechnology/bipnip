@@ -1,0 +1,278 @@
+//! Runs every `LightningBackend` method of `LndBackend` against two real LND nodes on regtest
+//! (payer A, payee B), the way a lease uses them. Driven by `run-lnd.sh`; exits non-zero on the
+//! first failed step. Environment: `A_ADDR`/`A_CERT`/`A_MAC`, `B_…` (gRPC address, tls.cert,
+//! admin.macaroon), `B_P2P` (host:port), `MINE` (a command that mines its argument's blocks),
+//! `HASHES` (three "preimage:hash" pairs, comma-separated).
+
+use std::path::Path;
+use std::process::Command;
+use std::time::Duration;
+
+use bipnip_ln::lnd::LndBackend;
+use bipnip_ln::{
+    BackendError, HoldInvoiceRequest, HoldState, LightningBackend, OpenRequest, PaymentState,
+};
+use mostro_core::node_binding::recover_ln_signer;
+
+fn env(k: &str) -> String {
+    std::env::var(k).unwrap_or_else(|_| panic!("missing env {k}"))
+}
+
+fn mine(n: u32) {
+    let ok = Command::new("bash")
+        .arg(env("MINE"))
+        .arg(n.to_string())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    assert!(ok, "mining {n} blocks failed");
+}
+
+fn step(name: &str) {
+    println!("STEP {name}");
+}
+
+async fn until<F, Fut>(what: &str, secs: u64, mut f: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    for _ in 0..secs {
+        if f().await {
+            return;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    panic!("timed out waiting for: {what}");
+}
+
+async fn node(prefix: &str) -> LndBackend {
+    LndBackend::connect(
+        &env(&format!("{prefix}_ADDR")),
+        Path::new(&env(&format!("{prefix}_CERT"))),
+        Path::new(&env(&format!("{prefix}_MAC"))),
+    )
+    .await
+    .expect("connect")
+}
+
+/// Pays `invoice` from `a` until the HTLC is out (a brand-new channel can refuse the first tries).
+async fn pay_until_in_flight(a: &LndBackend, invoice: &str, hash: &str) -> PaymentState {
+    for attempt in 1..=6 {
+        match a.pay_invoice(invoice, 10_000, 5).await {
+            Ok(PaymentState::Failed { reason }) => {
+                println!("  attempt {attempt} failed ({reason}); retrying");
+                tokio::time::sleep(Duration::from_secs(10)).await;
+            }
+            Ok(state) => return state,
+            // LND refuses to re-send while its previous attempt is still unresolved.
+            Err(BackendError::Rejected(m))
+                if m.contains("in flight") || m.contains("in transition") =>
+            {
+                return a.payment_state(hash).await.expect("payment state");
+            }
+            Err(e) => panic!("pay_invoice: {e}"),
+        }
+    }
+    panic!("payment never left");
+}
+
+#[tokio::main]
+async fn main() {
+    let (a, b) = (node("A").await, node("B").await);
+    let hashes: Vec<(String, String)> = env("HASHES")
+        .split(',')
+        .map(|p| {
+            let (pre, hash) = p.split_once(':').expect("preimage:hash");
+            (pre.to_string(), hash.to_string())
+        })
+        .collect();
+
+    step("node_info");
+    let (ia, ib) = (
+        a.node_info().await.expect("info a"),
+        b.node_info().await.expect("info b"),
+    );
+    assert_eq!(ia.network, "regtest");
+    assert_eq!(ib.network, "regtest");
+    assert_ne!(ia.node_pubkey, ib.node_pubkey);
+    assert!(ia.block_height > 100);
+
+    step("sign_message recovers to the node key in bipnip-core");
+    let msg = b"bipnip-ln conformance";
+    let sig = a.sign_message(msg).await.expect("sign");
+    let recovered = recover_ln_signer(msg, &sig).expect("recover");
+    assert_eq!(recovered.to_string(), ia.node_pubkey);
+
+    step("argument checks reject before any RPC");
+    assert!(matches!(
+        a.hold_invoice_state("zz").await,
+        Err(BackendError::Rejected(_))
+    ));
+    assert!(matches!(
+        a.channels_with("02abc").await,
+        Err(BackendError::Rejected(_))
+    ));
+
+    step("graph_node: unknown key is None");
+    let unknown = format!("02{}", "11".repeat(32));
+    assert_eq!(a.graph_node(&unknown).await.expect("graph"), None);
+
+    step("open_channel A -> B (announced) and channels_with on both sides");
+    assert!(
+        a.channels_with(&ib.node_pubkey)
+            .await
+            .expect("channels")
+            .is_empty()
+    );
+    let outpoint = a
+        .open_channel(&OpenRequest {
+            remote_pubkey: ib.node_pubkey.clone(),
+            remote_addr: Some(env("B_P2P")),
+            capacity_sat: 1_000_000,
+            announce: true,
+            feerate_sat_vb: 2,
+        })
+        .await
+        .expect("open");
+    assert_eq!(
+        outpoint.split(':').next().map(str::len),
+        Some(64),
+        "{outpoint}"
+    );
+    let pending = a.channels_with(&ib.node_pubkey).await.expect("channels");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].funding_outpoint, outpoint);
+    assert!(pending[0].local_initiator && !pending[0].active && pending[0].confirmations == 0);
+    mine(6);
+    until("channel active on A", 120, || async {
+        a.channels_with(&ib.node_pubkey)
+            .await
+            .is_ok_and(|c| c.iter().any(|c| c.active))
+    })
+    .await;
+    until("channel active on B", 120, || async {
+        b.channels_with(&ia.node_pubkey)
+            .await
+            .is_ok_and(|c| c.iter().any(|c| c.active))
+    })
+    .await;
+    let on_a = &a.channels_with(&ib.node_pubkey).await.expect("channels")[0];
+    let on_b = &b.channels_with(&ia.node_pubkey).await.expect("channels")[0];
+    assert_eq!(on_a.funding_outpoint, outpoint);
+    assert_eq!(on_b.funding_outpoint, outpoint);
+    assert_eq!(
+        (on_a.capacity_sat, on_b.capacity_sat),
+        (1_000_000, 1_000_000)
+    );
+    assert!(on_a.local_initiator && !on_b.local_initiator);
+    assert!(on_a.announced && on_b.announced);
+    assert!(
+        on_a.confirmations >= 6 && on_b.confirmations >= 6,
+        "{on_a:?} {on_b:?}"
+    );
+
+    step("hold invoice on the payer's hash: held without the preimage, then settled with it");
+    let (pre, hash) = &hashes[0];
+    let hold = HoldInvoiceRequest {
+        payment_hash: hash.clone(),
+        amount_msat: 1_500_000,
+        expiry_secs: 3600,
+        cltv_delta: 144,
+        description: "bipnip-ln conformance: hold".into(),
+    };
+    let invoice = b.add_hold_invoice(&hold).await.expect("add hold");
+    assert_eq!(
+        b.hold_invoice_state(hash).await.expect("state"),
+        HoldState::Open
+    );
+    assert_eq!(
+        pay_until_in_flight(&a, &invoice, hash).await,
+        PaymentState::InFlight
+    );
+    until("hold invoice accepted", 60, || async {
+        b.hold_invoice_state(hash).await == Ok(HoldState::Accepted)
+    })
+    .await;
+    assert_eq!(
+        a.payment_state(hash).await.expect("state"),
+        PaymentState::InFlight
+    );
+    b.settle_hold_invoice(pre).await.expect("settle");
+    until("payer sees the preimage", 60, || async {
+        a.payment_state(hash).await
+            == Ok(PaymentState::Succeeded {
+                preimage: pre.clone(),
+            })
+    })
+    .await;
+    assert_eq!(
+        b.hold_invoice_state(hash).await.expect("state"),
+        HoldState::Settled
+    );
+
+    step("hold invoice cancelled: the payer is refunded");
+    let (_, hash2) = &hashes[1];
+    let invoice = b
+        .add_hold_invoice(&HoldInvoiceRequest {
+            payment_hash: hash2.clone(),
+            ..hold.clone()
+        })
+        .await
+        .expect("add hold");
+    assert_eq!(
+        pay_until_in_flight(&a, &invoice, hash2).await,
+        PaymentState::InFlight
+    );
+    until("hold invoice accepted", 60, || async {
+        b.hold_invoice_state(hash2).await == Ok(HoldState::Accepted)
+    })
+    .await;
+    b.cancel_hold_invoice(hash2).await.expect("cancel");
+    until("payer sees the failure", 60, || async {
+        matches!(
+            a.payment_state(hash2).await,
+            Ok(PaymentState::Failed { .. })
+        )
+    })
+    .await;
+    assert_eq!(
+        b.hold_invoice_state(hash2).await.expect("state"),
+        HoldState::Canceled
+    );
+
+    step("settling with a wrong preimage is rejected");
+    let (_, hash3) = &hashes[2];
+    b.add_hold_invoice(&HoldInvoiceRequest {
+        payment_hash: hash3.clone(),
+        ..hold.clone()
+    })
+    .await
+    .expect("add hold");
+    assert!(matches!(
+        b.settle_hold_invoice(pre).await,
+        Err(BackendError::Rejected(_))
+    ));
+    assert_eq!(
+        b.hold_invoice_state(hash3).await.expect("state"),
+        HoldState::Open
+    );
+
+    step("plain invoice paid within the wait");
+    let invoice = b
+        .add_invoice(250_000, 600, "bipnip-ln conformance: plain")
+        .await
+        .expect("invoice");
+    match a.pay_invoice(&invoice, 10_000, 30).await.expect("pay") {
+        PaymentState::Succeeded { preimage } => assert_eq!(preimage.len(), 64),
+        other => panic!("plain invoice not paid: {other:?}"),
+    }
+
+    step("graph_node sees the announced channel");
+    until("B in A's graph with a channel", 120, || async {
+        matches!(a.graph_node(&ib.node_pubkey).await, Ok(Some((n, cap))) if n >= 1 && cap >= 1_000_000)
+    })
+    .await;
+
+    println!("CONFORMANCE PASS: LndBackend, all steps");
+}

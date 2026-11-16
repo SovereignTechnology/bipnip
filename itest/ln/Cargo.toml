@@ -1,0 +1,22 @@
+[package]
+name = "bipnip-ln-itest"
+description = "Conformance run of bipnip-ln backends against real nodes on regtest (Kata only)"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Its own workspace root: it needs the network (a git dependency) and protoc, which the main
+# workspace's offline builds must not.
+[workspace]
+
+[[bin]]
+name = "lnd-conformance"
+path = "src/lnd.rs"
+
+[dependencies]
+bipnip-ln = { path = "../../crates/bipnip-ln", features = ["lnd"] }
+# bipnip-core main (#2): node signatures are checked with the same code verifiers use.
+mostro-core = { git = "https://github.com/SovereignTechnology/bipnip-core", rev = "282e28b6c6a4b3020ee2f9d4e4f385e0d2373564" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
