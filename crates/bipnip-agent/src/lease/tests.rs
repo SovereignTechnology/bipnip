@@ -312,6 +312,38 @@ async fn the_seller_cannot_open_before_the_payment_is_locked() {
 }
 
 #[tokio::test]
+async fn the_hold_invoice_must_outlast_the_confirmation_wait() {
+    let (seller, buyer, world) = pair();
+    let slow = LeaseTerms {
+        min_confirmations: 120,
+        ..terms()
+    };
+    let b = BuyerLease::start(&buyer, &seller.id(), Network::Regtest, slow, NOW)
+        .await
+        .expect("start");
+    let s = SellerLease::accept(&seller, &b.contract().text())
+        .await
+        .expect("accept");
+    let needed = 120 + SELLER_SETTLE_MARGIN_BLOCKS;
+    // One day of blocks is not enough room for a 120-confirmation wait: no invoice is made.
+    let err = s
+        .upfront_invoice(&seller, DEFAULT_SELLER_CLTV_DELTA)
+        .await
+        .expect_err("too short");
+    assert!(
+        matches!(err, LeaseStepError::HoldWindow { cltv_delta, needed: n }
+            if cltv_delta == DEFAULT_SELLER_CLTV_DELTA && n == needed),
+        "{err}"
+    );
+    assert!(s.upfront_invoice(&seller, needed - 1).await.is_err());
+    assert!(world.lock().expect("world").invoices.is_empty());
+    // The smallest delta that fits is accepted, and the buyer's default limit still covers it.
+    let bolt11 = s.upfront_invoice(&seller, needed).await.expect("invoice");
+    assert!(needed <= DEFAULT_MAX_CLTV_DELTA);
+    assert!(check_upfront_invoice(&bolt11, b.contract(), DEFAULT_MAX_CLTV_DELTA).is_ok());
+}
+
+#[tokio::test]
 async fn invoices_that_differ_from_the_contract_are_never_paid() {
     let (seller, buyer, world) = pair();
     let b = BuyerLease::start(&buyer, &seller.id(), Network::Regtest, terms(), NOW)

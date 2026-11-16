@@ -13,9 +13,11 @@ Nostr-native peer-to-peer Lightning exchange) that keeps all of Mostro and adds:
 Everything travels over Nostr relays. Anyone who runs a node can run an instance; instances coordinate
 leases and rings but never hold lease money.
 
-Status: **M1 in progress**. M0 (forks, specs, spikes) is done; the LND backend passes its conformance run
-against real nodes, and `bipnip-agent` can create a mnemonic, bind a node and publish the binding.
-Nothing here is ready for real funds.
+Status: **M1 and M2 in progress**. M0 (forks, specs, spikes) is done. The LND backend passes its
+conformance run against real nodes; `bipnip-agent` can create a mnemonic, bind a node and publish the
+binding; and the lease engine (both sides) completes a lease between two real LND nodes on regtest,
+refunding the buyer when the seller never opens or opens the wrong channel. Instances do not coordinate
+leases yet, and the Core Lightning and LDK backends are not written. Nothing here is ready for real funds.
 
 ## Try the agent (regtest or signet only)
 

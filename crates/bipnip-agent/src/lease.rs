@@ -31,6 +31,10 @@ pub const DEFAULT_MAX_CLTV_DELTA: u32 = 288;
 /// The `min_final_cltv_expiry_delta` a seller asks for by default: one day of blocks, room to
 /// open the channel and for the buyer to wait for confirmations.
 pub const DEFAULT_SELLER_CLTV_DELTA: u32 = 144;
+/// Blocks a seller needs on top of the buyer's confirmation wait: time to open the channel, for
+/// its first confirmation, and for the node to settle before it gives a held payment back. A hold
+/// invoice with less room could expire after the channel is open and before the preimage arrives.
+pub const SELLER_SETTLE_MARGIN_BLOCKS: u32 = 36;
 
 /// Why a lease step was refused.
 #[derive(Debug)]
@@ -49,6 +53,13 @@ pub enum LeaseStepError {
     Channel(String),
     /// The preimage offered does not hash to the contract's payment hash.
     WrongPreimage,
+    /// The hold invoice would not outlast the buyer's confirmation wait.
+    HoldWindow {
+        /// The final CLTV delta asked for.
+        cltv_delta: u32,
+        /// The smallest delta this contract needs.
+        needed: u32,
+    },
     /// The operating system gave no randomness.
     Randomness,
 }
@@ -68,6 +79,11 @@ impl std::fmt::Display for LeaseStepError {
             }
             LeaseStepError::Channel(why) => write!(f, "the channel is refused: {why}"),
             LeaseStepError::WrongPreimage => write!(f, "the preimage does not match the contract"),
+            LeaseStepError::HoldWindow { cltv_delta, needed } => write!(
+                f,
+                "a hold invoice of {cltv_delta} blocks could expire before the preimage arrives; \
+                 this contract needs at least {needed}"
+            ),
             LeaseStepError::Randomness => write!(f, "no randomness available"),
         }
     }
@@ -329,8 +345,8 @@ pub struct SellerLease {
 }
 
 impl SellerLease {
-    /// Accepts a buyer's contract (canonical text) if it is valid, dated sensibly, and names this
-    /// node as the seller on its network.
+    /// Accepts a buyer's contract (canonical text) if it is valid and names this node as the
+    /// seller on its network. Whether the terms are ones the seller offered is the caller's check.
     pub async fn accept(
         backend: &dyn LightningBackend,
         contract_text: &str,
@@ -357,11 +373,23 @@ impl SellerLease {
 
     /// Has the seller's own node create the hold invoice for the upfront share, on the buyer's
     /// payment hash. The seller cannot settle it: it does not know the preimage.
+    ///
+    /// Refuses a `cltv_delta` below the contract's confirmation wait plus
+    /// [`SELLER_SETTLE_MARGIN_BLOCKS`]: the payment would go back to the buyer while the seller is
+    /// still waiting for the preimage, with the channel already open.
     pub async fn upfront_invoice(
         &self,
         backend: &dyn LightningBackend,
         cltv_delta: u32,
     ) -> Result<String, LeaseStepError> {
+        let needed = self
+            .contract
+            .terms
+            .min_confirmations
+            .saturating_add(SELLER_SETTLE_MARGIN_BLOCKS);
+        if cltv_delta < needed {
+            return Err(LeaseStepError::HoldWindow { cltv_delta, needed });
+        }
         let amount_msat = self
             .contract
             .terms

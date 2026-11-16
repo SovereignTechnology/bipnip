@@ -16,7 +16,7 @@ preimage: **the buyer keeps the preimage until its own node has verified the cha
 
 ## Lease order (kind 38735, `k` = `lease`)
 
-Published and signed by the instance after a seller's `NewOrder`, `d` = order id. Tags (one value each
+Published and signed by the instance after a seller's `lease-offer`, `d` = order id. Tags (one value each
 unless noted):
 
 | tag | meaning |
@@ -37,31 +37,71 @@ unless noted):
 | `bond` | buyer bond in sat, or `0` |
 | `expiration` | NIP-40 |
 
+Implemented so far (`bipnip-core`, `lease` and `lease_message`): `node`, `network`, `capacity`,
+`duration`, `fee`, `split`, `confs`, `announce` and the expiry. `fee_caps`, `channel_type`, `rules` and
+`bond` are not part of the v1 contract yet.
+
+## The contract
+
+The buyer writes the contract; both sides refer to it by its id. Canonical text (ASCII, no spaces):
+
+```
+bipnip-lease:v1:<network>:<seller node>:<buyer node>:<capacity_sat>:<duration_blocks>:<fee_base_sat>:
+<fee_ppm>:<upfront_percent>:<min_confirmations>:<announce 0|1>:<payment_hash>:<created_at>
+```
+
+The lease id is the SHA-256 of that text, in hex. The fee is `fee_base_sat + floor(capacity_sat ×
+fee_ppm / 1 000 000)`; the upfront share is `ceil(fee × upfront_percent / 100)` and the completion share
+is the rest. Seller and instance refuse a contract whose terms are not exactly the offer's at a capacity
+inside the offer's range, so nothing a buyer writes can change the price.
+
+## Messages
+
+Mostro protocol v2 messages with these actions; all but the first carry the order id. The payload is
+`{"lease": {"<name>": {…}}}`. Unknown fields are refused.
+
+| action | direction | payload |
+|---|---|---|
+| `lease-offer` | seller → instance; echoed back with the order id | `offer`: network, seller node, the seller's binding event, capacity range, duration, fee, split, confirmations, announce, expiry |
+| `take-lease` | buyer → instance → seller | `take`: the contract text, the buyer's binding event, optionally the buyer's node address |
+| `lease-invoice` | seller → instance → buyer | `invoice`: lease id, BOLT 11 hold invoice |
+| `lease-channel-opened` | seller → instance → buyer | `channel`: lease id, funding txid, output index |
+| `lease-preimage` | buyer → seller, *peer* only | `preimage`: lease id, preimage |
+| `lease-active` | seller → instance → buyer | none |
+| `lease-completion-invoice` | seller → instance → buyer | `invoice`: lease id, BOLT 11 invoice |
+
+A binding carried in a message must verify and bind that node, on that network, to the Nostr key that
+sent the message. That shows the node once vouched for the key; a receiver that can reach relays still
+looks for a newer revocation.
+
 ## Flow
 
 All messages are Mostro protocol v2 messages (kind 14, NIP-44) unless marked *peer*, which go directly
 between the two trade keys over the same transport.
 
-1. **Take.** The buyer's agent generates a random 32-byte preimage `P`, computes `H = sha256(P)` and sends
-   `TakeLease` with: order id, capacity, its binding event, its node address, and `H`. The instance checks
-   the binding, the rules against its own graph, and the capacity range; if `bond > 0` it asks the buyer
+1. **Take.** The buyer's agent generates a random 32-byte preimage `P`, computes `H = sha256(P)`, writes
+   the contract (capacity, the offer's terms, both nodes, `H`) and sends `take-lease` with the order id,
+   the contract, its binding event and, if needed, its node address. The instance checks the binding,
+   the contract against the offer, and the rules against its own graph; if `bond > 0` it asks the buyer
    to pay a bond hold invoice (Mostro's bond flow).
 2. **Invoice.** The instance forwards the take to the seller. The seller's agent has its **own node**
    create a hold invoice on `H` for the upfront share, valid ≤ 48 h, `min_final_cltv_expiry_delta` within
-   the instance's `payment_cltv_limit`, and sends it (`LeaseInvoice`).
+   the instance's `payment_cltv_limit` and at least `confs` + 36 blocks (room to open, confirm and
+   settle before the payment would go back), and sends it (`lease-invoice`).
 3. **Pay.** The buyer's agent checks: payee = the seller's bound node key, payment hash = `H`, amount =
    the upfront share for the chosen capacity, expiry and CLTV within limits. It pays; the HTLC is held at
    the seller's node.
 4. **Open.** When its node reports the invoice accepted, the seller opens the channel to the buyer
-   (from its wallet or as a vortex-ng coinjoin output) and sends `LeaseChannelOpened` with the funding
+   (from its wallet or as a vortex-ng coinjoin output) and sends `lease-channel-opened` with the funding
    outpoint.
 5. **Verify and release** (*peer*). The buyer's agent waits until its own node shows a channel with:
    remote = the seller's node, the agreed capacity, seller as initiator, the agreed channel type and
    announce flag, at least `confs` confirmations. Then it sends `P` to the seller's trade key
-   (`LeasePreimage`). Before this point `P` is never sent anywhere.
-6. **Settle.** The seller's agent settles the hold invoice with `P` and reports `LeaseActive`.
+   (`lease-preimage`). Before this point `P` is never sent anywhere, and it never goes to the instance.
+6. **Settle.** The seller's agent checks that `P` hashes to `H`, settles the hold invoice with it and
+   reports `lease-active`.
 7. **Completion.** At `funding height + duration`, the seller sends an ordinary invoice for the remaining
-   share (`LeaseCompletionInvoice`); the buyer's agent pays it if its node still sees the channel open.
+   share (`lease-completion-invoice`); the buyer's agent pays it if its node still sees the channel open.
 8. **Outcomes.** Each party may publish a kind 8735 outcome; both may rate through Mostro's rating flow.
 
 ## Failure handling
