@@ -13,6 +13,8 @@
 //!
 //! Nothing here logs. The preimage is wiped on drop and never appears in `Debug`.
 
+pub mod run;
+
 use std::str::FromStr;
 
 use bipnip_ln::{
