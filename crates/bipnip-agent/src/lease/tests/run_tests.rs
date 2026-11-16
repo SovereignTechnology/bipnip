@@ -170,7 +170,8 @@ impl Stage {
 
     /// The seller's run with its offer open under the stage's order id.
     async fn offered(&self) -> SellerRun {
-        let (mut run, out) = SellerRun::offer(self.instance_key(), self.offer.clone(), 1, SELLER);
+        let (mut run, out) =
+            SellerRun::offer(self.instance_key(), self.offer.clone(), 1, 7, SELLER);
         assert!(to_instance(vec![out]).verify());
         assert_eq!(run.state(), SellerState::Offering);
         let echo = Message::new_order(
@@ -191,6 +192,7 @@ impl Stage {
         TakeRequest {
             order_id: self.order_id,
             request_id: 2,
+            trade_index: 8,
             seller_node: self.offer.seller_node.clone(),
             network: Network::Regtest,
             terms: self.offer.terms_for(2_000_000).expect("terms"),
@@ -703,7 +705,7 @@ async fn a_refusal_from_the_instance_ends_what_it_refused() {
         )
     };
 
-    let (mut seller, _) = SellerRun::offer(stage.instance_key(), stage.offer.clone(), 1, SELLER);
+    let (mut seller, _) = SellerRun::offer(stage.instance_key(), stage.offer.clone(), 1, 7, SELLER);
     // A refusal of someone else's request is not ours.
     let result = stage.to_seller(&mut seller, &refusal(None, 77)).await;
     assert!(matches!(result, Err(RunError::OtherOrder)), "{result:?}");

@@ -177,6 +177,7 @@ pub struct SellerRun {
     instance: PublicKey,
     offer: LeaseOffer,
     request_id: u64,
+    trade_index: u32,
     config: SellerConfig,
     state: SellerState,
     order_id: Option<Uuid>,
@@ -197,6 +198,7 @@ struct SellerRecord {
     instance: String,
     offer: LeaseOffer,
     request_id: u64,
+    trade_index: u32,
     cltv_delta: u32,
     feerate_sat_vb: u64,
     state: SellerState,
@@ -230,10 +232,13 @@ fn parsed_json<'a, T: Deserialize<'a>>(json: &'a str) -> Result<T, StoreError> {
 
 impl SellerRun {
     /// Starts by offering `offer` on `instance`. Returns the run and the offer message to send.
+    /// `trade_index` says which of the wallet's lease trade keys this run talks under; it is
+    /// stored with the run so a restart finds the key again.
     pub fn offer(
         instance: PublicKey,
         offer: LeaseOffer,
         request_id: u64,
+        trade_index: u32,
         config: SellerConfig,
     ) -> (Self, Outgoing) {
         let message = lease_wire::offer(request_id, offer.clone());
@@ -241,6 +246,7 @@ impl SellerRun {
             instance,
             offer,
             request_id,
+            trade_index,
             config,
             state: SellerState::Offering,
             order_id: None,
@@ -271,6 +277,7 @@ impl SellerRun {
             instance: self.instance.to_hex(),
             offer: self.offer.clone(),
             request_id: self.request_id,
+            trade_index: self.trade_index,
             cltv_delta: self.config.cltv_delta,
             feerate_sat_vb: self.config.feerate_sat_vb,
             state: self.state,
@@ -331,6 +338,7 @@ impl SellerRun {
             instance: stored_key(&record.instance)?,
             offer: record.offer,
             request_id: record.request_id,
+            trade_index: record.trade_index,
             config: SellerConfig {
                 cltv_delta: record.cltv_delta,
                 feerate_sat_vb: record.feerate_sat_vb,
@@ -371,6 +379,16 @@ impl SellerRun {
     /// Where the run stands.
     pub fn state(&self) -> SellerState {
         self.state
+    }
+
+    /// Which of the wallet's lease trade keys this run talks under.
+    pub fn trade_index(&self) -> u32 {
+        self.trade_index
+    }
+
+    /// The instance the run is on.
+    pub fn instance(&self) -> PublicKey {
+        self.instance
     }
 
     /// The order id, once the instance has given one.
@@ -632,6 +650,8 @@ pub struct TakeRequest {
     pub order_id: Uuid,
     /// Our request id for the take.
     pub request_id: u64,
+    /// Which of the wallet's lease trade keys this run talks under; stored with the run.
+    pub trade_index: u32,
     /// The seller's node key (66 hex), from the order. The caller has checked the seller's
     /// binding.
     pub seller_node: String,
@@ -651,6 +671,7 @@ pub struct BuyerRun {
     instance: PublicKey,
     order_id: Uuid,
     request_id: u64,
+    trade_index: u32,
     config: BuyerConfig,
     lease: BuyerLease,
     state: BuyerState,
@@ -669,6 +690,7 @@ struct BuyerRecord {
     instance: String,
     order_id: String,
     request_id: u64,
+    trade_index: u32,
     lease_id: String,
     max_fee_msat: u64,
     max_cltv_delta: u32,
@@ -698,6 +720,7 @@ impl BuyerRun {
             instance: self.instance.to_hex(),
             order_id: self.order_id.to_string(),
             request_id: self.request_id,
+            trade_index: self.trade_index,
             lease_id: self.lease.contract().id(),
             max_fee_msat: self.config.max_fee_msat,
             max_cltv_delta: self.config.max_cltv_delta,
@@ -732,6 +755,7 @@ impl BuyerRun {
             instance: stored_key(&record.instance)?,
             order_id: Uuid::parse_str(&record.order_id).map_err(|_| corrupt("the order id"))?,
             request_id: record.request_id,
+            trade_index: record.trade_index,
             config: BuyerConfig {
                 max_fee_msat: record.max_fee_msat,
                 max_cltv_delta: record.max_cltv_delta,
@@ -781,6 +805,7 @@ impl BuyerRun {
             instance,
             order_id: request.order_id,
             request_id: request.request_id,
+            trade_index: request.trade_index,
             config,
             lease,
             state: BuyerState::Taking,
@@ -795,6 +820,16 @@ impl BuyerRun {
     /// Where the run stands.
     pub fn state(&self) -> BuyerState {
         self.state
+    }
+
+    /// Which of the wallet's lease trade keys this run talks under.
+    pub fn trade_index(&self) -> u32 {
+        self.trade_index
+    }
+
+    /// The instance the run is on.
+    pub fn instance(&self) -> PublicKey {
+        self.instance
     }
 
     /// The order taken.

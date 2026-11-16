@@ -173,3 +173,120 @@ sleep 2
 grep -q "revoked" "$W/verify2.out" || fail "no revocation reported"
 
 log "AGENT E2E PASS: init, bind, publish, verify, revoke against a real LND node"
+
+# --- two agents lease through a real instance ---------------------------------------------------
+# bipnipd at the head of its lease branch (PR #5: lease handlers + the public lease order). Move
+# this to a commit on main once that is merged.
+BIPNIPD_REV=3c66bb3e6928fe4ff54bc73c51744d21e4fb5306
+log "build the instance (bipnipd ${BIPNIPD_REV:0:12})"
+git clone --quiet https://github.com/SovereignTechnology/bipnipd "$W/bipnipd"
+git -C "$W/bipnipd" checkout --quiet "$BIPNIPD_REV"
+cargo build --quiet --release --locked --manifest-path "$W/bipnipd/Cargo.toml" --bin mostrod --target-dir "$W/target-d"
+
+log "a third node (carol) for the instance"
+RPC[carol]=10011; REST[carol]=8083; P2P[carol]=9737
+mkdir -p "$W/carol"
+lnd --lnddir="$W/carol" --bitcoin.regtest --bitcoin.node=bitcoind \
+  --bitcoind.rpchost=127.0.0.1:18443 --bitcoind.rpcuser=itest --bitcoind.rpcpass=itest \
+  --bitcoind.zmqpubrawblock=tcp://127.0.0.1:28332 --bitcoind.zmqpubrawtx=tcp://127.0.0.1:28333 \
+  --noseedbackup --rpclisten=127.0.0.1:${RPC[carol]} --restlisten=127.0.0.1:${REST[carol]} \
+  --listen=127.0.0.1:${P2P[carol]} --alias=carol > "$W/carol/lnd.log" 2>&1 &
+wait_until 120 synced carol || { log "carol did not sync"; tail -20 "$W/carol/lnd.log"; exit 1; }
+
+log "instance: settings and start"
+read -r INSTANCE_NSEC INSTANCE_PUB < <("$W/target/release/test-key")
+mkdir -p "$W/instance"
+# The daemon's own template, with this run's node, relay, key and database. The price source is
+# pointed at a closed local port: this run makes no outside calls and trades no fiat.
+python3 - "$W/bipnipd/settings.tpl.toml" "$W/instance/settings.toml" <<PY
+import re, sys
+text = open(sys.argv[1]).read()
+values = {
+    "lnd_cert_file": "'$W/carol/tls.cert'",
+    "lnd_macaroon_file": "'$(mac carol)'",
+    "lnd_grpc_host": "'https://127.0.0.1:${RPC[carol]}'",
+    "nsec_privkey": "'$INSTANCE_NSEC'",
+    "relays": "['ws://127.0.0.1:7777']",
+    "bitcoin_price_api_url": '"http://127.0.0.1:9"',
+    "url": '"sqlite://$W/instance/mostro.db"',
+    "pow": "0",
+}
+for key, value in values.items():
+    text, n = re.subn(rf"(?m)^{key} = .*$", f"{key} = {value}", text)
+    assert n == 1, (key, n)
+open(sys.argv[2], "w").write(text)
+PY
+chmod 600 "$W/instance/settings.toml"
+TERM=xterm "$W/target-d/release/mostrod" --dirsettings "$W/instance" > "$W/instance/mostrod.log" 2>&1 < /dev/null &
+INSTANCE_PID=$!
+instance_log() { sed 's/\x1b\[[0-9;]*[A-Za-z]//g' "$W/instance/mostrod.log" | tail -"${1:-40}" | sed 's/^/  instance: /'; }
+wait_until 120 grep -q "Scheduler Started" "$W/instance/mostrod.log" \
+  || { instance_log; fail "the instance did not start"; }
+
+for n in alice bob; do printf '\n[instance]\npubkey = "%s"\n' "$INSTANCE_PUB" >> "$W/$n.toml"; done
+lease_dump() {
+  for f in offer.out offer.err take.out take.err; do [ -s "$W/$f" ] && sed "s/^/  $f: /" "$W/$f"; done
+  instance_log 60
+}
+
+log "lease: bob offers liquidity on the instance"
+"$AGENT" --config "$W/bob.toml" lease offer --min-capacity 500000 --max-capacity 1000000 \
+  --duration 144 --fee-base 1000 --fee-ppm 2000 --feerate 2 --confs 3 --expires-in 3600 --poll 2 \
+  > "$W/offer.out" 2> "$W/offer.err" &
+OFFER_PID=$!
+wait_until 90 grep -q "state=open" "$W/offer.out" || { lease_dump; fail "the offer did not open"; }
+ORDER=$(grep -m1 "state=open" "$W/offer.out" | sed 's/.*order=\([^ ]*\).*/\1/')
+log "lease: order $ORDER is open; alice takes 600000 sat of it"
+"$AGENT" --config "$W/alice.toml" lease take "$ORDER" --capacity 600000 \
+  --node-address "127.0.0.1:${P2P[alice]}" --poll 2 > "$W/take.out" 2> "$W/take.err" &
+TAKE_PID=$!
+
+both_active() { grep -q "state=active" "$W/offer.out" && grep -q "state=active" "$W/take.out"; }
+t=0
+until both_active; do
+  kill -0 "$OFFER_PID" 2>/dev/null || grep -q "state=active" "$W/offer.out" || { lease_dump; fail "the seller's agent stopped early"; }
+  kill -0 "$TAKE_PID" 2>/dev/null || grep -q "state=active" "$W/take.out" || { lease_dump; fail "the buyer's agent stopped early"; }
+  "$W/mine.sh" 1; sleep 2; t=$((t+1))
+  [ "$t" -lt 90 ] || { lease_dump; fail "the lease did not become active"; }
+done
+wait "$OFFER_PID" || fail "the seller's agent exited with an error"
+wait "$TAKE_PID" || fail "the buyer's agent exited with an error"
+sed 's/^/  seller: /' "$W/offer.out"; sed 's/^/  buyer:  /' "$W/take.out"
+
+log "lease: what each side holds afterwards"
+BPK=$(lnc bob getinfo | jget identity_pubkey)
+lnc alice listchannels | python3 -c '
+import json, sys
+bob = sys.argv[1]
+leased = [c for c in json.load(sys.stdin)["channels"]
+          if c["remote_pubkey"] == bob and c["capacity"] == "600000" and not c["initiator"]]
+assert len(leased) == 1, f"expected one leased 600000 sat channel from bob, found {len(leased)}"
+assert leased[0]["active"], "the leased channel is not active"
+' "$BPK" || fail "alice does not have the leased channel"
+"$AGENT" --config "$W/alice.toml" lease list | grep -q "^buyer order=$ORDER state=active" || fail "the buyer's stored lease is not active"
+"$AGENT" --config "$W/bob.toml" lease list | grep -q "^seller order=$ORDER state=active" || fail "the seller's stored lease is not active"
+LEASE_FILE=$(ls "$W"/alice-agent/leases/buyer-*.lease)
+[ "$(stat -c %a "$LEASE_FILE")" = 600 ] || fail "the buyer's lease file is not 600"
+[ "$(stat -c %a "$W/alice-agent/leases")" = 700 ] || fail "the leases directory is not 700"
+
+log "lease: the instance coordinated it and never held the preimage"
+python3 - "$W/instance/mostro.db" "$ORDER" <<'PY' || fail "the instance's record of the lease is wrong"
+import sqlite3, sys
+db = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+status = db.execute("SELECT status FROM lease_offers WHERE id = ?", (sys.argv[2],)).fetchone()
+assert status == ("active",), status
+txid, = db.execute("SELECT funding_txid FROM leases WHERE offer_id = ?", (sys.argv[2],)).fetchone()
+assert txid and len(txid) == 64, txid
+PY
+# The preimage is read into a variable and only ever searched for, never printed.
+PREIMAGE=$(sed -n 3p "$LEASE_FILE")
+[ "${#PREIMAGE}" = 64 ] || fail "the lease file has no preimage line"
+grep -qF -- "$PREIMAGE" "$LEASE_FILE" || fail "the search for the preimage does not find it where it is"
+for f in "$W"/instance/mostro.db* "$W/instance/mostrod.log" "$W/relay.log" \
+         "$W"/alice-agent/leases/*.json "$W"/bob-agent/leases/*.json "$W"/*.out "$W"/*.err; do
+  [ -e "$f" ] || fail "nothing to search at $f"
+  if grep -aqF -- "$PREIMAGE" "$f"; then fail "the preimage is in $f"; fi
+done
+kill "$INSTANCE_PID"
+
+log "INSTANCE LEASE E2E PASS: offer, take, pay, open, verify, release and settle through a real bipnipd, two agents and three LND nodes"

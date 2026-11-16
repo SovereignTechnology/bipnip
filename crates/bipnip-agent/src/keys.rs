@@ -106,6 +106,16 @@ impl Wallet {
         derive(&self.mnemonic, 0)
     }
 
+    /// The key for lease `index` (`1..=MAX_TRADE_INDEX`), under the liquidity account. Lease
+    /// trade keys share nothing with the fiat trade keys, and their indexes cannot collide with
+    /// those of a Mostro client restored from the same mnemonic.
+    pub fn liquidity_trade(&self, index: u32) -> Result<Keys, KeyError> {
+        if index == 0 || index > MAX_TRADE_INDEX {
+            return Err(KeyError::TradeIndex(index));
+        }
+        derive_in(&self.mnemonic, LIQUIDITY_ACCOUNT, index)
+    }
+
     /// The key for trade `index` (`1..=MAX_TRADE_INDEX`).
     pub fn trade(&self, index: u32) -> Result<Keys, KeyError> {
         if index == 0 || index > MAX_TRADE_INDEX {
