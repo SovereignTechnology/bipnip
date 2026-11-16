@@ -20,6 +20,7 @@ use crate::lease::run::{
 use crate::lease::{DEFAULT_MAX_CLTV_DELTA, DEFAULT_SELLER_CLTV_DELTA, LeaseStepError};
 use crate::lease_wire::{self, Incoming, WireError};
 
+mod link_tests;
 mod store_tests;
 
 const SELLER: SellerConfig = SellerConfig {

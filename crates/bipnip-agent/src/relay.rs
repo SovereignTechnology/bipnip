@@ -21,7 +21,8 @@ pub struct PublishReport {
     pub failed: Vec<(String, String)>,
 }
 
-async fn connected(relays: &[String]) -> Result<Client, String> {
+/// A client connected to `relays`, or an error when there are none.
+pub(crate) async fn connected(relays: &[String]) -> Result<Client, String> {
     if relays.is_empty() {
         return Err("no relays configured".into());
     }

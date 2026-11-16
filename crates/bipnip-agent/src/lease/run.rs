@@ -24,11 +24,17 @@
 //! saves, and only the second opens. A seller that restarts in between looks for a channel it
 //! already opened before opening another.
 //!
+//! Two steps touch the node before the run can be saved, and are safe to repeat after a restart:
+//! a buyer whose payment is already locked does not pay again, and a seller whose hold invoice is
+//! already settled does not settle again. One is not: a seller that stopped after creating the
+//! hold invoice and before saving cannot create it again, so that lease stalls until the
+//! instance times it out. No money is at stake there, since the buyer never saw an invoice.
+//!
 //! Not here yet: the completion invoice at the end of the lease.
 
 use std::path::Path;
 
-use bipnip_ln::{LightningBackend, PaymentState, hexutil};
+use bipnip_ln::{HoldState, LightningBackend, PaymentState, hexutil};
 use mostro_core::lease::{LeaseContract, LeaseTerms};
 use mostro_core::lease_message::LeaseOffer;
 use mostro_core::node_binding::Network;
@@ -471,7 +477,16 @@ impl SellerRun {
                     .as_ref()
                     .ok_or(RunError::OutOfOrder("no lease"))?;
                 let secret = lease_wire::check_preimage(lease.contract(), &preimage)?;
-                lease.settle(backend, secret).await?;
+                // A run that stopped after settling and before it was saved has nothing left
+                // to settle.
+                let settled = backend
+                    .hold_invoice_state(&lease.contract().payment_hash)
+                    .await
+                    .map_err(LeaseStepError::from)?
+                    == HoldState::Settled;
+                if !settled {
+                    lease.settle(backend, secret).await?;
+                }
                 self.state = SellerState::Active;
                 Ok(vec![Outgoing::ToInstance(lease_wire::active(order_id))])
             }
@@ -844,6 +859,15 @@ impl BuyerRun {
             }
             (Incoming::UpfrontInvoice { invoice, .. }, BuyerState::Taking) => {
                 lease_wire::check_names(self.lease.contract(), &invoice.lease_id)?;
+                // A run that stopped after paying and before it was saved: the payment is
+                // already locked, and paying again would only be refused by our node.
+                if matches!(
+                    self.lease.payment_state(backend).await,
+                    Ok(PaymentState::InFlight)
+                ) {
+                    self.state = BuyerState::Paid;
+                    return Ok(Vec::new());
+                }
                 let paid = self
                     .lease
                     .pay_upfront(
