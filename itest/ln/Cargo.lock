@@ -204,6 +204,7 @@ dependencies = [
  "sha2 0.10.9",
  "tokio",
  "toml",
+ "uuid",
  "zeroize",
 ]
 
@@ -1307,7 +1308,7 @@ dependencies = [
 [[package]]
 name = "mostro-core"
 version = "0.17.3"
-source = "git+https://github.com/SovereignTechnology/bipnip-core?rev=5daa0124b5ecb86bb32dc947a3d5659e7e1c8d64#5daa0124b5ecb86bb32dc947a3d5659e7e1c8d64"
+source = "git+https://github.com/SovereignTechnology/bipnip-core?rev=bd6fa53c278d572980182b091e4bcae25fd1dd41#bd6fa53c278d572980182b091e4bcae25fd1dd41"
 dependencies = [
  "bitcoin",
  "chrono",
