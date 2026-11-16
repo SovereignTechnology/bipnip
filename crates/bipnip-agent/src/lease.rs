@@ -11,10 +11,14 @@
 //!   [`BuyerLease::verify_channel`] can make, from the buyer's own node's view of the channel;
 //! - [`SellerLease::open`] refuses unless the seller's own node reports the hold invoice accepted.
 //!
-//! Nothing here logs. The preimage is wiped on drop and never appears in `Debug`.
+//! Nothing here logs. The preimage is wiped on drop and never appears in `Debug`. It leaves memory
+//! in two ways only: through [`BuyerLease::release`], and into the owner-only file
+//! [`BuyerLease::save_new`] writes so that a restarted agent can still finish the lease.
 
 pub mod run;
+pub mod store;
 
+use std::path::Path;
 use std::str::FromStr;
 
 use bipnip_ln::{
@@ -26,6 +30,9 @@ use mostro_core::lease::{LeaseContract, LeaseError, LeaseTerms, MAX_HOLD_SECS};
 use mostro_core::node_binding::Network;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
+
+use crate::secretfile;
+use store::StoreError;
 
 /// Largest `min_final_cltv_expiry_delta` a buyer accepts on the upfront invoice by default: about
 /// two days of blocks, in line with the 48-hour hold limit.
@@ -219,6 +226,9 @@ impl VerifiedChannel {
     }
 }
 
+/// First line of a stored buyer lease.
+const BUYER_LEASE_HEADER: &str = "bipnip-buyer-lease:v1";
+
 /// The buyer's side of one lease: the contract and the preimage only the buyer knows.
 pub struct BuyerLease {
     contract: LeaseContract,
@@ -274,6 +284,56 @@ impl BuyerLease {
         };
         lease.contract.validate()?;
         Ok(lease)
+    }
+
+    /// Writes the contract and the preimage to a new file only its owner can read. Nothing is
+    /// ever overwritten: a lease has one preimage for life. This must happen before the take is
+    /// sent, or a restart between the two leaves a paid lease nobody can release.
+    pub fn save_new(&self, path: &Path) -> Result<(), StoreError> {
+        let mut contents = format!(
+            "{BUYER_LEASE_HEADER}\n{}\n{}\n",
+            self.contract.text(),
+            hexutil::encode(&self.preimage)
+        );
+        let written = secretfile::create_secret(path, &contents);
+        contents.zeroize();
+        written.map_err(StoreError::File)
+    }
+
+    /// Reads a lease [`BuyerLease::save_new`] wrote, refusing a file anyone else can read and a
+    /// preimage that does not open the contract's payment hash.
+    pub fn load(path: &Path) -> Result<Self, StoreError> {
+        let mut contents = secretfile::read_secret(path).map_err(StoreError::File)?;
+        let lease = Self::parse_stored(&contents);
+        contents.zeroize();
+        lease
+    }
+
+    fn parse_stored(contents: &str) -> Result<Self, StoreError> {
+        let corrupt = |what: &str| StoreError::Corrupt(format!("buyer lease file: {what}"));
+        let mut lines = contents.lines();
+        if lines.next() != Some(BUYER_LEASE_HEADER) {
+            return Err(corrupt("unknown format"));
+        }
+        let contract = lines
+            .next()
+            .and_then(|text| LeaseContract::parse(text).ok())
+            .ok_or_else(|| corrupt("contract"))?;
+        let mut bytes = lines
+            .next()
+            .and_then(|hex| hexutil::hash32(hex, "preimage").ok())
+            .ok_or_else(|| corrupt("preimage"))?;
+        let opens = sha256_hex(&bytes) == contract.payment_hash;
+        let mut preimage = [0u8; 32];
+        if opens && bytes.len() == preimage.len() {
+            preimage.copy_from_slice(&bytes);
+        }
+        bytes.zeroize();
+        if !opens || lines.next().is_some() {
+            preimage.zeroize();
+            return Err(corrupt("the preimage does not open the contract"));
+        }
+        Ok(BuyerLease { contract, preimage })
     }
 
     /// The contract to send to the seller. It carries the payment hash, never the preimage.
@@ -366,6 +426,14 @@ impl SellerLease {
             ));
         }
         Ok(SellerLease { contract })
+    }
+
+    /// A lease read back from this agent's own state: the contract was accepted before it was
+    /// stored, so only its form is checked again.
+    pub(crate) fn restore(contract_text: &str) -> Result<Self, LeaseError> {
+        Ok(SellerLease {
+            contract: LeaseContract::parse(contract_text)?,
+        })
     }
 
     /// The contract.

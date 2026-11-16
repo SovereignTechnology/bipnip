@@ -17,18 +17,28 @@
 //!   for the preimage. Otherwise an instance could cost a seller the channel it opened, by telling
 //!   it to give the payment back.
 //!
-//! Not here yet: state on disk (a restarted agent forgets its leases, and a buyer's preimage with
-//! them, in which case the payment times out and returns), and the completion invoice at the end
-//! of the lease.
+//! Both runs can be written out and read back ([`SellerRun::to_json`], [`BuyerRun::to_json`],
+//! [`super::store::LeaseStore`]). The caller saves after every message and every tick, and saves
+//! a buyer's run before sending its take. The seller opens the channel in two ticks for that
+//! reason: the first records that the payment is locked and which channels exist, the caller
+//! saves, and only the second opens. A seller that restarts in between looks for a channel it
+//! already opened before opening another.
+//!
+//! Not here yet: the completion invoice at the end of the lease.
 
-use bipnip_ln::{LightningBackend, PaymentState};
+use std::path::Path;
+
+use bipnip_ln::{LightningBackend, PaymentState, hexutil};
 use mostro_core::lease::{LeaseContract, LeaseTerms};
 use mostro_core::lease_message::LeaseOffer;
 use mostro_core::node_binding::Network;
 use mostro_core::prelude::{CantDoReason, Message};
 use nostr_sdk::prelude::{Event, Keys, PublicKey};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use super::store::StoreError;
 use super::{BuyerLease, LeaseStepError, SellerLease};
 use crate::lease_wire::{self, Incoming, WireError};
 
@@ -126,7 +136,8 @@ fn learn_peer(known: &mut Option<PublicKey>, trade_key: PublicKey) -> Result<(),
 }
 
 /// Where the seller's side stands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum SellerState {
     /// The offer is sent; the instance has not answered.
     Offering,
@@ -134,6 +145,9 @@ pub enum SellerState {
     Open,
     /// A buyer took it and has our hold invoice.
     Invoiced,
+    /// The buyer's payment is locked; the channel is about to be opened, or was opened and the
+    /// run stopped before recording it.
+    Opening,
     /// The buyer's payment is locked and the channel is opening; waiting for the preimage.
     Opened,
     /// The hold invoice is settled.
@@ -163,8 +177,49 @@ pub struct SellerRun {
     buyer_trade: Option<PublicKey>,
     buyer_addr: Option<String>,
     lease: Option<SellerLease>,
+    /// Funding outpoints of the channels our node had with the buyer before we opened one.
+    channels_before: Vec<String>,
     outpoint: Option<String>,
     canceled_by_instance: bool,
+}
+
+/// A seller's run as stored. Nothing in it is secret.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SellerRecord {
+    version: u8,
+    instance: String,
+    offer: LeaseOffer,
+    request_id: u64,
+    cltv_delta: u32,
+    feerate_sat_vb: u64,
+    state: SellerState,
+    order_id: Option<String>,
+    buyer_trade: Option<String>,
+    buyer_addr: Option<String>,
+    contract: Option<String>,
+    channels_before: Vec<String>,
+    outpoint: Option<String>,
+    canceled_by_instance: bool,
+}
+
+/// The version of the stored records.
+const RECORD_VERSION: u8 = 1;
+
+fn corrupt(what: &str) -> StoreError {
+    StoreError::Corrupt(what.to_string())
+}
+
+fn stored_key(hex: &str) -> Result<PublicKey, StoreError> {
+    PublicKey::parse(hex).map_err(|_| corrupt("a public key"))
+}
+
+fn stored_json<T: Serialize>(record: &T) -> Result<String, StoreError> {
+    serde_json::to_string(record).map_err(|e| StoreError::Corrupt(e.to_string()))
+}
+
+fn parsed_json<'a, T: Deserialize<'a>>(json: &'a str) -> Result<T, StoreError> {
+    serde_json::from_str(json).map_err(|e| StoreError::Corrupt(e.to_string()))
 }
 
 impl SellerRun {
@@ -186,10 +241,125 @@ impl SellerRun {
             buyer_trade: None,
             buyer_addr: None,
             lease: None,
+            channels_before: Vec::new(),
             outpoint: None,
             canceled_by_instance: false,
         };
         (run, Outgoing::ToInstance(message))
+    }
+
+    /// A stable name for this run's stored state: the same offer, sent to the same instance
+    /// under the same request id, has the same key (32 hex).
+    pub fn store_key(&self) -> String {
+        let offer = serde_json::to_string(&self.offer).unwrap_or_default();
+        let text = format!("{}:{}:{offer}", self.instance.to_hex(), self.request_id);
+        let mut key = hexutil::encode(&Sha256::digest(text.as_bytes()));
+        key.truncate(32);
+        key
+    }
+
+    /// The run as text, to store. Nothing in it is secret.
+    pub fn to_json(&self) -> Result<String, StoreError> {
+        stored_json(&SellerRecord {
+            version: RECORD_VERSION,
+            instance: self.instance.to_hex(),
+            offer: self.offer.clone(),
+            request_id: self.request_id,
+            cltv_delta: self.config.cltv_delta,
+            feerate_sat_vb: self.config.feerate_sat_vb,
+            state: self.state,
+            order_id: self.order_id.map(|id| id.to_string()),
+            buyer_trade: self.buyer_trade.map(|key| key.to_hex()),
+            buyer_addr: self.buyer_addr.clone(),
+            contract: self.contract().map(LeaseContract::text),
+            channels_before: self.channels_before.clone(),
+            outpoint: self.outpoint.clone(),
+            canceled_by_instance: self.canceled_by_instance,
+        })
+    }
+
+    /// Reads a stored run, refusing one whose parts do not fit together: a state that needs an
+    /// order id, a contract or an outpoint it does not have, or a contract that is not the
+    /// offer's.
+    pub fn from_json(json: &str) -> Result<Self, StoreError> {
+        let record: SellerRecord = parsed_json(json)?;
+        if record.version != RECORD_VERSION {
+            return Err(corrupt("an unknown record version"));
+        }
+        record.offer.validate().map_err(|_| corrupt("the offer"))?;
+        let order_id = record
+            .order_id
+            .as_deref()
+            .map(Uuid::parse_str)
+            .transpose()
+            .map_err(|_| corrupt("the order id"))?;
+        let lease = record
+            .contract
+            .as_deref()
+            .map(SellerLease::restore)
+            .transpose()
+            .map_err(|_| corrupt("the contract"))?;
+        if let Some(lease) = &lease {
+            record
+                .offer
+                .check_contract(lease.contract())
+                .map_err(|_| corrupt("the contract is not the offer's"))?;
+        }
+        let state = record.state;
+        let needs_order = state != SellerState::Offering && state != SellerState::Canceled;
+        let needs_lease = matches!(
+            state,
+            SellerState::Invoiced
+                | SellerState::Opening
+                | SellerState::Opened
+                | SellerState::Active
+        );
+        let needs_outpoint = matches!(state, SellerState::Opened | SellerState::Active);
+        if (needs_order && order_id.is_none())
+            || (needs_lease && lease.is_none())
+            || (needs_outpoint && record.outpoint.is_none())
+        {
+            return Err(corrupt("the state does not fit the rest of the record"));
+        }
+        Ok(SellerRun {
+            instance: stored_key(&record.instance)?,
+            offer: record.offer,
+            request_id: record.request_id,
+            config: SellerConfig {
+                cltv_delta: record.cltv_delta,
+                feerate_sat_vb: record.feerate_sat_vb,
+            },
+            state,
+            order_id,
+            buyer_trade: record.buyer_trade.as_deref().map(stored_key).transpose()?,
+            buyer_addr: record.buyer_addr,
+            lease,
+            channels_before: record.channels_before,
+            outpoint: record.outpoint,
+            canceled_by_instance: record.canceled_by_instance,
+        })
+    }
+
+    /// The channel this lease already opened, if our node has one: to the buyer, funded by us,
+    /// of the contract's capacity, and not among the channels noted before opening.
+    async fn already_opened(
+        &self,
+        lease: &SellerLease,
+        backend: &dyn LightningBackend,
+    ) -> Result<Option<String>, RunError> {
+        let contract = lease.contract();
+        let channels = backend
+            .channels_with(&contract.buyer_node.to_string())
+            .await
+            .map_err(LeaseStepError::from)?;
+        Ok(channels
+            .into_iter()
+            .find(|channel| {
+                channel.local_initiator
+                    && channel.capacity_sat == contract.terms.capacity_sat
+                    && !self.channels_before.contains(&channel.funding_outpoint)
+            })
+            .map(|channel| channel.funding_outpoint))
     }
 
     /// Where the run stands.
@@ -287,7 +457,10 @@ impl SellerRun {
             }
             (
                 Incoming::PeerKey { trade_key, .. },
-                SellerState::Open | SellerState::Invoiced | SellerState::Opened,
+                SellerState::Open
+                | SellerState::Invoiced
+                | SellerState::Opening
+                | SellerState::Opened,
             ) => {
                 learn_peer(&mut self.buyer_trade, trade_key)?;
                 Ok(Vec::new())
@@ -314,6 +487,24 @@ impl SellerRun {
                 self.state = SellerState::Canceled;
                 Ok(Vec::new())
             }
+            (Incoming::Canceled { .. }, SellerState::Opening) => {
+                // Between noticing the payment and recording the channel. If our node already
+                // has the channel, this is the case below; if not, nothing was opened and the
+                // buyer gets its payment back.
+                let lease = self.lease.clone().ok_or(RunError::OutOfOrder("no lease"))?;
+                match self.already_opened(&lease, backend).await? {
+                    Some(outpoint) => {
+                        self.outpoint = Some(outpoint);
+                        self.state = SellerState::Opened;
+                        self.canceled_by_instance = true;
+                    }
+                    None => {
+                        lease.cancel(backend).await?;
+                        self.state = SellerState::Canceled;
+                    }
+                }
+                Ok(Vec::new())
+            }
             (Incoming::Canceled { .. }, SellerState::Opened) => {
                 // The channel is open and the buyer's payment is locked at our node. The buyer
                 // can still release the preimage; if it does not, the payment times out. Giving
@@ -325,31 +516,50 @@ impl SellerRun {
         }
     }
 
-    /// Looks at our node. Once the buyer's payment is locked, opens the channel and reports it.
+    /// Looks at our node. Opening the channel takes two ticks, with a save by the caller in
+    /// between: the first notices the buyer's locked payment and notes the channels our node has
+    /// with the buyer; the second opens the channel (or finds the one a run that stopped mid-way
+    /// already opened) and reports it.
     pub async fn tick(
         &mut self,
         backend: &dyn LightningBackend,
     ) -> Result<Vec<Outgoing>, RunError> {
-        if self.state != SellerState::Invoiced {
-            return Ok(Vec::new());
-        }
         let (Some(lease), Some(order_id)) = (self.lease.clone(), self.order_id) else {
             return Ok(Vec::new());
         };
-        if !lease.payment_locked(backend).await? {
-            return Ok(Vec::new());
+        match self.state {
+            SellerState::Invoiced => {
+                if lease.payment_locked(backend).await? {
+                    self.channels_before = backend
+                        .channels_with(&lease.contract().buyer_node.to_string())
+                        .await
+                        .map_err(LeaseStepError::from)?
+                        .into_iter()
+                        .map(|channel| channel.funding_outpoint)
+                        .collect();
+                    self.state = SellerState::Opening;
+                }
+                Ok(Vec::new())
+            }
+            SellerState::Opening => {
+                let outpoint = match self.already_opened(&lease, backend).await? {
+                    Some(outpoint) => outpoint,
+                    None => {
+                        lease
+                            .open(backend, self.buyer_addr.clone(), self.config.feerate_sat_vb)
+                            .await?
+                    }
+                };
+                self.state = SellerState::Opened;
+                self.outpoint = Some(outpoint.clone());
+                Ok(vec![Outgoing::ToInstance(lease_wire::channel_opened(
+                    order_id,
+                    lease.contract(),
+                    &outpoint,
+                )?)])
+            }
+            _ => Ok(Vec::new()),
         }
-        let outpoint = lease
-            .open(backend, self.buyer_addr.clone(), self.config.feerate_sat_vb)
-            .await?;
-        // Recorded before anything else can fail: the channel is opened once.
-        self.state = SellerState::Opened;
-        self.outpoint = Some(outpoint.clone());
-        Ok(vec![Outgoing::ToInstance(lease_wire::channel_opened(
-            order_id,
-            lease.contract(),
-            &outpoint,
-        )?)])
     }
 
     /// Withdraws the offer, or backs out of a lease before the channel is opened: the hold
@@ -374,7 +584,8 @@ impl SellerRun {
 }
 
 /// Where the buyer's side stands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum BuyerState {
     /// The take is sent; waiting for the seller's invoice.
     Taking,
@@ -435,7 +646,90 @@ pub struct BuyerRun {
     waiting_on: Option<String>,
 }
 
+/// A buyer's run as stored. The preimage is not in it: that lives in the lease's own file.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BuyerRecord {
+    version: u8,
+    instance: String,
+    order_id: String,
+    request_id: u64,
+    lease_id: String,
+    max_fee_msat: u64,
+    max_cltv_delta: u32,
+    state: BuyerState,
+    seller_trade: Option<String>,
+    channels_before: Vec<String>,
+    outpoint: Option<String>,
+}
+
 impl BuyerRun {
+    /// A stable name for this run's stored state: the lease id (64 hex). It commits to the
+    /// payment hash, so two different preimages can never be stored under one key.
+    pub fn store_key(&self) -> String {
+        self.lease.contract().id()
+    }
+
+    /// Writes the contract and the preimage to a new owner-only file
+    /// ([`BuyerLease::save_new`]). Before the take is sent.
+    pub fn save_lease(&self, path: &Path) -> Result<(), StoreError> {
+        self.lease.save_new(path)
+    }
+
+    /// The run as text, to store. The preimage is not in it.
+    pub fn to_json(&self) -> Result<String, StoreError> {
+        stored_json(&BuyerRecord {
+            version: RECORD_VERSION,
+            instance: self.instance.to_hex(),
+            order_id: self.order_id.to_string(),
+            request_id: self.request_id,
+            lease_id: self.lease.contract().id(),
+            max_fee_msat: self.config.max_fee_msat,
+            max_cltv_delta: self.config.max_cltv_delta,
+            state: self.state,
+            seller_trade: self.seller_trade.map(|key| key.to_hex()),
+            channels_before: self.channels_before.clone(),
+            outpoint: self.outpoint.clone(),
+        })
+    }
+
+    /// Reads a stored run and joins it with its lease, refusing a record that is for another
+    /// lease or whose state needs an outpoint or a peer key it does not have.
+    pub fn from_json(json: &str, lease: BuyerLease) -> Result<Self, StoreError> {
+        let record: BuyerRecord = parsed_json(json)?;
+        if record.version != RECORD_VERSION {
+            return Err(corrupt("an unknown record version"));
+        }
+        if record.lease_id != lease.contract().id() {
+            return Err(corrupt("the record is for another lease"));
+        }
+        let seller_trade = record.seller_trade.as_deref().map(stored_key).transpose()?;
+        let state = record.state;
+        let needs_outpoint = matches!(
+            state,
+            BuyerState::Verifying | BuyerState::Released | BuyerState::Active
+        );
+        let needs_peer = matches!(state, BuyerState::Released | BuyerState::Active);
+        if (needs_outpoint && record.outpoint.is_none()) || (needs_peer && seller_trade.is_none()) {
+            return Err(corrupt("the state does not fit the rest of the record"));
+        }
+        Ok(BuyerRun {
+            instance: stored_key(&record.instance)?,
+            order_id: Uuid::parse_str(&record.order_id).map_err(|_| corrupt("the order id"))?,
+            request_id: record.request_id,
+            config: BuyerConfig {
+                max_fee_msat: record.max_fee_msat,
+                max_cltv_delta: record.max_cltv_delta,
+            },
+            lease,
+            state,
+            seller_trade,
+            channels_before: record.channels_before,
+            outpoint: record.outpoint,
+            waiting_on: None,
+        })
+    }
+
     /// Starts by taking an order on `instance`: draws the preimage, writes the contract dated
     /// `now`, and returns the run and the take message to send. The channels our node already
     /// has with the seller are noted, so none of them can be passed off as the leased one.
