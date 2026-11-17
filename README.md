@@ -19,11 +19,11 @@ binding. A whole lease now runs end to end on regtest: a seller's agent offers l
 a buyer's agent takes the order, pays the seller's hold invoice, checks the channel on its own node and
 releases the preimage, between real LND nodes and through a real `bipnipd`, which never sees the preimage.
 When part of the fee is due at the end, the seller bills it once the channel is as old as the lease is
-long, and the buyer pays if its node still has the channel. The instance side is still in review
-(`bipnipd` pull requests 4 and 5). Rings work the same way, without bonds for now: a creator proposes a
-ring, others take its slots, every member checks the roster and signs it, and each opens one channel to
-the next and confirms the one opened to it (`bipnipd` pull request 6). Not written yet: ring bonds, and
-the Core Lightning and LDK backends. Nothing here is ready for real funds.
+long, and the buyer pays if its node still has the channel. The instance side is in `bipnipd`. Rings work
+the same way, without bonds for now: a creator proposes a ring, others take its slots, every member checks
+the roster and signs it, and each opens one channel to the next and confirms the one opened to it. Not
+written yet: bonds, a long-running agent with a local API, and the Core Lightning and LDK backends. Nothing
+here is ready for real funds.
 
 ## Try the agent (regtest or signet only)
 
