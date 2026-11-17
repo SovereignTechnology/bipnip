@@ -329,10 +329,22 @@ async fn main() {
         .add_invoice(250_000, 600, "bipnip-ln conformance: plain")
         .await
         .expect("invoice");
-    match a.pay_invoice(&invoice, 10_000, 30).await.expect("pay") {
-        PaymentState::Succeeded { preimage } => assert_eq!(preimage.len(), 64),
-        other => panic!("plain invoice not paid: {other:?}"),
+    // As for a hold invoice, a brand-new channel can refuse the first tries.
+    let mut paid = None;
+    for attempt in 1..=6 {
+        match a.pay_invoice(&invoice, 10_000, 30).await.expect("pay") {
+            PaymentState::Succeeded { preimage } => {
+                paid = Some(preimage);
+                break;
+            }
+            PaymentState::Failed { reason } => {
+                println!("  attempt {attempt} failed ({reason}); retrying");
+                tokio::time::sleep(Duration::from_secs(10)).await;
+            }
+            PaymentState::InFlight => panic!("a plain invoice was not paid within the wait"),
+        }
     }
+    assert_eq!(paid.expect("plain invoice paid").len(), 64);
 
     step("graph_node sees the announced channel");
     until("B in A's graph with a channel", 120, || async {
