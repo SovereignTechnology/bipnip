@@ -15,6 +15,10 @@
 //! confirmations, so a few seconds between looks cost nothing, and a poll needs no connection
 //! state to get wrong.
 //!
+//! A link either has a relay connection of its own (one command, one run) or shares the
+//! daemon's ([`Link::shared`]): the daemon asks the relays once for all of its runs and hands
+//! each link the events addressed to its trade key ([`Link::deliver`]).
+//!
 //! An answer no relay took is owed, not lost. The run is marked and saved, and the next step
 //! starts by making the message its state implies again and sending that. What is sent twice
 //! does no harm: the instance refuses a step it already recorded, and a run refuses a message
@@ -43,9 +47,18 @@ pub struct Received {
     pub sender: PublicKey,
 }
 
+/// Where a link's events come from.
+enum Source {
+    /// The link asks the relays itself and owns its connection.
+    Own,
+    /// The daemon asks for all runs at once; these are the events it last found for this link.
+    Shared(Vec<Event>),
+}
+
 /// One run's connection to its instance's relays, under one trade key.
 pub struct Link {
     client: Client,
+    source: Source,
     identity: Keys,
     trade: Keys,
     instance: PublicKey,
@@ -74,6 +87,7 @@ impl Link {
     ) -> Result<Self, String> {
         Ok(Link {
             client: connected(relays).await?,
+            source: Source::Own,
             identity,
             trade,
             instance,
@@ -81,6 +95,41 @@ impl Link {
             since: Timestamp::from(since),
             done: HashSet::new(),
         })
+    }
+
+    /// A link over a relay connection the daemon owns and shares between its runs. It sends
+    /// through that connection and reads only what [`Link::deliver`] hands it.
+    pub fn shared(
+        client: Client,
+        identity: Keys,
+        trade: Keys,
+        instance: PublicKey,
+        pow: u8,
+    ) -> Self {
+        Link {
+            client,
+            source: Source::Shared(Vec::new()),
+            identity,
+            trade,
+            instance,
+            pow,
+            since: Timestamp::from(0),
+            done: HashSet::new(),
+        }
+    }
+
+    /// Hands a shared link everything the relays now hold for its trade key. The next poll
+    /// reads from this, skipping what is marked done. Nothing happens on a link with a
+    /// connection of its own.
+    pub fn deliver(&mut self, events: Vec<Event>) {
+        if let Source::Shared(inbox) = &mut self.source {
+            *inbox = events;
+        }
+    }
+
+    /// The trade key this link reads for.
+    pub fn trade_pubkey(&self) -> PublicKey {
+        self.trade.public_key()
     }
 
     /// Our liquidity identity, the key our node is bound to.
@@ -124,21 +173,30 @@ impl Link {
 
     /// The events the relays hold for our trade key that are not marked done, oldest first.
     async fn fresh(&self) -> Result<Vec<Event>, String> {
-        let filter = Filter::new()
-            .kind(Kind::PrivateDirectMessage)
-            .pubkey(self.trade.public_key())
-            .since(self.since);
-        let events = self
-            .client
-            .fetch_events(filter)
-            .timeout(RELAY_TIMEOUT)
-            .await
-            .map_err(|e| format!("fetch: {e}"))?;
-        let mut fresh: Vec<Event> = events
-            .iter()
-            .filter(|event| !self.done.contains(&event.id))
-            .cloned()
-            .collect();
+        let mut fresh: Vec<Event> = match &self.source {
+            Source::Shared(inbox) => inbox
+                .iter()
+                .filter(|event| !self.done.contains(&event.id))
+                .cloned()
+                .collect(),
+            Source::Own => {
+                let filter = Filter::new()
+                    .kind(Kind::PrivateDirectMessage)
+                    .pubkey(self.trade.public_key())
+                    .since(self.since);
+                let events = self
+                    .client
+                    .fetch_events(filter)
+                    .timeout(RELAY_TIMEOUT)
+                    .await
+                    .map_err(|e| format!("fetch: {e}"))?;
+                events
+                    .iter()
+                    .filter(|event| !self.done.contains(&event.id))
+                    .cloned()
+                    .collect()
+            }
+        };
         fresh.sort_by_key(|event| (event.created_at, event.id));
         Ok(fresh)
     }
@@ -183,9 +241,11 @@ impl Link {
         self.done.insert(id);
     }
 
-    /// Disconnects from the relays.
+    /// Disconnects from the relays, if the connection is this link's own.
     pub async fn close(self) {
-        self.client.shutdown().await;
+        if matches!(self.source, Source::Own) {
+            self.client.shutdown().await;
+        }
     }
 }
 

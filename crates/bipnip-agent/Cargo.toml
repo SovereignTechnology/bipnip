@@ -32,7 +32,8 @@ sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 # Lease state on disk.
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+# `net` and `io-util` for the daemon's unix socket, `sync` for its queues.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync"] }
 toml = "0.8"
 # bipnip-core main (#7): Mostro's protocol types and transport, the node binding, and leases and
 # rings (terms, messages, order events).
@@ -41,8 +42,8 @@ mostro-core = { git = "https://github.com/SovereignTechnology/bipnip-core", rev 
 nostr-sdk = "0.45.1"
 # NIP-06 (mnemonic → keys) is a feature of the nostr crate nostr-sdk re-exports.
 nostr = { version = "0.45.1", features = ["nip06"] }
-# Order ids in Mostro messages.
-uuid = "1"
+# Order ids in Mostro messages, and in the daemon's requests.
+uuid = { version = "1", features = ["serde"] }
 zeroize = "1"
 secp256k1 = "0.30"
 

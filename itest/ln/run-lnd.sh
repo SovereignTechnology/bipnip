@@ -227,7 +227,8 @@ instance_log() { sed 's/\x1b\[[0-9;]*[A-Za-z]//g' "$W/instance/mostrod.log" | ta
 wait_until 120 grep -q "Scheduler Started" "$W/instance/mostrod.log" \
   || { instance_log; fail "the instance did not start"; }
 
-for n in alice bob; do printf '\n[instance]\npubkey = "%s"\n' "$INSTANCE_PUB" >> "$W/$n.toml"; done
+# The proof of work is fixed here; the daemons further down read it from the instance instead.
+for n in alice bob; do printf '\n[instance]\npubkey = "%s"\npow = 0\n' "$INSTANCE_PUB" >> "$W/$n.toml"; done
 lease_dump() {
   for f in offer.out offer.err take.out take.err; do [ -s "$W/$f" ] && sed "s/^/  $f: /" "$W/$f"; done
   instance_log 60
@@ -649,6 +650,188 @@ paid = [p for p in json.load(sys.stdin)["payments"] if p["status"] == "SUCCEEDED
 assert len(paid) == 2 and all(int(p["value_sat"]) == payout for p in paid), paid
 assert all(0 <= int(p["fee_sat"]) <= bond - payout for p in paid), paid
 ' "$BOND" "$PAYOUT" || fail "the instance's node paid out something other than the two payouts"
-kill "$INSTANCE_PID"
 
 log "INSTANCE LEASE BOND E2E PASS: two leases with a buyer's bond through a real bipnipd: the bond was locked before the seller was asked and came back when the lease became active; with the buyer gone after the channel opened, its bond was taken and paid on to the seller, who then gave the upfront payment back"
+
+# --- the agents as daemons, driven by the bipnip command line ------------------------------------
+log "daemon: build the bipnip command line"
+cargo build --quiet --release --manifest-path "$HERE/../../Cargo.toml" -p bipnip-cli --target-dir "$W/target-ws"
+CLI=$W/target-ws/release/bipnip
+daemon_conf() { # name, policy lines
+  cat > "$W/$1-d.toml" <<CONF
+network = "regtest"
+data_dir = "$W/$1-agent"
+relays = ["ws://127.0.0.1:7777"]
+
+[lnd]
+address = "https://127.0.0.1:${RPC[$1]}"
+tls_cert = "$W/$1/tls.cert"
+macaroon = "$(mac "$1")"
+
+# No pow here: the daemon reads it from the instance's own info event.
+[[instance]]
+pubkey = "$INSTANCE_PUB"
+
+[policy]
+$2
+CONF
+}
+# Bob may have runs under way but has no allowance to open channels: what he starts is parked.
+daemon_conf bob "max_runs = 4"
+# Alice may pay 2100 sat for a lease, 2100 a day, and open 250000 sat of channels a day.
+daemon_conf alice "max_runs = 4
+max_fee_per_lease_sat = 2100
+max_fee_per_day_sat = 2100
+max_capacity_per_day_sat = 250000"
+declare -A DPID
+bip() { local n=$1; shift; "$CLI" --socket "$W/$n-agent/agent.sock" "$@"; }
+start_daemon() { # name
+  "$AGENT" --config "$W/$1-d.toml" run --poll 2 >> "$W/daemon-$1.out" 2>> "$W/daemon-$1.err" &
+  DPID[$1]=$!
+  wait_until 90 bip "$1" status || { daemon_dump; fail "$1's daemon did not come up"; }
+}
+stop_daemon() { kill "${DPID[$1]}"; wait "${DPID[$1]}" 2>/dev/null || true; }
+daemon_dump() {
+  for f in "$W"/daemon-*.out "$W"/daemon-*.err "$W"/d-*.out "$W"/d-*.err; do
+    [ -s "$f" ] && sed "s|^|  $(basename "$f"): |" "$f" | tail -60
+  done
+  instance_log 80
+}
+# Runs a command that must be parked: exit status 3. Prints the approval's name.
+parked() { # name, the limit it must be over, command...
+  local n=$1 limit=$2 rc=0; shift 2
+  bip "$n" "$@" > "$W/d-parked.out" 2> "$W/d-parked.err" || rc=$?
+  # This runs inside $(…): what is said about a failure must go to stderr to be seen.
+  [ "$rc" -eq 3 ] || { daemon_dump; fail "$n: '$*' ended with status $rc, not parked"; } >&2
+  grep -q "$limit" "$W/d-parked.err" || { daemon_dump; fail "$n: '$*' was not parked over $limit"; } >&2
+  sed -n 's/.*Parked as \([0-9a-f]*\);.*/\1/p' "$W/d-parked.err"
+}
+result_field() { python3 -c 'import json,sys; print(json.load(sys.stdin)[sys.argv[1]])' "$1"; }
+
+log "daemon: alice and bob run their agents as daemons"
+start_daemon alice; start_daemon bob
+bip bob status | python3 -c '
+import json, sys
+s = json.load(sys.stdin)
+assert s["network"] == "regtest" and s["node"]["synced"], s
+assert [i["pow"] for i in s["instances"]] == [0] and s["instances_not_ready"] == [], s
+assert s["policy"]["max_runs"] == 4 and s["policy"]["max_capacity_per_day_sat"] == 0, s
+' || { daemon_dump; fail "bob's daemon does not report what it should"; }
+if "$AGENT" --config "$W/bob-d.toml" lease resume > /dev/null 2> "$W/d-oneshot.err"; then
+  fail "a one-shot command ran beside the daemon"
+fi
+grep -q "another bipnip-agent" "$W/d-oneshot.err" || { cat "$W/d-oneshot.err"; fail "the one-shot command was not refused for the lock"; }
+if "$AGENT" --config "$W/bob-d.toml" run > /dev/null 2> "$W/d-second.err"; then fail "a second daemon started"; fi
+grep -q "another bipnip-agent" "$W/d-second.err" || { cat "$W/d-second.err"; fail "the second daemon was not refused for the lock"; }
+
+log "daemon: bob's offer is over his limits, so it is parked; he approves it"
+APPROVAL=$(parked bob max_capacity_per_day_sat lease offer --min-capacity 300000 --max-capacity 600000 \
+  --duration 144 --fee-base 1000 --fee-ppm 2000 --feerate 2 --confs 3 --expires-in 3600)
+bip bob approvals | python3 -c '
+import json, sys
+a = json.load(sys.stdin)["approvals"]
+assert len(a) == 1 and a[0]["approval"] == sys.argv[1] and a[0]["method"] == "lease.offer", a
+assert a[0]["ask"] == {"fee_sat": 0, "capacity_sat": 600000, "bond_sat": 0, "peer": None}, a
+' "$APPROVAL" || { daemon_dump; fail "the parked offer is not listed as it was asked"; }
+bip bob lease list | grep -q "state=offering\|state=open" && { daemon_dump; fail "a parked offer was started"; }
+bip bob approve "$APPROVAL" > "$W/d-approve.out" 2> "$W/d-approve.err" || { daemon_dump; fail "the approval did not start the offer"; }
+SELLER_RUN=$(result_field run < "$W/d-approve.out")
+[ "$(bip bob approvals | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["approvals"]))')" = 0 ] || fail "the approval is still parked"
+d_order() { bip bob lease list | sed -n 's/^seller order=\([0-9a-f-]\{36\}\) state=open .*/\1/p' | head -1; }
+d_open() { [ -n "$(d_order)" ]; }
+wait_until 90 d_open || { daemon_dump; fail "the daemon's offer did not open"; }
+ORDER_D=$(d_order)
+
+log "daemon: order $ORDER_D is open; bob's daemon is restarted and still has it"
+stop_daemon bob
+bip bob status > /dev/null 2>&1 && fail "bob's daemon still answers after it was stopped"
+start_daemon bob
+bip bob lease list | grep -q "^seller order=$ORDER_D state=open " || { daemon_dump; fail "the offer was lost over the restart"; }
+
+log "daemon: alice sees the order; 600000 sat would cost more than she allows, 512000 does not"
+bip alice orders --kind lease | python3 -c '
+import json, sys
+o = [o for o in json.load(sys.stdin)["orders"] if o["order_id"] == sys.argv[1]]
+assert len(o) == 1 and o[0]["max_capacity_sat"] == 600000 and o[0]["fee_ppm"] == 2000, o
+' "$ORDER_D" || { daemon_dump; fail "alice's daemon does not list the order"; }
+DEAR=$(parked alice max_fee_per_lease_sat lease take "$ORDER_D" --capacity 600000)
+bip alice deny "$DEAR" > /dev/null || fail "the dear take could not be denied"
+bip alice approve "$DEAR" > /dev/null 2>&1 && fail "a denied request could still be approved"
+bip alice lease take "$ORDER_D" --capacity 512000 --node-address "127.0.0.1:${P2P[alice]}" \
+  > "$W/d-take.out" 2> "$W/d-take.err" || { daemon_dump; fail "alice's daemon did not take the order"; }
+BUYER_RUN=$(result_field run < "$W/d-take.out")
+bip alice watch "$BUYER_RUN" > "$W/d-watch.out" 2> "$W/d-watch.err" &
+WATCH_PID=$!
+
+log "daemon: alice's daemon is stopped once her payment is locked, and started again"
+d_buyer_at() { bip alice lease list | grep -q "^buyer order=$ORDER_D state=\($1\) "; }
+wait_until 120 d_buyer_at 'paid\|verifying\|released\|active' || { daemon_dump; fail "alice's payment was not locked"; }
+stop_daemon alice
+wait "$WATCH_PID" 2>/dev/null || true
+start_daemon alice
+d_both_active() {
+  bip alice lease list | grep -q "^buyer order=$ORDER_D state=active " \
+    && bip bob lease list | grep -q "^seller order=$ORDER_D state=active "
+}
+t=0
+until d_both_active; do
+  for n in alice bob; do kill -0 "${DPID[$n]}" 2>/dev/null || { daemon_dump; fail "$n's daemon stopped"; }; done
+  "$W/mine.sh" 1; sleep 2; t=$((t+1))
+  [ "$t" -lt 90 ] || { daemon_dump; fail "the lease through the daemons did not become active"; }
+done
+grep -q "state=paid\|state=verifying" "$W/d-watch.out" || { daemon_dump; fail "the watcher was not told of the lease's progress"; }
+
+log "daemon: what the lease did with each node is what its run was granted"
+lnc alice listchannels | python3 -c '
+import json, sys
+leased = [c for c in json.load(sys.stdin)["channels"] if c["capacity"] == "512000"]
+assert len(leased) == 1 and not leased[0]["initiator"] and leased[0]["active"], leased
+' || fail "alice does not have the 512000 sat channel"
+python3 - "$W/alice-agent/policy/grant-$BUYER_RUN.json" "$W/bob-agent/policy/grant-$SELLER_RUN.json" <<'PY' || { daemon_dump; fail "the grants do not match what was done"; }
+import json, sys
+bought, sold = (json.load(open(path)) for path in sys.argv[1:3])
+# 1000 sat + 2000 ppm of 512000 = 2024 sat, all of it upfront.
+assert bought["ask"]["fee_sat"] == 2024 and not bought["approved"], bought
+assert [p["msat"] for p in bought["paid"]] == [2024000] and bought["opened_sat"] == 0, bought
+assert sold["approved"] and sold["ask"]["capacity_sat"] == 600000, sold
+assert sold["opened_sat"] == 512000 and sold["paid"] == [], sold
+PY
+bip alice status | python3 -c '
+import json, sys
+s = json.load(sys.stdin)
+assert s["last_day"]["fee_sat"] == 2024, s
+' || fail "alice's daemon does not count the fee against her day"
+
+log "daemon: a ring of two through the daemons; bob's is parked and approved, alice's is within her day"
+RING_APPROVAL=$(parked bob max_capacity_per_day_sat ring create --capacity 222222 --slots 2 --feerate 2 \
+  --window 3600 --expires-in 3600 --node-address "127.0.0.1:${P2P[bob]}")
+bip bob approve "$RING_APPROVAL" > "$W/d-ring-approve.out" 2> "$W/d-ring-approve.err" || { daemon_dump; fail "the ring was not started on approval"; }
+d_ring() { bip bob ring list | sed -n 's/^ring order=\([0-9a-f-]\{36\}\) state=seated .*/\1/p' | head -1; }
+d_ring_seated() { [ -n "$(d_ring)" ]; }
+wait_until 90 d_ring_seated || { daemon_dump; fail "the daemon's ring was not stored by the instance"; }
+RING_D=$(d_ring)
+bip alice ring join "$RING_D" --feerate 2 --node-address "127.0.0.1:${P2P[alice]}" \
+  > "$W/d-ring-join.out" 2> "$W/d-ring-join.err" || { daemon_dump; fail "alice's daemon did not join the ring"; }
+d_ring_done() { for n in alice bob; do bip "$n" ring list | grep -q "^ring order=$RING_D state=success " || return 1; done; }
+t=0
+until d_ring_done; do
+  for n in alice bob; do
+    bip "$n" ring list | grep -q "^ring order=$RING_D state=\(partial\|canceled\) " && { daemon_dump; fail "the daemons' ring ended early for $n"; }
+  done
+  "$W/mine.sh" 1; sleep 2; t=$((t+1))
+  [ "$t" -lt 90 ] || { daemon_dump; fail "the ring through the daemons did not complete"; }
+done
+for n in alice bob; do
+  lnc "$n" listchannels | python3 -c '
+import json, sys
+ring = [c for c in json.load(sys.stdin)["channels"] if c["capacity"] == "222222"]
+assert sorted(c["initiator"] for c in ring) == [False, True] and all(c["active"] for c in ring), ring
+' || fail "$n does not have one 222222 sat ring channel out and one in"
+done
+# Alice opened 222222 sat today and may open 250000: another 200000 is over her day.
+OVER=$(parked alice max_capacity_per_day_sat ring create --capacity 200000 --slots 2 --feerate 2)
+bip alice deny "$OVER" > /dev/null || fail "the ring over alice's day could not be denied"
+stop_daemon alice; stop_daemon bob
+kill "$INSTANCE_PID"
+
+log "DAEMON E2E PASS: a lease and a ring through two agent daemons and the bipnip command line, against a real bipnipd: requests over a limit were parked and went ahead only when approved; a daemon stopped and started again mid-lease carried on; each run paid and opened exactly what it was granted"

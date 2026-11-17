@@ -3,9 +3,11 @@
 
 pub mod binding;
 pub mod config;
+pub mod daemon;
 pub mod keys;
 pub mod lease;
 pub mod lease_wire;
+pub mod lock;
 pub mod relay;
 pub mod ring;
 pub mod ring_wire;

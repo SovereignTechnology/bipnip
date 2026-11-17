@@ -11,7 +11,9 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use super::link::{Link, StepReport, launch_buyer, launch_seller, step_buyer, step_seller};
-use super::run::{BondTerms, BuyerConfig, BuyerRun, SellerConfig, SellerRun, TakeRequest};
+use super::run::{
+    BondTerms, BuyerConfig, BuyerRun, Outgoing, SellerConfig, SellerRun, TakeRequest,
+};
 use super::store::LeaseStore;
 use crate::binding::make_binding_event;
 use crate::config::{Config, InstanceConfig};
@@ -33,6 +35,26 @@ pub struct Session<'a> {
     pub wallet: &'a Wallet,
     /// The agent's own node.
     pub backend: &'a dyn LightningBackend,
+    /// The instance to work on, when the caller chose one (the daemon, which may know
+    /// several). Without it, the only configured instance.
+    pub instance: Option<&'a InstanceConfig>,
+    /// A relay connection to share between runs (the daemon's). Without it, every run connects
+    /// for itself.
+    pub hub: Option<&'a nostr_sdk::prelude::Client>,
+    /// True when the caller weighs a new run against the `[policy]` limits itself (the daemon,
+    /// which parks what is over a limit). False for a command a person typed: there the one
+    /// limit that applies, the bond, is checked here and a bond over it is refused.
+    pub caller_checks_limits: bool,
+}
+
+impl Session<'_> {
+    /// The instance this session works on, with its proof of work settled.
+    pub(crate) async fn instance(&self) -> Result<InstanceConfig, String> {
+        match self.instance {
+            Some(instance) => Ok(instance.clone()),
+            None => instance(self.config).await,
+        }
+    }
 }
 
 /// What a seller offers.
@@ -78,14 +100,21 @@ pub(crate) fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-pub(crate) fn instance(config: &Config) -> Result<&InstanceConfig, String> {
-    config
-        .instance
-        .as_ref()
-        .ok_or_else(|| "no instance configured (add an [instance] section)".to_string())
+/// The instance a one-shot command works on: the only one configured, with its proof of work
+/// settled. With several, the daemon is the way (`bipnip-agent run`).
+async fn instance(config: &Config) -> Result<InstanceConfig, String> {
+    match config.instances.as_slice() {
+        [] => Err("no instance configured (add an [instance] section)".into()),
+        [entry] => relay::resolve_instance(entry, config).await,
+        _ => Err(
+            "several instances are configured; this command works with one (use the daemon, \
+             `bipnip-agent run`, to trade on several)"
+                .into(),
+        ),
+    }
 }
 
-fn store(config: &Config) -> Result<LeaseStore, String> {
+pub(crate) fn store(config: &Config) -> Result<LeaseStore, String> {
     let dir = config.leases_dir();
     LeaseStore::open(&dir).map_err(|e| format!("{}: {e}", dir.display()))
 }
@@ -123,6 +152,15 @@ pub(crate) async fn link_for(
         .wallet
         .liquidity_trade(trade_index)
         .map_err(|e| e.to_string())?;
+    if let Some(hub) = session.hub {
+        return Ok(Link::shared(
+            hub.clone(),
+            identity,
+            trade,
+            instance.pubkey,
+            instance.pow,
+        ));
+    }
     Link::connect(
         &session.config.relays,
         identity,
@@ -169,9 +207,24 @@ pub async fn offer(
     params: OfferParams,
     seller: SellerConfig,
 ) -> Result<(SellerRun, Link), String> {
+    let (mut run, first, link) = prepare_offer(session, params, seller).await?;
+    let store = store(session.config)?;
+    let report = launch_seller(&mut run, &first, &link, &store)
+        .await
+        .map_err(|e| e.to_string())?;
+    owed_note(&report, "the offer");
+    Ok((run, link))
+}
+
+/// Everything [`offer`] does short of storing the run and sending the offer: the run, its first
+/// message and its link. Our node's binding is published here already; nothing is committed.
+pub async fn prepare_offer(
+    session: &Session<'_>,
+    params: OfferParams,
+    seller: SellerConfig,
+) -> Result<(SellerRun, Outgoing, Link), String> {
     let config = session.config;
-    let instance = instance(config)?;
-    let store = store(config)?;
+    let instance = &session.instance().await?;
     let now = unix_now();
     let info = session
         .backend
@@ -199,7 +252,7 @@ pub async fn offer(
     relay::publish(&binding, &config.relays).await?;
 
     let trade_index = next_trade_index(config)?;
-    let (mut run, first) = SellerRun::offer(instance.pubkey, offer, now, trade_index, seller);
+    let (run, first) = SellerRun::offer(instance.pubkey, offer, now, trade_index, seller);
     let link = link_for(
         session,
         instance,
@@ -207,11 +260,7 @@ pub async fn offer(
         now.saturating_sub(NEW_RUN_LOOKBACK_SECS),
     )
     .await?;
-    let report = launch_seller(&mut run, &first, &link, &store)
-        .await
-        .map_err(|e| e.to_string())?;
-    owed_note(&report, "the offer");
-    Ok((run, link))
+    Ok((run, first, link))
 }
 
 /// Takes an order on the configured instance. The order is read from the relays and must be
@@ -223,9 +272,25 @@ pub async fn take(
     params: TakeParams,
     buyer: BuyerConfig,
 ) -> Result<(BuyerRun, Link), String> {
+    let (mut run, first, link) = prepare_take(session, params, buyer).await?;
+    let store = store(session.config)?;
+    let report = launch_buyer(&mut run, &first, &link, &store)
+        .await
+        .map_err(|e| e.to_string())?;
+    owed_note(&report, "the take");
+    Ok((run, link))
+}
+
+/// Everything [`take`] does short of storing the run and sending the take: every check on the
+/// order, the seller and the bond, then the run, its first message and its link. Nothing is
+/// committed.
+pub async fn prepare_take(
+    session: &Session<'_>,
+    params: TakeParams,
+    buyer: BuyerConfig,
+) -> Result<(BuyerRun, Outgoing, Link), String> {
     let config = session.config;
-    let instance = instance(config)?;
-    let store = store(config)?;
+    let instance = &session.instance().await?;
     let now = unix_now();
     let order = relay::fetch_lease_order(params.order_id, &instance.pubkey, &config.relays)
         .await?
@@ -255,7 +320,7 @@ pub async fn take(
     let binding = own_binding(session, now).await?;
     // A bond is paid only up to our own limit, and only to the node the instance's own binding
     // names: both are settled before the take is sent.
-    let bond = crate::ring::cmd::instance_node_for(config, instance, order.bond_sat)
+    let bond = crate::ring::cmd::instance_node_for(session, instance, order.bond_sat)
         .await?
         .map(|instance_node| BondTerms {
             instance_node,
@@ -274,7 +339,7 @@ pub async fn take(
         node_address: params.node_address,
         bond,
     };
-    let (mut run, first) = BuyerRun::take(session.backend, instance.pubkey, request, buyer, now)
+    let (run, first) = BuyerRun::take(session.backend, instance.pubkey, request, buyer, now)
         .await
         .map_err(|e| e.to_string())?;
     let link = link_for(
@@ -284,11 +349,7 @@ pub async fn take(
         now.saturating_sub(NEW_RUN_LOOKBACK_SECS),
     )
     .await?;
-    let report = launch_buyer(&mut run, &first, &link, &store)
-        .await
-        .map_err(|e| e.to_string())?;
-    owed_note(&report, "the take");
-    Ok((run, link))
+    Ok((run, first, link))
 }
 
 fn name<T: Serialize>(state: &T) -> String {
@@ -414,7 +475,7 @@ pub async fn resume(
     say: &mut dyn FnMut(String),
 ) -> Result<(), String> {
     let config = session.config;
-    let instance = instance(config)?;
+    let instance = &session.instance().await?;
     let store = store(config)?;
     let loaded = store.load().map_err(|e| e.to_string())?;
     for (file, why) in &loaded.problems {
@@ -430,8 +491,9 @@ pub async fn resume(
         }
     }
     let mut buyers = Vec::new();
-    for run in loaded.buyers {
+    for mut run in loaded.buyers {
         if !buyer_done(&run) && run.instance() == instance.pubkey {
+            run.resumed();
             let link = link_for(session, instance, run.trade_index(), since).await?;
             say(describe_buyer(&run));
             buyers.push((run, link));

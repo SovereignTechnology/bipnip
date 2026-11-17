@@ -10,9 +10,12 @@ use mostro_core::lease_order::{KIND_LEASE_ORDER, LeaseOrder};
 use mostro_core::node_binding::{
     Action as BindingAction, KIND_NODE_BINDING, Network, SignedStatement,
 };
+use mostro_core::prelude::NOSTR_INFO_EVENT_KIND;
 use mostro_core::ring_order::RingOrder;
 use nostr_sdk::prelude::{Client, Event, Filter, Kind, PublicKey};
 use uuid::Uuid;
+
+use crate::config::{Config, InstanceConfig, InstanceEntry, MAX_POW_BITS};
 
 /// How long to wait for relays to connect, accept an event or answer a query.
 pub const RELAY_TIMEOUT: Duration = Duration::from_secs(20);
@@ -131,6 +134,119 @@ fn newest_instance_node(
         .max_by_key(|statement| statement.created_at)
         .filter(|statement| statement.action == BindingAction::Bind)
         .map(|statement| statement.node_pubkey.to_string())
+}
+
+/// The proof of work an instance's info event asks for, in bits: the larger of its `pow` and
+/// `pow_first_contact` tags, since every run talks to the instance under a key it has not seen.
+/// `None` when the event names neither.
+fn pow_of_info(event: &Event) -> Option<u8> {
+    let tag = |name: &str| -> Option<u8> {
+        event
+            .tags
+            .iter()
+            .map(|tag| tag.as_slice())
+            .find(|tag| tag.first().map(String::as_str) == Some(name))
+            .and_then(|tag| tag.get(1))
+            .and_then(|value| value.parse().ok())
+    };
+    match (tag("pow"), tag("pow_first_contact")) {
+        (None, None) => None,
+        (base, first) => Some(base.unwrap_or(0).max(first.unwrap_or(0))),
+    }
+}
+
+/// The proof of work `instance` asks for, read from the newest info event it signed. A relay
+/// can serve an older event or none; it cannot forge one. An instance that asks for more than
+/// [`MAX_POW_BITS`] is refused: a message would take hours to make.
+pub async fn fetch_instance_pow(instance: &PublicKey, relays: &[String]) -> Result<u8, String> {
+    let client = connected(relays).await?;
+    let filter = Filter::new()
+        .kind(Kind::Custom(NOSTR_INFO_EVENT_KIND))
+        .author(*instance);
+    let fetched = client.fetch_events(filter).timeout(RELAY_TIMEOUT).await;
+    client.shutdown().await;
+    let events = fetched.map_err(|e| format!("fetch: {e}"))?;
+    let newest = events
+        .iter()
+        .filter(|event| event.pubkey == *instance && event.verify().is_ok())
+        .max_by_key(|event| event.created_at);
+    let pow = newest.and_then(pow_of_info).ok_or(
+        "the relays hold no info event from this instance that states its proof of work \
+         (set pow in the config to fix it by hand)",
+    )?;
+    if pow > MAX_POW_BITS {
+        return Err(format!(
+            "the instance asks for {pow} bits of proof of work; this agent does at most \
+             {MAX_POW_BITS}"
+        ));
+    }
+    Ok(pow)
+}
+
+/// Settles an instance's proof of work: what the configuration fixes, or else what the
+/// instance's info event asks for.
+pub async fn resolve_instance(
+    entry: &InstanceEntry,
+    config: &Config,
+) -> Result<InstanceConfig, String> {
+    let pow = match entry.pow {
+        Some(pow) => pow,
+        None => fetch_instance_pow(&entry.pubkey, &config.relays).await?,
+    };
+    Ok(InstanceConfig {
+        pubkey: entry.pubkey,
+        pow,
+    })
+}
+
+/// An open order as an instance published it.
+#[derive(Debug, Clone)]
+pub enum OpenOrder {
+    /// Liquidity offered for lease.
+    Lease(LeaseOrder),
+    /// A ring with slots left.
+    Ring(RingOrder),
+}
+
+/// Every lease and ring order `instance` has open at `now`, newest version of each. Only events
+/// that verify and are signed by `instance` count, as for [`fetch_lease_order`].
+pub async fn fetch_open_orders(
+    instance: &PublicKey,
+    relays: &[String],
+    now: u64,
+) -> Result<Vec<OpenOrder>, String> {
+    let client = connected(relays).await?;
+    let filter = Filter::new()
+        .kind(Kind::Custom(KIND_LEASE_ORDER))
+        .author(*instance);
+    let fetched = client.fetch_events(filter).timeout(RELAY_TIMEOUT).await;
+    client.shutdown().await;
+    let events = fetched.map_err(|e| format!("fetch: {e}"))?;
+    let mut newest: Vec<&Event> = Vec::new();
+    for event in events.iter().filter(|event| event.pubkey == *instance) {
+        let id = event.tags.identifier();
+        match newest
+            .iter_mut()
+            .find(|known| known.tags.identifier() == id)
+        {
+            Some(known) if known.created_at < event.created_at => *known = event,
+            Some(_) => {}
+            None => newest.push(event),
+        }
+    }
+    let mut orders = Vec::new();
+    for event in newest {
+        if let Ok(order) = LeaseOrder::from_event(event) {
+            if order.is_open(now) {
+                orders.push(OpenOrder::Lease(order));
+            }
+        } else if let Ok(order) = RingOrder::from_event(event)
+            && order.is_open(now)
+        {
+            orders.push(OpenOrder::Ring(order));
+        }
+    }
+    Ok(orders)
 }
 
 /// The newest lease order `instance` published under `order_id`, if the relays hold one. Only

@@ -471,6 +471,11 @@ impl SellerRun {
         self.instance
     }
 
+    /// What this run offers.
+    pub fn offered(&self) -> &LeaseOffer {
+        &self.offer
+    }
+
     /// The order id, once the instance has given one.
     pub fn order_id(&self) -> Option<Uuid> {
         self.order_id
@@ -1150,6 +1155,11 @@ impl BuyerRun {
         }
     }
 
+    /// The bond the order asks of us, in satoshi; 0 for none.
+    pub fn bond_sat(&self) -> u64 {
+        self.bond_terms.as_ref().map_or(0, |terms| terms.bond_sat)
+    }
+
     /// Our bond payment, once the instance's invoice passed our checks.
     pub fn bond(&self) -> Option<&BondPayment> {
         self.bond.as_ref()
@@ -1183,6 +1193,21 @@ impl BuyerRun {
     /// True when the answer the current state implies has not reached a relay yet.
     pub fn unsent(&self) -> bool {
         self.unsent
+    }
+
+    /// Call when a stored run is taken up again by a new process. If the preimage was released,
+    /// it is marked to be sent again: the process before may have ended after storing that it
+    /// released and before the message left. Without the preimage the seller is never paid for
+    /// a channel it did open, and a buyer's bond could be taken for it. Sent twice it does no
+    /// harm: it goes to the seller alone, only after our node has checked the channel again,
+    /// and a seller that already settled ignores it.
+    ///
+    /// No other state is sent again on a restart. A second take or a second offer is answered
+    /// by the instance with a refusal, and a refusal can end a run.
+    pub fn resumed(&mut self) {
+        if self.state == BuyerState::Released {
+            self.unsent = true;
+        }
     }
 
     /// Records whether the current state's answer still has to be sent. Stored with the run.

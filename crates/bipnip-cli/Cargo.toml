@@ -12,5 +12,9 @@ publish.workspace = true
 name = "bipnip"
 path = "src/main.rs"
 
+[dependencies]
+# The agent's socket speaks JSON lines; nothing else is needed to be its client.
+serde_json = "1"
+
 [lints]
 workspace = true
