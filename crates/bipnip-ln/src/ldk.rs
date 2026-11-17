@@ -7,23 +7,21 @@
 //!
 //! - **Paying, channels, signing** map onto the trait directly. An outbound payment is kept
 //!   under its payment hash, so its state is a lookup.
-//! - **Hold invoices** work, with limits a seller must know:
-//!   - The server keeps no record of a hold invoice until an HTLC arrives for it. So an
-//!     invoice nobody has paid and a hash nobody made an invoice for look the same: both read
-//!     as [`HoldState::Open`].
-//!   - A held payment has an id of its own, not its hash. This backend finds it by searching
-//!     the payment list for the hash, and remembers what it found. Nothing here depends on the
-//!     server's event stream, which is best-effort and never replayed.
-//!   - An unpaid invoice cannot be cancelled at the node. A cancel is remembered by this
-//!     process, and a payment that arrives later is failed when it is next looked at. If the
-//!     process ends first, such a payment stays held until its deadline and is then given
-//!     back by the node.
-//!   - **The lock time cannot be set.** The node's hold invoices ask for a fixed
-//!     `min_final_cltv_expiry_delta` (42 blocks when measured), and the node gives a held
-//!     payment back about 39 blocks before it expires: a seller has only a few blocks to open,
-//!     confirm and settle. A request for more blocks than the node gives is refused rather
-//!     than quietly shortened. Until LDK Server lets the caller set it, selling leases from
-//!     an LDK node is for regtest and short confirmations only.
+//! - **Hold invoices are not supported**, so an LDK node can buy a lease or sit in a ring but
+//!   cannot sell a lease. The server can make an invoice on a caller's hash and claim it with
+//!   the preimage, but it cannot yet do it safely for a seller:
+//!   - the lock time cannot be set: its hold invoices ask for 42 blocks, and the node gives a
+//!     held payment back about 39 blocks before it expires, which left 6 blocks when measured:
+//!     not enough to open a channel, see it confirmed and settle;
+//!   - whether a payment is held can only be learned from an event stream that is best-effort
+//!     and never replayed. The payment list does show a held payment, but shows it the same
+//!     way after the node has given it back, so it cannot answer "is it still held?";
+//!   - an unpaid hold invoice cannot be cancelled.
+//!
+//!   A seller that opened a channel on such an answer could find the payment gone. Rather
+//!   than offer that, the hold methods answer [`BackendError::Unsupported`]. Two additions to
+//!   LDK Server would lift this: a lock time on `Bolt11ReceiveForHash`, and a lookup of a held
+//!   payment by its hash that says until which block it can be claimed.
 //! - **`graph_node`** counts a node's public channels; their capacity is known only where the
 //!   server's graph has it, or the channel is this node's own. Read the capacity as a floor.
 //! - **`graph_channels` is not supported**: the server's graph names channels by short channel
@@ -34,10 +32,9 @@
 //! Every RPC has a deadline. Errors carry the server's own text only; the macaroon and
 //! invoices are never put in one.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::Path;
-use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -45,10 +42,9 @@ use ldk_server_client::client::LdkServerClient;
 use ldk_server_client::error::{LdkServerError, LdkServerErrorCode};
 use ldk_server_client::ldk_server_grpc::api::open_channel_request::Amount;
 use ldk_server_client::ldk_server_grpc::api::{
-    Bolt11ClaimForIdRequest, Bolt11FailForIdRequest, Bolt11ReceiveForHashRequest,
     Bolt11ReceiveRequest, Bolt11SendRequest, ConnectPeerRequest, DecodeInvoiceRequest,
     GetNodeInfoRequest, GetPaymentDetailsRequest, GraphGetChannelRequest, GraphGetNodeRequest,
-    ListChannelsRequest, ListPaymentsRequest, OpenChannelRequest, SignMessageRequest,
+    ListChannelsRequest, OpenChannelRequest, SignMessageRequest,
 };
 use ldk_server_client::ldk_server_grpc::types::bolt11_invoice_description::Kind as DescriptionKind;
 use ldk_server_client::ldk_server_grpc::types::payment_kind::Kind as PaymentKindOf;
@@ -60,9 +56,8 @@ use ldk_server_client::{
     DEFAULT_MAX_CHANNEL_SATURATION_POWER_OF_HALF, DEFAULT_MAX_PATH_COUNT,
     DEFAULT_MAX_TOTAL_CLTV_EXPIRY_DELTA,
 };
-use sha2::{Digest, Sha256};
 
-use crate::hexutil::{self, hash32, node_key};
+use crate::hexutil::{hash32, node_key};
 use crate::{
     BackendError, ChannelView, GraphChannel, HoldInvoiceRequest, HoldState, LightningBackend,
     NodeInfo, OpenRequest, PaymentState,
@@ -98,14 +93,6 @@ where
     }
 }
 
-/// The payment hash a BOLT 11 payment record carries, if it is one.
-fn bolt11_hash(payment: &Payment) -> Option<&str> {
-    match payment.kind.as_ref()?.kind.as_ref()? {
-        PaymentKindOf::Bolt11(bolt11) => Some(bolt11.hash.as_str()),
-        _ => None,
-    }
-}
-
 fn bolt11_preimage(payment: &Payment) -> Option<&str> {
     match payment.kind.as_ref()?.kind.as_ref()? {
         PaymentKindOf::Bolt11(bolt11) => bolt11.preimage.as_deref(),
@@ -117,13 +104,13 @@ fn is_status(payment: &Payment, status: PaymentStatus) -> bool {
     payment.status == status as i32
 }
 
+/// Why this backend holds no payments (the module's text has the measurements).
+const NO_HOLD: &str = "LDK Server cannot yet hold a payment safely for a seller: its lock time \
+                       is fixed and short, and a held payment cannot be looked up";
+
 /// An LDK Server reached over gRPC.
 pub struct LdkBackend {
     client: LdkServerClient,
-    /// The ids of held payments already found in the payment list, by payment hash.
-    found: Mutex<HashMap<String, Vec<String>>>,
-    /// Hold invoices cancelled before anyone paid them: a payment that still arrives is failed.
-    cancelled: Mutex<HashSet<String>>,
 }
 
 impl LdkBackend {
@@ -140,11 +127,7 @@ impl LdkBackend {
         // contents; they are still not passed on.
         let client = LdkServerClient::new(address.to_string(), macaroon.trim().to_string(), &cert)
             .map_err(|_| setup("the certificate or the macaroon is not usable"))?;
-        Ok(LdkBackend {
-            client,
-            found: Mutex::new(HashMap::new()),
-            cancelled: Mutex::new(HashSet::new()),
-        })
+        Ok(LdkBackend { client })
     }
 
     async fn payment(&self, payment_id: &str) -> Result<Option<Payment>, BackendError> {
@@ -154,78 +137,6 @@ impl LdkBackend {
         Ok(call(self.client.get_payment_details(request))
             .await?
             .payment)
-    }
-
-    /// Every inbound payment record for `payment_hash`: the ids found before, looked up again,
-    /// and whatever else the payment list now holds for the hash.
-    async fn inbound(&self, payment_hash: &str) -> Result<Vec<Payment>, BackendError> {
-        let known: Vec<String> = self
-            .found
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(payment_hash)
-            .cloned()
-            .unwrap_or_default();
-        let mut records = Vec::new();
-        for id in &known {
-            if let Some(payment) = self.payment(id).await? {
-                records.push(payment);
-            }
-        }
-        // A settled payment needs no second look. Anything else may have gained a record: the
-        // same invoice can be paid more than once.
-        if records
-            .iter()
-            .any(|payment| is_status(payment, PaymentStatus::Succeeded))
-        {
-            return Ok(records);
-        }
-        let mut page_token = None;
-        loop {
-            let page = call(
-                self.client
-                    .list_payments(ListPaymentsRequest { page_token }),
-            )
-            .await?;
-            for payment in page.payments {
-                let ours = payment.direction == PaymentDirection::Inbound as i32
-                    && bolt11_hash(&payment) == Some(payment_hash)
-                    && !known.contains(&payment.payment_id);
-                if ours {
-                    records.push(payment);
-                }
-            }
-            page_token = page.next_page_token;
-            if page_token.is_none() {
-                break;
-            }
-        }
-        if records.len() > known.len() {
-            self.found
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .insert(
-                    payment_hash.to_string(),
-                    records.iter().map(|p| p.payment_id.clone()).collect(),
-                );
-        }
-        Ok(records)
-    }
-
-    async fn fail(&self, payment_id: &str) -> Result<(), BackendError> {
-        let request = Bolt11FailForIdRequest {
-            payment_id: payment_id.to_string(),
-        };
-        call(self.client.bolt11_fail_for_id(request))
-            .await
-            .map(|_| ())
-    }
-
-    fn is_cancelled(&self, payment_hash: &str) -> bool {
-        self.cancelled
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .contains(payment_hash)
     }
 
     /// The state of an outbound payment record.
@@ -284,125 +195,22 @@ impl LightningBackend for LdkBackend {
 
     async fn add_hold_invoice(&self, req: &HoldInvoiceRequest) -> Result<String, BackendError> {
         hash32(&req.payment_hash, "payment hash")?;
-        let request = Bolt11ReceiveForHashRequest {
-            amount_msat: Some(req.amount_msat),
-            description: Some(Bolt11InvoiceDescription {
-                kind: Some(DescriptionKind::Direct(req.description.clone())),
-            }),
-            expiry_secs: req.expiry_secs,
-            payment_hash: req.payment_hash.clone(),
-        };
-        let invoice = call(self.client.bolt11_receive_for_hash(request))
-            .await?
-            .invoice;
-        // The lock time is the node's, not ours to set. Fewer blocks than asked for is not
-        // what the caller agreed to; the invoice is not handed out.
-        let decoded = call(self.client.decode_invoice(DecodeInvoiceRequest {
-            invoice: invoice.clone(),
-        }))
-        .await?;
-        if decoded.min_final_cltv_expiry_delta < u64::from(req.cltv_delta) {
-            return Err(BackendError::Rejected(format!(
-                "this LDK node's hold invoices lock a payment for {} blocks; {} were asked for, \
-                 and LDK Server has no way to set it",
-                decoded.min_final_cltv_expiry_delta, req.cltv_delta
-            )));
-        }
-        // A new invoice on a hash cancelled before is a new start.
-        self.cancelled
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&req.payment_hash);
-        Ok(invoice)
+        Err(BackendError::Unsupported(NO_HOLD))
     }
 
     async fn hold_invoice_state(&self, payment_hash: &str) -> Result<HoldState, BackendError> {
         hash32(payment_hash, "payment hash")?;
-        let records = self.inbound(payment_hash).await?;
-        if records
-            .iter()
-            .any(|payment| is_status(payment, PaymentStatus::Succeeded))
-        {
-            return Ok(HoldState::Settled);
-        }
-        let held: Vec<&Payment> = records
-            .iter()
-            .filter(|payment| is_status(payment, PaymentStatus::Pending))
-            .collect();
-        if self.is_cancelled(payment_hash) {
-            // Paid after it was cancelled: given back now.
-            for payment in held {
-                self.fail(&payment.payment_id).await?;
-            }
-            return Ok(HoldState::Canceled);
-        }
-        if !held.is_empty() {
-            return Ok(HoldState::Accepted);
-        }
-        if records.is_empty() {
-            // Not paid yet, or never made: the server cannot tell these apart.
-            Ok(HoldState::Open)
-        } else {
-            Ok(HoldState::Canceled)
-        }
+        Err(BackendError::Unsupported(NO_HOLD))
     }
 
     async fn settle_hold_invoice(&self, preimage: &str) -> Result<(), BackendError> {
-        let bytes = hash32(preimage, "preimage")?;
-        let payment_hash = hexutil::encode(&Sha256::digest(&bytes));
-        let records = self.inbound(&payment_hash).await?;
-        let held: Vec<&Payment> = records
-            .iter()
-            .filter(|payment| is_status(payment, PaymentStatus::Pending))
-            .collect();
-        if held.is_empty() {
-            // Settled before: a retry after a lost answer is fine. Otherwise there is nothing
-            // to settle.
-            return if records
-                .iter()
-                .any(|payment| is_status(payment, PaymentStatus::Succeeded))
-            {
-                Ok(())
-            } else {
-                Err(BackendError::Rejected(
-                    "no payment is held for this preimage".into(),
-                ))
-            };
-        }
-        for payment in held {
-            let request = Bolt11ClaimForIdRequest {
-                payment_id: payment.payment_id.clone(),
-                claimable_amount_msat: payment.amount_msat,
-                preimage: preimage.to_string(),
-            };
-            call(self.client.bolt11_claim_for_id(request)).await?;
-        }
-        Ok(())
+        hash32(preimage, "preimage")?;
+        Err(BackendError::Unsupported(NO_HOLD))
     }
 
     async fn cancel_hold_invoice(&self, payment_hash: &str) -> Result<(), BackendError> {
         hash32(payment_hash, "payment hash")?;
-        let records = self.inbound(payment_hash).await?;
-        if records
-            .iter()
-            .any(|payment| is_status(payment, PaymentStatus::Succeeded))
-        {
-            return Err(BackendError::Rejected(
-                "the invoice is settled; it cannot be cancelled".into(),
-            ));
-        }
-        // Remembered first: a payment that arrives after this is failed when it is seen.
-        self.cancelled
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(payment_hash.to_string());
-        for payment in records
-            .iter()
-            .filter(|payment| is_status(payment, PaymentStatus::Pending))
-        {
-            self.fail(&payment.payment_id).await?;
-        }
-        Ok(())
+        Err(BackendError::Unsupported(NO_HOLD))
     }
 
     async fn pay_invoice(

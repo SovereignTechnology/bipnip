@@ -6,13 +6,14 @@
 # Starts regtest bitcoind, two LND nodes from a sha256-pinned release and two LDK Servers built
 # from a pinned upstream revision, and runs the same `ln-conformance` steps across the two kinds:
 #
-#   1. LND pays, LDK is paid (alice -> dave): every payee-side step on LDK, hold invoices included,
-#      with the lock time the LDK node gives (it cannot be set; see bipnip-ln's `ldk` module);
-#   2. LDK pays, LND is paid (erin -> bob): every payer-side step on LDK;
+#   1. LND pays, LDK is paid (alice -> dave): every payee-side step an LDK node offers. It
+#      offers no hold invoices (see bipnip-ln's `ldk` module for why), so those steps say so and
+#      are skipped;
+#   2. LDK pays, LND is paid (erin -> bob): every payer-side step on LDK, hold invoices included
+#      (LND holds, LDK pays);
 #   3. a whole lease with an LDK buyer and an LND seller (`lease-e2e`).
 #
-# Not run: a lease with an LDK seller. An LDK node gives a held payment back a few blocks after it
-# arrives, fewer than a channel needs to open and confirm.
+# An LDK node cannot sell a lease, so that is not run.
 # Every key and credential here is a throwaway regtest value inside the VM.
 
 set -euo pipefail
@@ -33,8 +34,6 @@ LND_V=v0.21.5-beta
 LND_SHA=2127d4794ea9cbd98e762ba16283615158743646d2d6d2a5bf88664dd6255ce7
 # The revision bipnip-ln's `ldk` feature takes its client from.
 LDK_SERVER_REV=d7e7a2e708664af922c53c786ad6a5df622f5dd8
-# What an LDK node's hold invoices ask for (measured; spikes/ldk-m3/RESULTS.md).
-LDK_HOLD_CLTV=42
 fetch() { curl -fsSL --retry 3 -o "$3" "$1"; echo "$2  $3" | sha256sum -c --quiet; }
 
 log "tools"
@@ -154,7 +153,7 @@ pair() { python3 -c 'import os,hashlib; p=os.urandom(32); print(p.hex()+":"+hash
 log "conformance 1: LND pays (alice), LDK is paid (dave)"
 A_BACKEND=lnd A_ADDR=https://127.0.0.1:${RPC[alice]} A_CERT=$W/alice/tls.cert A_MAC=$(mac alice) \
 B_BACKEND=ldk B_ADDR=127.0.0.1:${GRPC[dave]} B_CERT=$(ldk_cert dave) B_MAC=$(ldk_mac dave) \
-B_P2P=127.0.0.1:${LP2P[dave]} HASHES="$(pair),$(pair),$(pair)" HOLD_CLTV=$LDK_HOLD_CLTV \
+B_P2P=127.0.0.1:${LP2P[dave]} HASHES="$(pair),$(pair),$(pair)" \
 MINE="$W/mine.sh" \
   "$W/target/release/ln-conformance" || { ldk_dump 60; fail "conformance with an LDK payee"; }
 

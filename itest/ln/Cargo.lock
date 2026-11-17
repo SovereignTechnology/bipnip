@@ -223,7 +223,6 @@ dependencies = [
  "fedimint-tonic-lnd",
  "ldk-server-client",
  "rustls",
- "sha2 0.10.9",
  "tokio",
 ]
 

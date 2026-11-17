@@ -1,16 +1,15 @@
 //! Runs every `LightningBackend` method against two real nodes on regtest (payer A, payee B), the
 //! way a lease uses them. The steps know only the trait: the same run is the conformance test
-//! of every backend. Driven by `run-lnd.sh`; exits non-zero on the first failed step.
+//! of every backend. Driven by `run-lnd.sh` and `run-ldk.sh`; exits non-zero on the first failed step.
 //!
 //! Environment: `A_BACKEND`, `B_BACKEND` (or `BACKEND` for both; `lnd` by default), how to reach
 //! each node (`A_ADDR`/`A_CERT`/`A_MAC`, `B_…`; see `node`), `B_P2P` (host:port), `MINE` (a
-//! command that mines its argument's blocks), `HASHES` (three "preimage:hash" pairs,
-//! comma-separated), and `HOLD_CLTV` (the lock time asked of B's hold invoices, in blocks; 144 by
-//! default; a backend that cannot give what is asked must refuse, so a node with a fixed lock
-//! time is tested with its own).
+//! command that mines its argument's blocks) and `HASHES` (three "preimage:hash" pairs,
+//! comma-separated).
 //!
-//! What a backend may lack, and the run then says so and goes on: `graph_channels`
-//! (`BackendError::Unsupported`). Everything else is required.
+//! What a backend may lack, and the run then says so and goes on: hold invoices as the payee, and
+//! `graph_channels` (both by answering `BackendError::Unsupported`). Everything else is required,
+//! and a backend that does offer hold invoices must pass every hold step.
 
 use std::path::Path;
 use std::process::Command;
@@ -96,6 +95,112 @@ async fn pay_until_in_flight(a: &dyn LightningBackend, invoice: &str) -> Payment
         }
     }
     panic!("payment never left");
+}
+
+/// The hold invoice steps, from the first invoice on: held and settled, held and cancelled, and
+/// what a settle is refused for.
+async fn hold_steps(
+    a: &dyn LightningBackend,
+    b: &dyn LightningBackend,
+    hashes: &[(String, String)],
+    hold: &HoldInvoiceRequest,
+    invoice: String,
+) {
+    let (pre, hash) = &hashes[0];
+    assert_eq!(
+        b.hold_invoice_state(hash).await.expect("state"),
+        HoldState::Open
+    );
+    assert_eq!(
+        pay_until_in_flight(a, &invoice).await,
+        PaymentState::InFlight
+    );
+    until("hold invoice accepted", 60, || async {
+        b.hold_invoice_state(hash).await == Ok(HoldState::Accepted)
+    })
+    .await;
+    assert_eq!(
+        a.payment_state(hash).await.expect("state"),
+        PaymentState::InFlight
+    );
+    // Paying an invoice whose payment is under way starts no second payment and is no error.
+    assert_eq!(
+        a.pay_invoice(&invoice, 10_000, 5).await,
+        Ok(PaymentState::InFlight),
+        "paying again while the payment is held"
+    );
+    b.settle_hold_invoice(pre).await.expect("settle");
+    until("payer sees the preimage", 60, || async {
+        a.payment_state(hash).await
+            == Ok(PaymentState::Succeeded {
+                preimage: pre.clone(),
+            })
+    })
+    .await;
+    assert_eq!(
+        b.hold_invoice_state(hash).await.expect("state"),
+        HoldState::Settled
+    );
+    // Nor is paying one that is already paid: the answer is the payment that was made.
+    assert_eq!(
+        a.pay_invoice(&invoice, 10_000, 5).await,
+        Ok(PaymentState::Succeeded {
+            preimage: pre.clone(),
+        }),
+        "paying again after the payment settled"
+    );
+
+    step("hold invoice cancelled: the payer is refunded");
+    let (_, hash2) = &hashes[1];
+    let invoice = b
+        .add_hold_invoice(&HoldInvoiceRequest {
+            payment_hash: hash2.clone(),
+            ..hold.clone()
+        })
+        .await
+        .expect("add hold");
+    assert_eq!(
+        pay_until_in_flight(a, &invoice).await,
+        PaymentState::InFlight
+    );
+    until("hold invoice accepted", 60, || async {
+        b.hold_invoice_state(hash2).await == Ok(HoldState::Accepted)
+    })
+    .await;
+    b.cancel_hold_invoice(hash2).await.expect("cancel");
+    until("payer sees the failure", 60, || async {
+        matches!(
+            a.payment_state(hash2).await,
+            Ok(PaymentState::Failed { .. })
+        )
+    })
+    .await;
+    assert_eq!(
+        b.hold_invoice_state(hash2).await.expect("state"),
+        HoldState::Canceled
+    );
+
+    step("settle is idempotent; a preimage matching no invoice is refused");
+    // Settling an already-settled invoice again is accepted by LND: a retry after a lost reply is safe.
+    let again = b.settle_hold_invoice(pre).await;
+    assert!(again.is_ok(), "repeat settle: {again:?}");
+    let (_, hash3) = &hashes[2];
+    b.add_hold_invoice(&HoldInvoiceRequest {
+        payment_hash: hash3.clone(),
+        ..hold.clone()
+    })
+    .await
+    .expect("add hold");
+    let stranger = "5a".repeat(32);
+    let refused = b.settle_hold_invoice(&stranger).await;
+    assert!(refused.is_err(), "unknown preimage: {refused:?}");
+    assert_eq!(
+        b.hold_invoice_state(hash3).await.expect("state"),
+        HoldState::Open
+    );
+    // An open (unpaid) hold invoice cannot be settled even with its own preimage.
+    let unpaid = b.settle_hold_invoice(&hashes[2].0).await;
+    assert!(unpaid.is_err(), "settle of an unpaid invoice: {unpaid:?}");
 }
 
 #[tokio::main]
@@ -195,113 +300,21 @@ async fn main() {
     );
 
     step("hold invoice on the payer's hash: held without the preimage, then settled with it");
-    let hold_cltv: u32 = std::env::var("HOLD_CLTV")
-        .ok()
-        .map(|v| v.parse().expect("HOLD_CLTV is a number of blocks"))
-        .unwrap_or(144);
-    let (pre, hash) = &hashes[0];
     let hold = HoldInvoiceRequest {
-        payment_hash: hash.clone(),
+        payment_hash: hashes[0].1.clone(),
         amount_msat: 1_500_000,
         expiry_secs: 3600,
-        cltv_delta: hold_cltv,
+        cltv_delta: 144,
         description: "bipnip-ln conformance: hold".into(),
     };
-    let invoice = b.add_hold_invoice(&hold).await.expect("add hold");
-    assert_eq!(
-        b.hold_invoice_state(hash).await.expect("state"),
-        HoldState::Open
-    );
-    assert_eq!(
-        pay_until_in_flight(a, &invoice).await,
-        PaymentState::InFlight
-    );
-    until("hold invoice accepted", 60, || async {
-        b.hold_invoice_state(hash).await == Ok(HoldState::Accepted)
-    })
-    .await;
-    assert_eq!(
-        a.payment_state(hash).await.expect("state"),
-        PaymentState::InFlight
-    );
-    // Paying an invoice whose payment is under way starts no second payment and is no error.
-    assert_eq!(
-        a.pay_invoice(&invoice, 10_000, 5).await,
-        Ok(PaymentState::InFlight),
-        "paying again while the payment is held"
-    );
-    b.settle_hold_invoice(pre).await.expect("settle");
-    until("payer sees the preimage", 60, || async {
-        a.payment_state(hash).await
-            == Ok(PaymentState::Succeeded {
-                preimage: pre.clone(),
-            })
-    })
-    .await;
-    assert_eq!(
-        b.hold_invoice_state(hash).await.expect("state"),
-        HoldState::Settled
-    );
-    // Nor is paying one that is already paid: the answer is the payment that was made.
-    assert_eq!(
-        a.pay_invoice(&invoice, 10_000, 5).await,
-        Ok(PaymentState::Succeeded {
-            preimage: pre.clone(),
-        }),
-        "paying again after the payment settled"
-    );
-
-    step("hold invoice cancelled: the payer is refunded");
-    let (_, hash2) = &hashes[1];
-    let invoice = b
-        .add_hold_invoice(&HoldInvoiceRequest {
-            payment_hash: hash2.clone(),
-            ..hold.clone()
-        })
-        .await
-        .expect("add hold");
-    assert_eq!(
-        pay_until_in_flight(a, &invoice).await,
-        PaymentState::InFlight
-    );
-    until("hold invoice accepted", 60, || async {
-        b.hold_invoice_state(hash2).await == Ok(HoldState::Accepted)
-    })
-    .await;
-    b.cancel_hold_invoice(hash2).await.expect("cancel");
-    until("payer sees the failure", 60, || async {
-        matches!(
-            a.payment_state(hash2).await,
-            Ok(PaymentState::Failed { .. })
-        )
-    })
-    .await;
-    assert_eq!(
-        b.hold_invoice_state(hash2).await.expect("state"),
-        HoldState::Canceled
-    );
-
-    step("settle is idempotent; a preimage matching no invoice is refused");
-    // Settling an already-settled invoice again is accepted by LND: a retry after a lost reply is safe.
-    let again = b.settle_hold_invoice(pre).await;
-    assert!(again.is_ok(), "repeat settle: {again:?}");
-    let (_, hash3) = &hashes[2];
-    b.add_hold_invoice(&HoldInvoiceRequest {
-        payment_hash: hash3.clone(),
-        ..hold.clone()
-    })
-    .await
-    .expect("add hold");
-    let stranger = "5a".repeat(32);
-    let refused = b.settle_hold_invoice(&stranger).await;
-    assert!(refused.is_err(), "unknown preimage: {refused:?}");
-    assert_eq!(
-        b.hold_invoice_state(hash3).await.expect("state"),
-        HoldState::Open
-    );
-    // An open (unpaid) hold invoice cannot be settled even with its own preimage.
-    let unpaid = b.settle_hold_invoice(&hashes[2].0).await;
-    assert!(unpaid.is_err(), "settle of an unpaid invoice: {unpaid:?}");
+    // A backend may be unable to hold a payment at all, and then says so before anything is
+    // made. One that can must pass every hold step.
+    match b.add_hold_invoice(&hold).await {
+        Err(BackendError::Unsupported(why)) => {
+            println!("  not supported by B's backend ({why}); the hold invoice steps are skipped");
+        }
+        first => hold_steps(a, b, &hashes, &hold, first.expect("add hold")).await,
+    }
 
     step("plain invoice paid within the wait");
     let invoice = b

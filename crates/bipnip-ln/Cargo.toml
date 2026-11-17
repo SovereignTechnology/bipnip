@@ -12,7 +12,7 @@ publish.workspace = true
 # The LND backend. Off by default: building fedimint-tonic-lnd needs `protoc`.
 lnd = ["dep:fedimint-tonic-lnd", "dep:rustls", "dep:tokio"]
 # The LDK backend: an LDK Server (ldk-server) over its gRPC API. Its client is a git dependency.
-ldk = ["dep:ldk-server-client", "dep:sha2", "dep:tokio"]
+ldk = ["dep:ldk-server-client", "dep:tokio"]
 
 [dependencies]
 async-trait.workspace = true
@@ -23,8 +23,6 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 tokio = { version = "1", features = ["time"], optional = true }
 # LDK Server's own client, at the revision the harness builds the server from. Not on crates.io.
 ldk-server-client = { git = "https://github.com/lightningdevkit/ldk-server", rev = "d7e7a2e708664af922c53c786ad6a5df622f5dd8", optional = true }
-# A hold invoice is settled by its preimage; LDK Server finds the payment by its hash.
-sha2 = { version = "0.10", optional = true }
 
 [lints]
 workspace = true
