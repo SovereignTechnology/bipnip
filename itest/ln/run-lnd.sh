@@ -563,12 +563,21 @@ done
 wait "$OFFER_PID" || fail "the seller's agent exited with an error"
 wait "$TAKE_PID" || fail "the buyer's agent exited with an error"
 log "bonded lease: the bond was paid before the seller was asked for anything, and it came back"
-python3 - "$W/lbond-a-take.out" <<'PY' || { lbond_dump; fail "alice paid the seller before her bond was out"; }
-import sys
+python3 - "$W/lbond-a-take.out" <(lnc carol listinvoices) <(lnc bob listinvoices) "$BOND" <<'PY' || { lbond_dump; fail "alice paid the seller before her bond was out"; }
+import json, sys
+# The agent prints a line when its state changes. From the line that shows the seller paid, every
+# line must show the bond already out.
 lines = open(sys.argv[1]).read().splitlines()
-bond = next(i for i, line in enumerate(lines) if " bond=sent " in line)
-paid = next(i for i, line in enumerate(lines) if " state=paid " in line or " state=verifying " in line)
-assert bond < paid, (bond, paid)
+after = [line for line in lines if any(f" state={s} " in line for s in ("paid", "verifying", "released", "active"))]
+assert after and all(" bond=sent " in line for line in after), after
+assert any(" state=taking " in line and " bond=awaited " in line for line in lines), lines
+# And on the nodes: the instance's node held the bond before the seller's node made its invoice,
+# since the instance passes the take on only once the bond is locked. 1000 sat + 2000 ppm of
+# 444444 sat is 1888 sat, all of it upfront.
+bonds = [i for i in json.load(open(sys.argv[2]))["invoices"] if i["value"] == sys.argv[4] and i["htlcs"]]
+locked = max(int(h["accept_time"]) for h in max(bonds, key=lambda i: int(i["creation_date"]))["htlcs"])
+asked = max(int(i["creation_date"]) for i in json.load(open(sys.argv[3]))["invoices"] if i["value"] == "1888")
+assert 0 < locked <= asked, (locked, asked)
 PY
 python3 - "$W/instance/mostro.db" "$LORDER_A" "$BOND" <<'PY' || { lbond_dump; fail "the instance's record of the returned lease bond is wrong"; }
 import sqlite3, sys
