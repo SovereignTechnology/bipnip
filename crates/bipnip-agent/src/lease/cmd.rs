@@ -21,9 +21,9 @@ use crate::{relay, secretfile};
 /// Name of the file, in the leases directory, that holds the next unused lease trade index.
 const NEXT_TRADE_INDEX_FILE: &str = "next-trade-index";
 /// How far back a new run's link reads: nothing older can be for it.
-const NEW_RUN_LOOKBACK_SECS: u64 = 60;
+pub(crate) const NEW_RUN_LOOKBACK_SECS: u64 = 60;
 /// How far back a resumed run's link reads: longer than any hold invoice lives.
-const RESUME_LOOKBACK_SECS: u64 = 3 * 24 * 3600;
+pub(crate) const RESUME_LOOKBACK_SECS: u64 = 3 * 24 * 3600;
 
 /// What the commands work with.
 pub struct Session<'a> {
@@ -69,14 +69,14 @@ pub struct TakeParams {
     pub node_address: Option<String>,
 }
 
-fn unix_now() -> u64 {
+pub(crate) fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
 }
 
-fn instance(config: &Config) -> Result<&InstanceConfig, String> {
+pub(crate) fn instance(config: &Config) -> Result<&InstanceConfig, String> {
     config
         .instance
         .as_ref()
@@ -90,7 +90,9 @@ fn store(config: &Config) -> Result<LeaseStore, String> {
 
 /// Hands out the next unused lease trade index, and records that it is used before returning it:
 /// an index is never given to two runs, even across a crash.
-fn next_trade_index(config: &Config) -> Result<u32, String> {
+pub(crate) fn next_trade_index(config: &Config) -> Result<u32, String> {
+    // The counter lives with the lease runs; rings share it, so the directory may not exist yet.
+    secretfile::create_private_dir(&config.leases_dir()).map_err(|e| e.to_string())?;
     let path = config.leases_dir().join(NEXT_TRADE_INDEX_FILE);
     let index = match secretfile::read_secret(&path) {
         Ok(text) => text
@@ -108,7 +110,7 @@ fn next_trade_index(config: &Config) -> Result<u32, String> {
     Ok(index)
 }
 
-async fn link_for(
+pub(crate) async fn link_for(
     session: &Session<'_>,
     instance: &InstanceConfig,
     trade_index: u32,
@@ -142,7 +144,10 @@ fn owed_note(report: &StepReport, what: &str) {
 }
 
 /// Our node's binding to the liquidity identity, made now.
-async fn own_binding(session: &Session<'_>, now: u64) -> Result<nostr_sdk::prelude::Event, String> {
+pub(crate) async fn own_binding(
+    session: &Session<'_>,
+    now: u64,
+) -> Result<nostr_sdk::prelude::Event, String> {
     let identity = session.wallet.liquidity().map_err(|e| e.to_string())?;
     make_binding_event(
         session.backend,

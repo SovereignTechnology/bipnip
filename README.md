@@ -20,8 +20,10 @@ a buyer's agent takes the order, pays the seller's hold invoice, checks the chan
 releases the preimage, between real LND nodes and through a real `bipnipd`, which never sees the preimage.
 When part of the fee is due at the end, the seller bills it once the channel is as old as the lease is
 long, and the buyer pays if its node still has the channel. The instance side is still in review
-(`bipnipd` pull requests 4 and 5). Not written yet: rings, and the Core Lightning and LDK backends.
-Nothing here is ready for real funds.
+(`bipnipd` pull requests 4 and 5). Rings work the same way, without bonds for now: a creator proposes a
+ring, others take its slots, every member checks the roster and signs it, and each opens one channel to
+the next and confirms the one opened to it (`bipnipd` pull request 6). Not written yet: ring bonds, and
+the Core Lightning and LDK backends. Nothing here is ready for real funds.
 
 ## Try the agent (regtest or signet only)
 
@@ -72,6 +74,24 @@ bipnip-agent --config agent.toml lease resume    # carry on after a restart
 Both commands run until the lease is finished: active, when all of the fee was upfront (the default), or
 paid in full at the end of the lease when `--upfront` is below 100. The buyer's agent keeps the lease's preimage in an
 owner-only file under `data_dir/leases` from before it sends the take, so a restart does not lose it.
+
+### Rings
+
+```sh
+# Propose a ring of three 1 million sat channels and take its first slot.
+bipnip-agent --config agent.toml ring create --capacity 1000000 --slots 3 --feerate 2 \
+    --node-address host:9735
+
+# Take a slot of a ring the instance published.
+bipnip-agent --config agent.toml ring join <order id> --feerate 2 --node-address host:9735
+
+bipnip-agent --config agent.toml ring list
+bipnip-agent --config agent.toml ring resume
+```
+
+Each member opens one channel, to the next member, and only after every member has signed the same
+roster. A member that signs and never opens costs the others the channel they opened, which stands; there
+are no bonds yet.
 
 ## Repositories
 
