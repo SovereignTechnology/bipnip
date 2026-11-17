@@ -170,6 +170,11 @@ pub trait LightningBackend: Send + Sync {
     /// hold invoice stays [`PaymentState::InFlight`] until the payee settles or cancels, so callers
     /// follow it with [`LightningBackend::payment_state`]. Returning `InFlight` never cancels the
     /// payment.
+    ///
+    /// Paying an invoice again is safe and is not an error: while its payment is still under
+    /// way, or once it has succeeded, no second payment is started and the answer is where that
+    /// payment stands. Only a payment that failed is tried anew. A backend whose node refuses
+    /// the repeat with an error of its own turns that error into this answer.
     async fn pay_invoice(
         &self,
         bolt11: &str,

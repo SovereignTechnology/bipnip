@@ -12,8 +12,8 @@ publish = false
 [workspace]
 
 [[bin]]
-name = "lnd-conformance"
-path = "src/lnd.rs"
+name = "ln-conformance"
+path = "src/conformance.rs"
 
 [[bin]]
 name = "lease-e2e"

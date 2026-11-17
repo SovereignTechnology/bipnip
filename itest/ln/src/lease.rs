@@ -1,7 +1,7 @@
 //! A whole liquidity lease between two real LND nodes on regtest, through `bipnip-agent`'s lease
 //! engine: buyer = node A (has a channel to B to pay over), seller = node B (has on-chain funds).
 //! Three leases: the honest one; one where the seller never opens and cancels; and one where the
-//! seller opens a smaller channel than agreed. Same environment as `lnd-conformance`.
+//! seller opens a smaller channel than agreed. Same environment as `ln-conformance`.
 
 use std::path::Path;
 use std::process::Command;
@@ -54,14 +54,21 @@ where
     panic!("timed out waiting for: {what}");
 }
 
-async fn node(prefix: &str) -> LndBackend {
-    LndBackend::connect(
-        &env(&format!("{prefix}_ADDR")),
-        Path::new(&env(&format!("{prefix}_CERT"))),
-        Path::new(&env(&format!("{prefix}_MAC"))),
-    )
-    .await
-    .expect("connect")
+/// The node behind `prefix` (`A` or `B`), through the backend `BACKEND` names (`lnd`, the default).
+async fn node(prefix: &str) -> Box<dyn LightningBackend> {
+    let backend = std::env::var("BACKEND").unwrap_or_else(|_| "lnd".into());
+    match backend.as_str() {
+        "lnd" => Box::new(
+            LndBackend::connect(
+                &env(&format!("{prefix}_ADDR")),
+                Path::new(&env(&format!("{prefix}_CERT"))),
+                Path::new(&env(&format!("{prefix}_MAC"))),
+            )
+            .await
+            .expect("connect"),
+        ),
+        other => panic!("no backend {other:?} in this build"),
+    }
 }
 
 fn terms() -> LeaseTerms {
@@ -77,7 +84,10 @@ fn terms() -> LeaseTerms {
 }
 
 /// Runs a lease up to the buyer's payment being locked at the seller.
-async fn until_locked(buyer: &LndBackend, seller: &LndBackend) -> (BuyerLease, SellerLease) {
+async fn until_locked(
+    buyer: &dyn LightningBackend,
+    seller: &dyn LightningBackend,
+) -> (BuyerLease, SellerLease) {
     let seller_id = seller.node_info().await.expect("info").node_pubkey;
     let b = BuyerLease::start(buyer, &seller_id, Network::Regtest, terms(), now())
         .await

@@ -5,6 +5,8 @@
 //!   loses nothing (Mostro issue #1078).
 //! - A payment that outlives `wait_secs` is reported `InFlight`, never cancelled: dropping the
 //!   stream does not stop LND from completing it, and callers follow it by hash.
+//! - Paying an invoice LND is already paying, or has paid, is answered with that payment's state:
+//!   LND's own `AlreadyExists` refusal is not passed on as an error (the trait's rule).
 //! - Errors carry LND's own status text only; no credential or invoice is ever put in one.
 //!
 //! A macaroon for this backend needs: `info:read`, `message:write` (signmessage), `invoices:read`,
@@ -22,8 +24,8 @@ use fedimint_tonic_lnd::lnrpc::invoice::InvoiceState;
 use fedimint_tonic_lnd::lnrpc::payment::PaymentStatus;
 use fedimint_tonic_lnd::lnrpc::{
     ConnectPeerRequest, GetInfoRequest, Initiator, Invoice, LightningAddress, ListChannelsRequest,
-    NodeInfoRequest, OpenChannelRequest, Payment, PaymentHash, PendingChannelsRequest,
-    SignMessageRequest,
+    NodeInfoRequest, OpenChannelRequest, PayReqString, Payment, PaymentHash,
+    PendingChannelsRequest, SignMessageRequest,
 };
 use fedimint_tonic_lnd::routerrpc::{SendPaymentRequest, TrackPaymentRequest};
 use fedimint_tonic_lnd::tonic::{Code, Status};
@@ -144,6 +146,28 @@ impl LndBackend {
     async fn tip(&self) -> Result<u32, BackendError> {
         Ok(self.node_info().await?.block_height)
     }
+
+    /// What to answer when LND refuses to send a payment. For an invoice it is already paying,
+    /// or has paid, LND answers `AlreadyExists`: that is not this payment failing, and by the
+    /// trait's rule the answer is where the payment stands. Any other refusal is passed on.
+    async fn repeated_payment(
+        &self,
+        bolt11: &str,
+        status: Status,
+    ) -> Result<PaymentState, BackendError> {
+        if status.code() != Code::AlreadyExists {
+            return Err(status_error(status));
+        }
+        let mut c = self.client.clone();
+        let decoded = call(
+            RPC_TIMEOUT,
+            c.lightning().decode_pay_req(PayReqString {
+                pay_req: bolt11.to_string(),
+            }),
+        )
+        .await?;
+        self.payment_state(&decoded.payment_hash).await
+    }
 }
 
 #[async_trait]
@@ -244,13 +268,22 @@ impl LightningBackend for LndBackend {
             fee_limit_msat: to_i64(max_fee_msat, "fee limit")?,
             ..Default::default()
         };
-        let mut stream = call(RPC_TIMEOUT, c.router().send_payment_v2(req)).await?;
+        let sending = tokio::time::timeout(RPC_TIMEOUT, c.router().send_payment_v2(req)).await;
+        let mut stream = match sending {
+            Ok(Ok(response)) => response.into_inner(),
+            Ok(Err(status)) => return self.repeated_payment(bolt11, status).await,
+            Err(_) => {
+                return Err(BackendError::Unavailable(
+                    "LND did not answer in time".into(),
+                ));
+            }
+        };
         let deadline = tokio::time::Instant::now() + Duration::from_secs(u64::from(wait_secs));
         loop {
             match tokio::time::timeout_at(deadline, stream.message()).await {
                 // Still unresolved when the caller's wait ran out: LND keeps the payment going.
                 Err(_) => return Ok(PaymentState::InFlight),
-                Ok(Err(status)) => return Err(status_error(status)),
+                Ok(Err(status)) => return self.repeated_payment(bolt11, status).await,
                 Ok(Ok(None)) => return Ok(PaymentState::InFlight),
                 Ok(Ok(Some(payment))) => match payment_state(&payment) {
                     PaymentState::InFlight => continue,
