@@ -1,0 +1,21 @@
+[package]
+name = "bipnip-ldk-probe"
+description = "Phase 3 spike: what an LDK Server (ldk-server) answers, call by call, for the LightningBackend trait"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.94"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Its own workspace root, so it never joins the bipnip workspace. No lock file is kept: this runs
+# once, in a throwaway VM, to learn facts; the backend that follows pins its own.
+[workspace]
+
+[[bin]]
+name = "ldk-probe"
+path = "src/main.rs"
+
+[dependencies]
+# The same revision of ldk-server that run.sh builds and runs.
+ldk-server-client = { git = "https://github.com/lightningdevkit/ldk-server", rev = "d7e7a2e708664af922c53c786ad6a5df622f5dd8" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
