@@ -15,6 +15,9 @@
 //! tls_cert = "/home/me/.ldk-server/tls.crt"
 //! macaroon = "/home/me/.ldk-server/bitcoin/macaroons/bipnip.macaroon"
 //!
+//! [cln]                               # or: a Core Lightning node (with the `hold` plugin to sell)
+//! rpc_socket = "/home/me/.lightning/bitcoin/lightning-rpc"
+//!
 //! [[instance]]                        # a bipnip instance to trade on; may appear more than once
 //! pubkey = "npub1…"                   # its Nostr key, npub or hex
 //! pow = 0                             # optional: proof of work, in bits. Left out, it is read
@@ -112,6 +115,15 @@ pub struct LdkConfig {
     pub macaroon: PathBuf,
 }
 
+/// How to reach a Core Lightning node.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClnConfig {
+    /// The node's JSON-RPC socket (`<lightning-dir>/<network>/lightning-rpc`). Whoever can open
+    /// it controls the node; there is no narrower credential.
+    pub rpc_socket: PathBuf,
+}
+
 /// Limits on what the agent does with the node's money without being asked again.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -149,6 +161,7 @@ struct Raw {
     relays: Vec<String>,
     lnd: Option<LndConfig>,
     ldk: Option<LdkConfig>,
+    cln: Option<ClnConfig>,
     instance: Option<RawInstances>,
     #[serde(default)]
     policy: PolicyConfig,
@@ -165,8 +178,10 @@ pub struct Config {
     pub relays: Vec<String>,
     /// The LND node, if one is configured.
     pub lnd: Option<LndConfig>,
-    /// The LDK Server, if one is configured. An agent has one node: never both.
+    /// The LDK Server, if one is configured. An agent has one node: never two.
     pub ldk: Option<LdkConfig>,
+    /// The Core Lightning node, if one is configured.
+    pub cln: Option<ClnConfig>,
     /// The instances to trade on, in the order the configuration lists them.
     pub instances: Vec<InstanceEntry>,
     /// Spending limits.
@@ -202,10 +217,16 @@ impl Config {
                 return Err("config: lnd.tls_cert and lnd.macaroon must be absolute paths".into());
             }
         }
+        let nodes = [raw.lnd.is_some(), raw.ldk.is_some(), raw.cln.is_some()];
+        if nodes.iter().filter(|set| **set).count() > 1 {
+            return Err("config: an agent has one node: one of [lnd], [ldk] and [cln]".into());
+        }
+        if let Some(cln) = &raw.cln
+            && !cln.rpc_socket.is_absolute()
+        {
+            return Err("config: cln.rpc_socket must be an absolute path".into());
+        }
         if let Some(ldk) = &raw.ldk {
-            if raw.lnd.is_some() {
-                return Err("config: an agent has one node: [lnd] or [ldk], not both".into());
-            }
             if ldk.address.contains("://") || !ldk.address.contains(':') {
                 return Err("config: ldk.address must be host:port, without a scheme".into());
             }
@@ -254,6 +275,7 @@ impl Config {
             relays: raw.relays,
             lnd: raw.lnd,
             ldk: raw.ldk,
+            cln: raw.cln,
             instances,
             policy,
         })
@@ -401,8 +423,24 @@ macaroon = "/tmp/a.macaroon"
         let c = Config::parse(&format!("{base}{ldk}")).expect("parses");
         assert!(c.lnd.is_none());
         assert_eq!(c.ldk.expect("ldk").address, "127.0.0.1:3536");
+        let c =
+            Config::parse(&format!("{base}\n[cln]\nrpc_socket = \"/tmp/rpc\"\n")).expect("parses");
+        assert!(c.lnd.is_none() && c.ldk.is_none());
+        assert_eq!(c.cln.expect("cln").rpc_socket, PathBuf::from("/tmp/rpc"));
         for (bad, why) in [
             (format!("{GOOD}{ldk}"), "two nodes"),
+            (
+                format!("{base}{ldk}\n[cln]\nrpc_socket = \"/tmp/rpc\"\n"),
+                "two nodes",
+            ),
+            (
+                format!("{base}\n[cln]\nrpc_socket = \"rpc\"\n"),
+                "relative socket",
+            ),
+            (
+                format!("{base}\n[cln]\nsocket = \"/tmp/rpc\"\n"),
+                "unknown key",
+            ),
             (
                 format!(
                     "{base}{}",

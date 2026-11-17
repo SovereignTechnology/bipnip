@@ -10,6 +10,7 @@ use std::time::Duration;
 use bipnip_agent::lease::{
     BuyerLease, DEFAULT_MAX_CLTV_DELTA, DEFAULT_SELLER_CLTV_DELTA, LeaseStepError, SellerLease,
 };
+use bipnip_ln::cln::ClnBackend;
 use bipnip_ln::ldk::LdkBackend;
 use bipnip_ln::lnd::LndBackend;
 use bipnip_ln::{LightningBackend, OpenRequest, PaymentState};
@@ -58,25 +59,25 @@ where
 /// The node behind `prefix` (`A` or `B`), through the backend `<prefix>_BACKEND` names, or else
 /// `BACKEND`, or else `lnd`. For `lnd`: `<prefix>_ADDR` (https://host:port), `_CERT` (tls.cert),
 /// `_MAC` (a macaroon file). For `ldk`: `_ADDR` (host:port of the LDK Server's gRPC service),
-/// `_CERT` (its tls.crt), `_MAC` (its hex macaroon file).
+/// `_CERT` (its tls.crt), `_MAC` (its hex macaroon file). For `cln`: `_ADDR` (the path of the
+/// node's `lightning-rpc` socket).
 async fn node(prefix: &str) -> Box<dyn LightningBackend> {
     let backend = std::env::var(format!("{prefix}_BACKEND"))
         .or_else(|_| std::env::var("BACKEND"))
         .unwrap_or_else(|_| "lnd".into());
-    let (addr, cert, mac) = (
-        env(&format!("{prefix}_ADDR")),
-        env(&format!("{prefix}_CERT")),
-        env(&format!("{prefix}_MAC")),
-    );
+    let addr = env(&format!("{prefix}_ADDR"));
+    let file = |what: &str| env(&format!("{prefix}_{what}"));
     match backend.as_str() {
         "lnd" => Box::new(
-            LndBackend::connect(&addr, Path::new(&cert), Path::new(&mac))
+            LndBackend::connect(&addr, Path::new(&file("CERT")), Path::new(&file("MAC")))
                 .await
                 .expect("connect"),
         ),
         "ldk" => Box::new(
-            LdkBackend::connect(&addr, Path::new(&cert), Path::new(&mac)).expect("connect"),
+            LdkBackend::connect(&addr, Path::new(&file("CERT")), Path::new(&file("MAC")))
+                .expect("connect"),
         ),
+        "cln" => Box::new(ClnBackend::connect(Path::new(&addr))),
         other => panic!("no backend {other:?} in this build"),
     }
 }
@@ -106,7 +107,15 @@ async fn until_locked(
         .await
         .expect("seller accept");
     let bolt11 = s
-        .upfront_invoice(seller, DEFAULT_SELLER_CLTV_DELTA)
+        .upfront_invoice(
+            seller,
+            // The seller's usual lock time, or as much of it as its node can give.
+            seller
+                .max_hold_cltv_delta()
+                .map_or(DEFAULT_SELLER_CLTV_DELTA, |most| {
+                    most.min(DEFAULT_SELLER_CLTV_DELTA)
+                }),
+        )
         .await
         .expect("upfront invoice");
     let state = b

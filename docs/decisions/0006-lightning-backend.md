@@ -46,3 +46,37 @@ the agent (hold invoices by external hash, opens, channel checks, `signmessage`)
 - Measured on LND v0.21.5-beta (`itest/ln`): settling an already-settled hold invoice again succeeds (a retry
   after a lost reply is safe); a preimage matching no invoice, and the right preimage for an unpaid invoice,
   are refused; a brand-new channel can fail the first payment (`failure reason 5`), so callers retry.
+
+## Notes from the LDK and Core Lightning implementations (2026-11-17)
+
+Both were built on what real nodes answered (`spikes/ldk-m3/RESULTS.md`, `spikes/cln-m3/RESULTS.md`), not on
+the plan above, which had guessed two things wrong.
+
+- **A backend may lack a capability, and says so.** `BackendError::Unsupported` is an answer the callers
+  handle: the conformance run goes on past it, and the agent refuses beforehand what its node cannot do (an
+  agent on a node that cannot hold a payment offers no lease). Two capabilities may be missing: hold invoices
+  and `graph_channels`. Everything else is required of every backend.
+- **LDK is an LDK Server (`ldk-server`) over gRPC, not an embedded `ldk-node`**: the agent sits beside the
+  runner's node, as with LND. It pays, opens channels and signs; **it offers no hold invoices**, so an LDK node
+  buys leases and joins rings but does not sell. The server can make an invoice on a caller's hash, but its
+  lock time is fixed (42 blocks, which left 6 blocks to claim), a held payment cannot be looked up (the only
+  signal is a best-effort event; the payment list shows a payment the same way after the node gave it back),
+  and an unpaid invoice cannot be cancelled. Offering that to a seller could cost it a channel opened for
+  nothing. A lock time on `Bolt11ReceiveForHash` and a lookup of a held payment with its claim deadline would
+  lift this.
+- **Core Lightning is the node's own JSON-RPC socket, not `cln-grpc` with a rune.** Hold invoices come from the
+  `hold` plugin (BoltzExchange/hold), whose commands are ordinary RPC methods on that socket; the other
+  candidate (daywalker90/holdinvoice) cannot make an invoice on a hash the caller chose. The socket is the
+  whole node: there is no narrower credential for a local client, and the agent must run as a user the node
+  lets in. Through the plugin's RPC a hold invoice always locks for 80 blocks.
+- **A node may limit the lock time of its hold invoices** (`max_hold_cltv_delta`). The seller asks for no more
+  than its node gives, and an offer whose confirmation wait does not fit is refused when it is made.
+  `add_hold_invoice` still refuses a request it cannot honour rather than shorten it.
+- **Paying an invoice again is not an error on any backend**: while the payment is under way or once it is
+  made, the answer is where that payment stands. LND and LDK refuse the repeat with an error of their own and
+  Core Lightning refuses one and answers the other; each backend turns that into the same answer.
+- **`graph_channels` exists only on LND.** LDK's and Core Lightning's graphs name a channel by short channel
+  id, not by funding outpoint. Only an instance needs it (to judge a bond), and the instance runs on LND.
+- **Nodes that follow the chain by polling lag a block for a moment** (Core Lightning, LDK Server). Callers
+  wait for a count of confirmations; they do not assert it right after a block.
+

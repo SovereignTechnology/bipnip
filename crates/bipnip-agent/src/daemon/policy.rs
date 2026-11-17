@@ -434,6 +434,10 @@ impl LightningBackend for Guard<'_> {
         self.inner.add_hold_invoice(req).await
     }
 
+    fn max_hold_cltv_delta(&self) -> Option<u32> {
+        self.inner.max_hold_cltv_delta()
+    }
+
     async fn hold_invoice_state(&self, payment_hash: &str) -> Result<HoldState, BackendError> {
         self.inner.hold_invoice_state(payment_hash).await
     }

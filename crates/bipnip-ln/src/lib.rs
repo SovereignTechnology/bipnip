@@ -5,13 +5,16 @@
 //! chose** (the lease buyer keeps the preimage), channel opens and inspection, graph lookups,
 //! and the node's `signmessage` for node ↔ Nostr key bindings. The LND implementation is `lnd::LndBackend`
 //! (feature `lnd`; building it needs `protoc`); the LDK one is `ldk::LdkBackend` (feature `ldk`, an
-//! LDK Server over gRPC, with the limits its module states); Core Lightning follows.
+//! LDK Server over gRPC, with the limits its module states); the Core Lightning one is
+//! `cln::ClnBackend` (feature `cln`, lightningd's JSON-RPC socket with the `hold` plugin).
 //!
 //! Keys and identifiers cross this boundary as hex strings, so the trait does not tie callers to
 //! one secp256k1 version (rust-bitcoin 0.32 and rust-nostr 0.45 carry two).
 
 use async_trait::async_trait;
 
+#[cfg(feature = "cln")]
+pub mod cln;
 pub mod hexutil;
 #[cfg(feature = "ldk")]
 pub mod ldk;
@@ -158,6 +161,14 @@ pub trait LightningBackend: Send + Sync {
     /// A hold invoice on a payment hash the caller chose (the preimage stays with whoever made
     /// the hash). Returns the BOLT 11 invoice.
     async fn add_hold_invoice(&self, req: &HoldInvoiceRequest) -> Result<String, BackendError>;
+
+    /// The longest lock time (`min_final_cltv_expiry_delta`, in blocks) this node can give a
+    /// hold invoice, when it cannot give whatever is asked: `None` for a node that can. A
+    /// caller asks for no more than this; [`LightningBackend::add_hold_invoice`] refuses a
+    /// request the node cannot honour rather than shorten it.
+    fn max_hold_cltv_delta(&self) -> Option<u32> {
+        None
+    }
 
     /// Current state of the hold invoice for `payment_hash`. Implementations re-subscribe after
     /// a node restart instead of losing the invoice (Mostro issue #1078).
