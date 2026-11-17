@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use bipnip_ln::{LightningBackend, OpenRequest, PaymentState};
 
-use super::{Stage, to_instance};
+use super::{SELLER, Stage, to_instance};
 use crate::lease::BuyerLease;
 use crate::lease::run::{BuyerRun, BuyerState, SellerRun, SellerState};
 use crate::lease::store::{LeaseStore, StoreError};
@@ -337,4 +337,70 @@ async fn stored_state_that_was_changed_or_opened_up_is_refused() {
     let record = std::fs::read_to_string(&buyer_file).expect("read");
     let result = BuyerRun::from_json(&record, BuyerLease::load(&other_lease).expect("load"));
     assert!(matches!(result, Err(StoreError::Corrupt(_))));
+}
+
+#[tokio::test]
+async fn finished_runs_are_put_away_once_they_are_old_and_nothing_is_deleted() {
+    let stage = Stage::new();
+    let path = dir("put-away");
+    let store = LeaseStore::open(&path).expect("store");
+    // A seller that withdrew its offer, a buyer that backed out, and an offer still waiting.
+    let mut withdrawn = stage.offered().await;
+    withdrawn
+        .cancel(&stage.seller_node, 9)
+        .await
+        .expect("cancel");
+    store.save_seller(&withdrawn).expect("save");
+    let (mut backed_out, _) = stage.take(stage.take_request()).await;
+    backed_out.cancel(9).expect("cancel");
+    store.save_buyer(&backed_out).expect("save");
+    let (waiting, _) = SellerRun::offer(stage.instance_key(), stage.offer.clone(), 5, 9, SELLER);
+    store.save_seller(&waiting).expect("save");
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+    // Finished a moment ago: they stay where they are listed.
+    assert!(
+        store
+            .put_away_finished(3_600, now)
+            .expect("pass")
+            .is_empty()
+    );
+    // An hour on, the two finished runs go; the offer that still waits does not.
+    let mut moved = store.put_away_finished(3_600, now + 3_601).expect("pass");
+    moved.sort();
+    let seller = format!("seller-{}", withdrawn.store_key());
+    let buyer = format!("buyer-{}", backed_out.store_key());
+    assert_eq!(moved, vec![buyer.clone(), seller.clone()]);
+    let loaded = store.load().expect("load");
+    assert!(loaded.problems.is_empty(), "{:?}", loaded.problems);
+    assert_eq!((loaded.sellers.len(), loaded.buyers.len()), (1, 0));
+    assert_eq!(loaded.sellers[0].state(), SellerState::Offering);
+    // Nothing was deleted: the files are in `done`, owner-only, the buyer's lease with them.
+    let done = path.join("done");
+    assert_eq!(
+        std::fs::metadata(&done).expect("meta").mode() & 0o777,
+        0o700
+    );
+    for name in [
+        format!("{seller}.json"),
+        format!("{buyer}.json"),
+        format!("{buyer}.lease"),
+    ] {
+        assert!(done.join(&name).exists(), "{name} is kept");
+        assert!(!path.join(&name).exists(), "{name} is out of the way");
+        assert_eq!(
+            std::fs::metadata(done.join(&name)).expect("meta").mode() & 0o777,
+            0o600
+        );
+    }
+    // A second pass finds nothing more to do.
+    assert!(
+        store
+            .put_away_finished(3_600, now + 3_601)
+            .expect("pass")
+            .is_empty()
+    );
 }

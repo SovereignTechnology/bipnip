@@ -69,6 +69,10 @@ that starts one): `run`, `role` (`seller`, `buyer` or `member`), `order_id`, `st
 `bond`, `owed_bond`, `waiting_on`. The lists add `under_way` and, for a run the agent had to stop because
 it could not be saved, `halted`.
 
+A run that finished more than 30 days ago is put away: its files move into a `done` directory beside the
+others (`<data_dir>/leases/done`, `rings/done`, `policy/done`). Nothing is deleted, and such a run is no
+longer listed.
+
 ## Policy
 
 ```toml

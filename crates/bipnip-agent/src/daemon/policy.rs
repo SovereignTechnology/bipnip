@@ -262,6 +262,19 @@ impl PolicyStore {
         Ok(Some(grant))
     }
 
+    /// Moves a run's grant out of the way, into `done`, when the run itself was put away. It
+    /// stays on disk and is no longer counted or read. A run without a grant is passed over.
+    pub fn put_away_grant(&self, run: &str) -> Result<(), PolicyError> {
+        let path = self.grant_path(run)?;
+        let done = self.dir.join(crate::lease::store::DONE_DIR);
+        secretfile::create_private_dir(&done).map_err(|e| file_error(&done, e))?;
+        match std::fs::rename(&path, done.join(format!("grant-{run}.json"))) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(PolicyError(format!("{}: {e}", path.display()))),
+        }
+    }
+
     fn names(&self, prefix: &str) -> Result<Vec<String>, PolicyError> {
         let io = |e: std::io::Error| PolicyError(format!("{}: {e}", self.dir.display()));
         let mut names = Vec::new();
@@ -742,6 +755,30 @@ mod tests {
         // Names that are not ours never become paths.
         assert!(again.grant("../mnemonic").is_err());
         assert!(again.parked("a/b").is_err());
+    }
+
+    #[test]
+    fn a_grant_put_away_is_kept_and_no_longer_counted() {
+        let store = store("put-away");
+        let now = 1_800_000_000;
+        store
+            .save_grant(&Grant::new(
+                "buyer-01".into(),
+                now - 100,
+                ask(3_000, 0, 0),
+                false,
+            ))
+            .expect("save");
+        assert_eq!(store.used_since(now), Ok((3_000, 0)));
+        store.put_away_grant("buyer-01").expect("put away");
+        store.put_away_grant("buyer-01").expect("twice is fine");
+        store
+            .put_away_grant("buyer-02")
+            .expect("a run without a grant");
+        assert_eq!(store.used_since(now), Ok((0, 0)));
+        assert_eq!(store.grant("buyer-01"), Ok(None));
+        assert!(store.dir.join("done").join("grant-buyer-01.json").exists());
+        assert!(store.put_away_grant("../x").is_err());
     }
 
     #[test]

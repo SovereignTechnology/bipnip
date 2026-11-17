@@ -34,6 +34,33 @@ impl std::fmt::Display for StoreError {
 
 impl std::error::Error for StoreError {}
 
+/// Name of the directory, inside a store's own, that old finished runs are moved to.
+pub const DONE_DIR: &str = "done";
+
+/// True when the file at `path` was last written at least `after_secs` before `now`.
+pub(crate) fn old_enough(path: &Path, after_secs: u64, now: u64) -> bool {
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+        .is_some_and(|at| at.as_secs().saturating_add(after_secs) <= now)
+}
+
+/// Moves the named files of `dir` into its [`DONE_DIR`], in the order given. A file that is
+/// not there is passed over.
+pub(crate) fn put_away(dir: &Path, names: &[String]) -> Result<(), StoreError> {
+    let done = dir.join(DONE_DIR);
+    secretfile::create_private_dir(&done).map_err(StoreError::File)?;
+    for name in names {
+        match std::fs::rename(dir.join(name), done.join(name)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(StoreError::File(SecretFileError::Io(e.to_string()))),
+        }
+    }
+    Ok(())
+}
+
 /// What a store held.
 #[derive(Debug, Default)]
 pub struct Loaded {
@@ -78,6 +105,49 @@ impl LeaseStore {
         }
         let path = self.dir.join(format!("buyer-{key}.json"));
         secretfile::replace_private(&path, &run.to_json()?).map_err(StoreError::File)
+    }
+
+    /// Moves the finished runs that were last written at least `after_secs` before `now` into
+    /// [`DONE_DIR`]. Nothing is deleted: a finished lease is a record of what was agreed and
+    /// which channel it was for. Runs put away are no longer loaded or listed. Returns the
+    /// names they were stored under.
+    pub fn put_away_finished(&self, after_secs: u64, now: u64) -> Result<Vec<String>, StoreError> {
+        let loaded = self.load()?;
+        let mut moved = Vec::new();
+        for run in loaded.sellers.iter().filter(|run| run.finished()) {
+            let stem = format!("seller-{}", run.store_key());
+            let file = format!("{stem}.json");
+            if old_enough(&self.dir.join(&file), after_secs, now) {
+                put_away(&self.dir, &[file])?;
+                moved.push(stem);
+            }
+        }
+        for run in loaded.buyers.iter().filter(|run| run.finished()) {
+            let stem = format!("buyer-{}", run.store_key());
+            let file = format!("{stem}.json");
+            if old_enough(&self.dir.join(&file), after_secs, now) {
+                // The state first: a lease file left behind alone is not read as a run.
+                put_away(&self.dir, &[file, format!("{stem}.lease")])?;
+                moved.push(stem);
+            }
+        }
+        // A lease file whose state was moved just before the process stopped follows it.
+        let io = |e: std::io::Error| StoreError::File(SecretFileError::Io(e.to_string()));
+        let done = self.dir.join(DONE_DIR);
+        for entry in std::fs::read_dir(&self.dir).map_err(io)? {
+            let name = entry
+                .map_err(io)?
+                .file_name()
+                .to_string_lossy()
+                .into_owned();
+            if let Some(stem) = name.strip_suffix(".lease")
+                && !self.dir.join(format!("{stem}.json")).exists()
+                && done.join(format!("{stem}.json")).exists()
+            {
+                put_away(&self.dir, &[name])?;
+            }
+        }
+        Ok(moved)
     }
 
     /// Loads every run in the store. A file that is refused is listed in

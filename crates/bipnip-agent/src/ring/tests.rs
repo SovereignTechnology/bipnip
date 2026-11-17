@@ -1538,3 +1538,33 @@ async fn a_message_no_relay_took_is_kept_and_sent_by_a_later_step() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn a_finished_ring_run_is_put_away_once_it_is_old() {
+    use crate::ring::store::RingStore;
+
+    let dir = std::env::temp_dir().join(format!("bipnip-ring-done-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let store = RingStore::open(&dir).expect("store");
+    let table = Table::new(2);
+    let mut runs = table.seated().await;
+    // The creator withdraws the ring while it fills; the other member still holds its slot.
+    runs[0].cancel(9).expect("cancel");
+    for run in &runs {
+        store.save(run).expect("save");
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+    assert!(store.put_away_finished(60, now).expect("pass").is_empty());
+    let moved = store.put_away_finished(60, now + 61).expect("pass");
+    let name = format!("ring-{}", runs[0].store_key());
+    assert_eq!(moved, vec![name.clone()]);
+    let loaded = store.load().expect("load");
+    assert!(loaded.problems.is_empty(), "{:?}", loaded.problems);
+    assert_eq!(loaded.runs.len(), 1);
+    assert!(!loaded.runs[0].finished());
+    assert!(dir.join("done").join(format!("{name}.json")).exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
