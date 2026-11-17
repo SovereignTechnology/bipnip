@@ -22,7 +22,8 @@
 //! ```
 //!
 //! The `lease` commands need an `[instance]` section and a node. They run until the lease is
-//! active or over; a lease interrupted before that is picked up again by `lease resume`.
+//! finished: active when all of the fee was upfront (the default), otherwise until the rest is
+//! paid at the end of the lease. A lease interrupted before that is picked up by `lease resume`.
 //!
 //! Nothing here prints the mnemonic or any credential.
 
@@ -284,7 +285,7 @@ async fn lease(config: &Config, args: &[String]) -> Result<(), String> {
                 duration_blocks: options.required("duration")?,
                 fee_base_sat: options.required("fee-base")?,
                 fee_ppm: options.required("fee-ppm")?,
-                // The completion share is not collected yet, so by default all of it is upfront.
+                // All upfront by default: the command then ends when the lease is active.
                 upfront_percent: options.or("upfront", 100u8)?,
                 min_confirmations: options.or("confs", 3u32)?,
                 announce: !options.switch("private"),
@@ -299,8 +300,8 @@ async fn lease(config: &Config, args: &[String]) -> Result<(), String> {
             }
             if params.upfront_percent < 100 {
                 eprintln!(
-                    "note: this version does not send the completion invoice yet; the share not \
-                     paid upfront will not be collected"
+                    "note: part of the fee is due at the end of the lease; keep this running, or \
+                     run `lease resume` later, so it can be billed then"
                 );
             }
             let (mut run, mut link) = cmd::offer(&session, params, seller).await?;

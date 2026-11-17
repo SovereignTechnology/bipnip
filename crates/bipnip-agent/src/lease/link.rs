@@ -170,10 +170,11 @@ async fn send_all(link: &Link, outgoing: &[Outgoing], report: &mut StepReport) -
     all_sent
 }
 
-/// Whether a refused message should be looked at again. Only one that came too early may fit
-/// later: relays do not promise an order.
+/// Whether a refused message should be looked at again: one that came too early may fit later
+/// (relays do not promise an order, and a completion invoice can arrive before our node agrees
+/// the lease is over), and a payment our node could not make now may go through later.
 fn retry_later(error: &RunError) -> bool {
-    matches!(error, RunError::OutOfOrder(_))
+    matches!(error, RunError::OutOfOrder(_) | RunError::PaymentFailed(_))
 }
 
 /// Saves a seller's new run, then sends its offer. If no relay takes it, the run is saved again

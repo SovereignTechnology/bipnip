@@ -287,6 +287,45 @@ for f in "$W"/instance/mostro.db* "$W/instance/mostrod.log" "$W/relay.log" \
   [ -e "$f" ] || fail "nothing to search at $f"
   if grep -aqF -- "$PREIMAGE" "$f"; then fail "the preimage is in $f"; fi
 done
+
+log "lease: a second lease, half the fee at the end, six blocks long"
+"$AGENT" --config "$W/bob.toml" lease offer --min-capacity 500000 --max-capacity 1000000 \
+  --duration 6 --upfront 50 --fee-base 1000 --fee-ppm 2000 --feerate 2 --confs 3 --expires-in 3600 --poll 2 \
+  > "$W/offer2.out" 2> "$W/offer2.err" &
+OFFER_PID=$!
+lease2_dump() {
+  for f in offer2.out offer2.err take2.out take2.err; do [ -s "$W/$f" ] && sed "s/^/  $f: /" "$W/$f"; done
+  instance_log 60
+}
+wait_until 90 grep -q "state=open" "$W/offer2.out" || { lease2_dump; fail "the second offer did not open"; }
+ORDER2=$(grep -m1 "state=open" "$W/offer2.out" | sed 's/.*order=\([^ ]*\).*/\1/')
+"$AGENT" --config "$W/alice.toml" lease take "$ORDER2" --capacity 777000 \
+  --node-address "127.0.0.1:${P2P[alice]}" --poll 2 > "$W/take2.out" 2> "$W/take2.err" &
+TAKE_PID=$!
+both_complete() { grep -q "state=complete" "$W/offer2.out" && grep -q "state=complete" "$W/take2.out"; }
+t=0
+until both_complete; do
+  kill -0 "$OFFER_PID" 2>/dev/null || grep -q "state=complete" "$W/offer2.out" || { lease2_dump; fail "the seller's agent stopped early"; }
+  kill -0 "$TAKE_PID" 2>/dev/null || grep -q "state=complete" "$W/take2.out" || { lease2_dump; fail "the buyer's agent stopped early"; }
+  "$W/mine.sh" 1; sleep 2; t=$((t+1))
+  [ "$t" -lt 90 ] || { lease2_dump; fail "the second lease did not complete"; }
+done
+wait "$OFFER_PID" || fail "the seller's agent exited with an error"
+wait "$TAKE_PID" || fail "the buyer's agent exited with an error"
+sed 's/^/  seller: /' "$W/offer2.out"; sed 's/^/  buyer:  /' "$W/take2.out"
+grep -q "state=completing" "$W/offer2.out" || fail "the seller never billed the completion share"
+python3 - "$W/instance/mostro.db" "$ORDER2" <<'PY' || fail "the instance's record of the second lease is wrong"
+import sqlite3, sys
+db = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+status = db.execute("SELECT status FROM lease_offers WHERE id = ?", (sys.argv[2],)).fetchone()
+assert status == ("completion",), status
+PY
+# Both shares reached bob: 1000 + 777000 * 2000 / 1000000 = 2554 sat, 1277 upfront and 1277 at the end.
+lnc bob listinvoices --max_invoices 1000 | python3 -c '
+import json, sys
+settled = sorted(int(i["amt_paid_sat"]) for i in json.load(sys.stdin)["invoices"] if i["state"] == "SETTLED")
+assert settled.count(1277) == 2, f"expected two settled 1277 sat invoices at bob, got {settled}"
+' || fail "bob was not paid both shares of the second lease"
 kill "$INSTANCE_PID"
 
-log "INSTANCE LEASE E2E PASS: offer, take, pay, open, verify, release and settle through a real bipnipd, two agents and three LND nodes"
+log "INSTANCE LEASE E2E PASS: two leases through a real bipnipd, two agents and three LND nodes: offer, take, pay, open, verify, release, settle, and the completion share at the end of the lease"

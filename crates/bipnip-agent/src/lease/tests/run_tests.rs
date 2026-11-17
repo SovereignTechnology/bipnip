@@ -1,9 +1,12 @@
 //! The lease runs, seller and buyer, on the two-node simulator. Messages travel sealed, the way
 //! an instance and a peer would send them; the test plays the instance.
 
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
 use bipnip_ln::{HoldState, LightningBackend, OpenRequest, PaymentState};
+use lightning_invoice::Bolt11Invoice;
+use mostro_core::lease::LeaseContract;
 use mostro_core::lease_message::{LeaseOffer, LeasePayload};
 use mostro_core::node_binding::{
     Action as BindingAction, Network, SignedStatement, Statement, sign_ln_message,
@@ -252,6 +255,55 @@ impl Stage {
         let report = to_instance(seller.tick(&self.seller_node).await.expect("tick"));
         assert_eq!(seller.state(), SellerState::Opened);
         report
+    }
+
+    /// A stage whose offer asks for `percent` of the fee upfront.
+    fn with_upfront(percent: u8) -> Self {
+        let mut stage = Self::new();
+        stage.offer.upfront_percent = percent;
+        stage
+    }
+
+    /// Both runs with the lease active and the channel three blocks deep.
+    async fn active(&self) -> (SellerRun, BuyerRun) {
+        let (mut seller, mut buyer) = self.opened().await;
+        self.confirm(&seller);
+        let out = buyer.tick(&self.buyer_node).await.expect("tick");
+        let active = to_instance(
+            self.peer_to_seller(&mut seller, &out[0])
+                .await
+                .expect("preimage"),
+        );
+        self.to_buyer(&mut buyer, &active).await.expect("active");
+        assert_eq!(seller.state(), SellerState::Active);
+        assert_eq!(buyer.state(), BuyerState::Active);
+        (seller, buyer)
+    }
+
+    /// The leased channel now has this many confirmations.
+    fn age(&self, seller: &SellerRun, confirmations: u32) {
+        confirm(
+            &self.world,
+            seller.funding_outpoint().expect("an outpoint"),
+            confirmations,
+        );
+    }
+
+    fn close_channels(&self) {
+        self.world.lock().expect("world").channels.clear();
+    }
+
+    fn payments(&self) -> usize {
+        self.world.lock().expect("world").payments.len()
+    }
+
+    /// A completion invoice from `node` for `amount_msat`, as a message for `contract`.
+    async fn bill(&self, node: &Node, contract: &LeaseContract, amount_msat: u64) -> Message {
+        let bolt11 = node
+            .add_invoice(amount_msat, 3_600, "completion")
+            .await
+            .expect("invoice");
+        lease_wire::completion_invoice(self.order_id, contract, bolt11)
     }
 
     fn confirm(&self, seller: &SellerRun) {
@@ -514,6 +566,193 @@ async fn each_state_can_make_its_message_again() {
     let stored = SellerRun::from_json(&seller.to_json().expect("json")).expect("stored");
     assert!(stored.unsent());
     assert_eq!(wire(&stored.pending().expect("pending")), wire(&active));
+}
+
+#[tokio::test]
+async fn the_completion_share_is_billed_once_the_lease_has_run_and_paid_while_the_channel_stands() {
+    let stage = Stage::new(); // half the fee upfront, 4 320 blocks
+    let (mut seller, mut buyer) = stage.active().await;
+    assert!(!seller.finished() && !buyer.finished());
+    let completion_msat = buyer.contract().terms.completion_sat().expect("share") * 1000;
+    assert!(completion_msat > 0);
+
+    // One block short of the lease's length: no bill.
+    stage.age(&seller, 4_319);
+    assert!(
+        seller
+            .tick(&stage.seller_node)
+            .await
+            .expect("tick")
+            .is_empty()
+    );
+    assert_eq!(seller.state(), SellerState::Active);
+
+    stage.age(&seller, 4_320);
+    let bill = seller.tick(&stage.seller_node).await.expect("tick");
+    assert_eq!(seller.state(), SellerState::Completing);
+    assert_eq!(wire(&seller.pending().expect("pending")), wire(&bill));
+    // Billed once, and stored.
+    assert!(
+        seller
+            .tick(&stage.seller_node)
+            .await
+            .expect("tick")
+            .is_empty()
+    );
+    let stored = SellerRun::from_json(&seller.to_json().expect("json")).expect("stored");
+    assert_eq!(stored.state(), SellerState::Completing);
+
+    let bill = to_instance(bill);
+    let Incoming::CompletionInvoice { invoice, .. } = lease_wire::read(&bill).expect("bill") else {
+        panic!("not a completion invoice");
+    };
+    let parsed = Bolt11Invoice::from_str(&invoice.invoice).expect("bolt11");
+    assert_eq!(parsed.amount_milli_satoshis(), Some(completion_msat));
+
+    let before = buyer.to_json().expect("json");
+    let paid_before = stage.payments();
+    stage.to_buyer(&mut buyer, &bill).await.expect("bill");
+    assert_eq!(buyer.state(), BuyerState::Complete);
+    assert!(buyer.finished());
+    assert_eq!(stage.payments(), paid_before + 1);
+
+    assert!(
+        seller
+            .tick(&stage.seller_node)
+            .await
+            .expect("tick")
+            .is_empty()
+    );
+    assert_eq!(seller.state(), SellerState::Complete);
+    assert!(seller.finished());
+
+    // A buyer that stopped after paying and before it was saved does not pay again.
+    let lease_file = std::env::temp_dir().join(format!(
+        "bipnip-completion-{}-{}",
+        std::process::id(),
+        buyer.store_key()
+    ));
+    let _ = std::fs::remove_file(&lease_file);
+    buyer.save_lease(&lease_file).expect("save");
+    let lease = crate::lease::BuyerLease::load(&lease_file).expect("load");
+    let mut buyer = BuyerRun::from_json(&before, lease).expect("the run as it was saved");
+    assert_eq!(buyer.state(), BuyerState::Active);
+    stage.to_buyer(&mut buyer, &bill).await.expect("bill");
+    assert_eq!(buyer.state(), BuyerState::Complete);
+    assert_eq!(stage.payments(), paid_before + 1);
+}
+
+#[tokio::test]
+async fn a_bill_that_is_early_or_wrong_is_not_paid() {
+    let stage = Stage::new();
+    let (seller, mut buyer) = stage.active().await;
+    let contract = buyer.contract().clone();
+    let completion_msat = contract.terms.completion_sat().expect("share") * 1000;
+    let paid_before = stage.payments();
+    let good = stage
+        .bill(&stage.seller_node, &contract, completion_msat)
+        .await;
+
+    // Before the channel is as old as the lease is long. It may fit later.
+    let result = stage.to_buyer(&mut buyer, &good).await;
+    assert!(matches!(result, Err(RunError::OutOfOrder(_))), "{result:?}");
+    stage.age(&seller, 4_320);
+
+    // More than the agreed share; an invoice that pays another node; another lease's id.
+    let too_much = stage
+        .bill(&stage.seller_node, &contract, completion_msat + 1_000)
+        .await;
+    let elsewhere = stage
+        .bill(&stage.buyer_node, &contract, completion_msat)
+        .await;
+    for wrong in [too_much, elsewhere] {
+        let result = stage.to_buyer(&mut buyer, &wrong).await;
+        assert!(
+            matches!(result, Err(RunError::Step(LeaseStepError::Invoice(_)))),
+            "{result:?}"
+        );
+    }
+    let mut other = contract.clone();
+    other.created_at += 1;
+    let other_lease = stage
+        .bill(&stage.seller_node, &other, completion_msat)
+        .await;
+    let result = stage.to_buyer(&mut buyer, &other_lease).await;
+    assert!(
+        matches!(result, Err(RunError::Wire(WireError::NotOurs(_)))),
+        "{result:?}"
+    );
+    // A bill that does not come from the instance.
+    let (incoming, sender) = Stage::sent(&good, &Keys::generate(), &stage.buyer.trade);
+    let result = buyer.on_message(incoming, &sender, &stage.buyer_node).await;
+    assert!(matches!(result, Err(RunError::Sender)), "{result:?}");
+
+    assert_eq!(buyer.state(), BuyerState::Active);
+    assert_eq!(stage.payments(), paid_before, "nothing was paid");
+
+    stage
+        .to_buyer(&mut buyer, &good)
+        .await
+        .expect("the real bill");
+    assert_eq!(buyer.state(), BuyerState::Complete);
+}
+
+#[tokio::test]
+async fn a_channel_that_is_gone_ends_the_lease_unbilled_and_unpaid() {
+    let stage = Stage::new();
+    let (mut seller, mut buyer) = stage.active().await;
+    let contract = buyer.contract().clone();
+    let completion_msat = contract.terms.completion_sat().expect("share") * 1000;
+    let bill = stage
+        .bill(&stage.seller_node, &contract, completion_msat)
+        .await;
+    let paid_before = stage.payments();
+    stage.age(&seller, 4_320);
+    stage.close_channels();
+
+    assert!(
+        seller
+            .tick(&stage.seller_node)
+            .await
+            .expect("tick")
+            .is_empty()
+    );
+    assert_eq!(seller.state(), SellerState::Closed);
+    assert!(seller.finished());
+
+    // A seller that bills anyway is not paid.
+    let out = stage.to_buyer(&mut buyer, &bill).await.expect("handled");
+    assert!(out.is_empty());
+    assert_eq!(buyer.state(), BuyerState::Closed);
+    assert!(buyer.finished());
+    assert_eq!(stage.payments(), paid_before);
+}
+
+#[tokio::test]
+async fn a_lease_paid_all_upfront_ends_when_it_is_active() {
+    let stage = Stage::with_upfront(100);
+    let (mut seller, mut buyer) = stage.active().await;
+    assert!(seller.finished() && buyer.finished());
+    let contract = buyer.contract().clone();
+    assert_eq!(contract.terms.completion_sat(), Ok(0));
+
+    stage.age(&seller, 4_320);
+    assert!(
+        seller
+            .tick(&stage.seller_node)
+            .await
+            .expect("tick")
+            .is_empty()
+    );
+    assert_eq!(seller.state(), SellerState::Active);
+    // Nothing more is owed, whatever is billed.
+    let extra = stage.bill(&stage.seller_node, &contract, 1_000).await;
+    let result = stage.to_buyer(&mut buyer, &extra).await;
+    assert!(
+        matches!(result, Err(RunError::Step(LeaseStepError::Invoice(_)))),
+        "{result:?}"
+    );
+    assert_eq!(buyer.state(), BuyerState::Active);
 }
 
 #[tokio::test]

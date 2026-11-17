@@ -11,9 +11,7 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use super::link::{Link, StepReport, launch_buyer, launch_seller, step_buyer, step_seller};
-use super::run::{
-    BuyerConfig, BuyerRun, BuyerState, SellerConfig, SellerRun, SellerState, TakeRequest,
-};
+use super::run::{BuyerConfig, BuyerRun, SellerConfig, SellerRun, TakeRequest};
 use super::store::LeaseStore;
 use crate::binding::make_binding_event;
 use crate::config::{Config, InstanceConfig};
@@ -309,11 +307,11 @@ pub fn describe_buyer(run: &BuyerRun) -> String {
 }
 
 fn seller_done(run: &SellerRun) -> bool {
-    matches!(run.state(), SellerState::Active | SellerState::Canceled)
+    run.finished()
 }
 
 fn buyer_done(run: &BuyerRun) -> bool {
-    matches!(run.state(), BuyerState::Active | BuyerState::Canceled)
+    run.finished()
 }
 
 fn tell(report: StepReport, say: &mut dyn FnMut(String)) {
@@ -322,8 +320,9 @@ fn tell(report: StepReport, say: &mut dyn FnMut(String)) {
     }
 }
 
-/// Drives a seller's run until the lease is active or over, looking every `poll`. Each change of
-/// state and each problem is passed to `say`.
+/// Drives a seller's run until it is finished, looking every `poll`: until the lease is active
+/// when all of the fee was upfront, otherwise until the completion share is paid at the end of
+/// the lease. Each change of state and each problem is passed to `say`.
 pub async fn run_seller(
     session: &Session<'_>,
     run: &mut SellerRun,
@@ -349,7 +348,7 @@ pub async fn run_seller(
     }
 }
 
-/// Drives a buyer's run until the lease is active or over, looking every `poll`.
+/// Drives a buyer's run until it is finished, looking every `poll`.
 pub async fn run_buyer(
     session: &Session<'_>,
     run: &mut BuyerRun,
@@ -459,6 +458,7 @@ pub async fn resume(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lease::run::{BuyerState, SellerState};
 
     #[test]
     fn trade_indexes_are_handed_out_once_each() {
