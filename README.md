@@ -23,9 +23,10 @@ long, and the buyer pays if its node still has the channel. The instance side is
 the same way: a creator proposes a ring, others take its slots, every member checks the roster and signs
 it, and each opens one channel to the next and confirms the one opened to it. A ring can ask every member
 for a bond, locked at the instance's node before anyone opens and paid on to the member that was let down
-when a channel is missing (the instance side of bonds is still in review). Not written yet: the buyer's
-bond on a lease, a long-running agent with a local API, and the Core Lightning and LDK backends. Nothing
-here is ready for real funds.
+when a channel is missing. A lease offer can ask its buyer for a bond the same way, paid on to the seller
+if the buyer walks away from an opened channel. (The instance side of bonds is still in review.) Not
+written yet: a long-running agent with a local API, and the Core Lightning and LDK backends. Nothing here
+is ready for real funds.
 
 ## Try the agent (regtest or signet only)
 
@@ -72,6 +73,9 @@ bipnip-agent --config agent.toml lease take <order id> --capacity 600000 --node-
 bipnip-agent --config agent.toml lease list      # the stored leases and where they stand
 bipnip-agent --config agent.toml lease resume    # carry on after a restart
 ```
+
+A seller can ask its buyer for a bond with `lease offer … --bond 20000` (on an instance that takes bonds);
+a buyer's agent takes such an order only up to its `[policy] max_bond_sat` (see Rings below).
 
 Both commands run until the lease is finished: active, when all of the fee was upfront (the default), or
 paid in full at the end of the lease when `--upfront` is below 100. The buyer's agent keeps the lease's preimage in an
