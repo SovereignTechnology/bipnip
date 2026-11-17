@@ -175,9 +175,8 @@ grep -q "revoked" "$W/verify2.out" || fail "no revocation reported"
 log "AGENT E2E PASS: init, bind, publish, verify, revoke against a real LND node"
 
 # --- two agents lease through a real instance ---------------------------------------------------
-# bipnipd at the head of its ring branch (PR #6, stacked on #4 and #5: lease handlers, the public
-# lease order, ring handlers). Move this to a commit on main once those are merged.
-BIPNIPD_REV=35e6981ca7defca8772f0e83b9e0695c342a1271
+# bipnipd main: lease handlers, the public lease order and ring handlers (#4, #5, #6).
+BIPNIPD_REV=67d7b2836916ebc7f9abe7cc8a63036a8fe4459b
 log "build the instance (bipnipd ${BIPNIPD_REV:0:12})"
 git clone --quiet https://github.com/SovereignTechnology/bipnipd "$W/bipnipd"
 git -C "$W/bipnipd" checkout --quiet "$BIPNIPD_REV"
