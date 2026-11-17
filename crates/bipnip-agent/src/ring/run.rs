@@ -30,7 +30,8 @@
 //!
 //! A run that stops after opening its channel and before it is saved finds that channel on its
 //! node again (it was not there when the roster was checked) and reports it instead of opening
-//! another. Not here yet: sending again what a relay did not take.
+//! another. A message no relay took is kept with the run and sent again
+//! ([`crate::ring::link`]).
 
 use bipnip_ln::{HoldState, LightningBackend, OpenRequest};
 use mostro_core::bond::{BOND_CLAIM_WINDOW_SECS, payout_sat};
