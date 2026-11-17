@@ -1,8 +1,11 @@
-//! Runs every `LightningBackend` method of `LndBackend` against two real LND nodes on regtest
-//! (payer A, payee B), the way a lease uses them. Driven by `run-lnd.sh`; exits non-zero on the
-//! first failed step. Environment: `A_ADDR`/`A_CERT`/`A_MAC`, `B_…` (gRPC address, tls.cert,
-//! admin.macaroon), `B_P2P` (host:port), `MINE` (a command that mines its argument's blocks),
-//! `HASHES` (three "preimage:hash" pairs, comma-separated).
+//! Runs every `LightningBackend` method against two real nodes on regtest (payer A, payee B), the
+//! way a lease uses them. The steps know only the trait: the same run is the conformance test
+//! of every backend. Driven by `run-lnd.sh`; exits non-zero on the first failed step.
+//!
+//! Environment: `BACKEND` (which backend both nodes are; `lnd`, the default), `MINE` (a command
+//! that mines its argument's blocks), `HASHES` (three "preimage:hash" pairs, comma-separated),
+//! `B_P2P` (host:port), and how to reach each node. For LND: `A_ADDR`/`A_CERT`/`A_MAC`, `B_…`
+//! (gRPC address, tls.cert, admin.macaroon).
 
 use std::path::Path;
 use std::process::Command;
@@ -46,18 +49,27 @@ where
     panic!("timed out waiting for: {what}");
 }
 
-async fn node(prefix: &str) -> LndBackend {
-    LndBackend::connect(
-        &env(&format!("{prefix}_ADDR")),
-        Path::new(&env(&format!("{prefix}_CERT"))),
-        Path::new(&env(&format!("{prefix}_MAC"))),
-    )
-    .await
-    .expect("connect")
+/// The node behind `prefix` (`A` or `B`), through the backend `BACKEND` names.
+async fn node(prefix: &str) -> Box<dyn LightningBackend> {
+    let backend = std::env::var("BACKEND").unwrap_or_else(|_| "lnd".into());
+    match backend.as_str() {
+        "lnd" => Box::new(
+            LndBackend::connect(
+                &env(&format!("{prefix}_ADDR")),
+                Path::new(&env(&format!("{prefix}_CERT"))),
+                Path::new(&env(&format!("{prefix}_MAC"))),
+            )
+            .await
+            .expect("connect"),
+        ),
+        other => panic!("no backend {other:?} in this build"),
+    }
 }
 
 /// Pays `invoice` from `a` until the HTLC is out (a brand-new channel can refuse the first tries).
-async fn pay_until_in_flight(a: &LndBackend, invoice: &str, hash: &str) -> PaymentState {
+/// A try made while the one before is still unresolved is answered with that payment's state,
+/// by the rule of [`LightningBackend::pay_invoice`]; no backend's error text is read here.
+async fn pay_until_in_flight(a: &dyn LightningBackend, invoice: &str) -> PaymentState {
     for attempt in 1..=6 {
         match a.pay_invoice(invoice, 10_000, 5).await {
             Ok(PaymentState::Failed { reason }) => {
@@ -65,12 +77,6 @@ async fn pay_until_in_flight(a: &LndBackend, invoice: &str, hash: &str) -> Payme
                 tokio::time::sleep(Duration::from_secs(10)).await;
             }
             Ok(state) => return state,
-            // LND refuses to re-send while its previous attempt is still unresolved.
-            Err(BackendError::Rejected(m))
-                if m.contains("in flight") || m.contains("in transition") =>
-            {
-                return a.payment_state(hash).await.expect("payment state");
-            }
             Err(e) => panic!("pay_invoice: {e}"),
         }
     }
@@ -80,6 +86,7 @@ async fn pay_until_in_flight(a: &LndBackend, invoice: &str, hash: &str) -> Payme
 #[tokio::main]
 async fn main() {
     let (a, b) = (node("A").await, node("B").await);
+    let (a, b) = (a.as_ref(), b.as_ref());
     let hashes: Vec<(String, String)> = env("HASHES")
         .split(',')
         .map(|p| {
@@ -187,7 +194,7 @@ async fn main() {
         HoldState::Open
     );
     assert_eq!(
-        pay_until_in_flight(&a, &invoice, hash).await,
+        pay_until_in_flight(a, &invoice).await,
         PaymentState::InFlight
     );
     until("hold invoice accepted", 60, || async {
@@ -197,6 +204,12 @@ async fn main() {
     assert_eq!(
         a.payment_state(hash).await.expect("state"),
         PaymentState::InFlight
+    );
+    // Paying an invoice whose payment is under way starts no second payment and is no error.
+    assert_eq!(
+        a.pay_invoice(&invoice, 10_000, 5).await,
+        Ok(PaymentState::InFlight),
+        "paying again while the payment is held"
     );
     b.settle_hold_invoice(pre).await.expect("settle");
     until("payer sees the preimage", 60, || async {
@@ -210,6 +223,14 @@ async fn main() {
         b.hold_invoice_state(hash).await.expect("state"),
         HoldState::Settled
     );
+    // Nor is paying one that is already paid: the answer is the payment that was made.
+    assert_eq!(
+        a.pay_invoice(&invoice, 10_000, 5).await,
+        Ok(PaymentState::Succeeded {
+            preimage: pre.clone(),
+        }),
+        "paying again after the payment settled"
+    );
 
     step("hold invoice cancelled: the payer is refunded");
     let (_, hash2) = &hashes[1];
@@ -221,7 +242,7 @@ async fn main() {
         .await
         .expect("add hold");
     assert_eq!(
-        pay_until_in_flight(&a, &invoice, hash2).await,
+        pay_until_in_flight(a, &invoice).await,
         PaymentState::InFlight
     );
     until("hold invoice accepted", 60, || async {
@@ -312,5 +333,8 @@ async fn main() {
         Err(BackendError::Rejected(_))
     ));
 
-    println!("CONFORMANCE PASS: LndBackend, all steps");
+    println!(
+        "CONFORMANCE PASS: {} backend, all steps",
+        std::env::var("BACKEND").unwrap_or_else(|_| "lnd".into())
+    );
 }

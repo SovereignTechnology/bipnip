@@ -4,7 +4,7 @@
 #   kata-run --cwd ~/Projects/bipnip --net --timeout 7200 -- bash itest/ln/run-lnd.sh
 #
 # Starts regtest bitcoind and two LND nodes from sha256-pinned releases, funds the payer, and runs
-# `lnd-conformance`, which calls every LightningBackend method of LndBackend the way a lease does.
+# `ln-conformance`, which calls every LightningBackend method the way a lease does (here on LND).
 # Every key and credential here is a throwaway regtest value inside the VM.
 
 set -euo pipefail
@@ -96,7 +96,7 @@ A_ADDR=https://127.0.0.1:${RPC[alice]} A_CERT=$W/alice/tls.cert A_MAC=$(mac alic
 B_ADDR=https://127.0.0.1:${RPC[bob]} B_CERT=$W/bob/tls.cert B_MAC=$(mac bob) \
 B_P2P=127.0.0.1:${P2P[bob]} HASHES="$(pair),$(pair),$(pair)" \
 MINE="$W/mine.sh" \
-  "$W/target/release/lnd-conformance"
+  "$W/target/release/ln-conformance"
 
 # --- a whole lease between the two nodes ------------------------------------------------------
 log "fund the seller (bob) on chain"
