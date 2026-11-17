@@ -34,9 +34,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 toml = "0.8"
-# bipnip-core main (#5): Mostro's protocol types and transport, the node binding, lease terms,
-# lease messages and the lease order event.
-mostro-core = { git = "https://github.com/SovereignTechnology/bipnip-core", rev = "bd6fa53c278d572980182b091e4bcae25fd1dd41" }
+# bipnip-core main (#7): Mostro's protocol types and transport, the node binding, and leases and
+# rings (terms, messages, order events).
+mostro-core = { git = "https://github.com/SovereignTechnology/bipnip-core", rev = "13355e32e7afc68ef2042220fb67dfbf49fbc6c3" }
 # The versions bipnip-core resolves, so key and event types are the same types.
 nostr-sdk = "0.45.1"
 # NIP-06 (mnemonic → keys) is a feature of the nostr crate nostr-sdk re-exports.

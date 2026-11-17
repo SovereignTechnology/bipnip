@@ -7,4 +7,6 @@ pub mod keys;
 pub mod lease;
 pub mod lease_wire;
 pub mod relay;
+pub mod ring;
+pub mod ring_wire;
 pub mod secretfile;
