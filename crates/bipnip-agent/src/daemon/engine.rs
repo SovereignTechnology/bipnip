@@ -49,6 +49,10 @@ use crate::ring::store::RingStore;
 const BUYER_MAX_ROUTING_FEE_MSAT: u64 = 10_000;
 /// How many ticks pass between tries to reach an instance whose proof of work is not known yet.
 const RESOLVE_EVERY_TICKS: u32 = 12;
+/// How many ticks pass between looks for finished runs that are old enough to put away.
+const TIDY_EVERY_TICKS: u32 = 720;
+/// How long a finished run stays where it is listed before it is put away, in seconds.
+const KEEP_FINISHED_SECS: u64 = 30 * 24 * 3600;
 
 /// Where a request's lines go: the client's connection. Lines that do not fit are dropped; the
 /// engine never waits for a client.
@@ -324,6 +328,7 @@ impl Engine {
         };
         engine.resolve_instances().await;
         engine.resume()?;
+        engine.tidy(unix_now());
         Ok(engine)
     }
 
@@ -398,6 +403,34 @@ impl Engine {
         Ok(())
     }
 
+    /// Puts away the runs that finished long ago, with their grants: moved into `done`
+    /// directories, never deleted. They are no longer loaded at a start, listed, or counted.
+    fn tidy(&mut self, now: u64) {
+        let moved = self
+            .leases
+            .put_away_finished(KEEP_FINISHED_SECS, now)
+            .and_then(|mut leases| {
+                leases.extend(self.rings.put_away_finished(KEEP_FINISHED_SECS, now)?);
+                Ok(leases)
+            });
+        match moved {
+            Ok(moved) => {
+                for run in &moved {
+                    if let Err(e) = self.policy.put_away_grant(run) {
+                        (self.log)(format!("problem: {e}"));
+                    }
+                }
+                if !moved.is_empty() {
+                    (self.log)(format!(
+                        "put away {} runs that finished long ago",
+                        moved.len()
+                    ));
+                }
+            }
+            Err(e) => (self.log)(format!("problem: finished runs could not be put away: {e}")),
+        }
+    }
+
     fn link(&self, instance: &InstanceConfig, trade_index: u32) -> Result<Link, String> {
         let identity = self.wallet.liquidity().map_err(|e| e.to_string())?;
         let trade = self
@@ -434,6 +467,9 @@ impl Engine {
             }
         }
         let now = unix_now();
+        if self.ticks.is_multiple_of(TIDY_EVERY_TICKS) {
+            self.tidy(now);
+        }
         let keys: Vec<PublicKey> = self
             .entries
             .iter()

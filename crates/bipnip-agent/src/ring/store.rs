@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use super::run::RingRun;
-use crate::lease::store::StoreError;
+use crate::lease::store::{StoreError, old_enough, put_away};
 use crate::secretfile::{self, SecretFileError};
 
 /// What a ring store held.
@@ -36,6 +36,23 @@ impl RingStore {
     pub fn save(&self, run: &RingRun) -> Result<(), StoreError> {
         let path = self.dir.join(format!("ring-{}.json", run.store_key()));
         secretfile::replace_private(&path, &run.to_json()?).map_err(StoreError::File)
+    }
+
+    /// Moves the finished runs that were last written at least `after_secs` before `now` into
+    /// the store's `done` directory, as [`crate::lease::store::LeaseStore::put_away_finished`]
+    /// does. Returns the names they were stored under.
+    pub fn put_away_finished(&self, after_secs: u64, now: u64) -> Result<Vec<String>, StoreError> {
+        let loaded = self.load()?;
+        let mut moved = Vec::new();
+        for run in loaded.runs.iter().filter(|run| run.finished()) {
+            let stem = format!("ring-{}", run.store_key());
+            let file = format!("{stem}.json");
+            if old_enough(&self.dir.join(&file), after_secs, now) {
+                put_away(&self.dir, &[file])?;
+                moved.push(stem);
+            }
+        }
+        Ok(moved)
     }
 
     /// Loads every run in the store. A file that is refused is listed in [`Loaded::problems`].
