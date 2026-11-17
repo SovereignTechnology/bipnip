@@ -30,8 +30,8 @@ use fedimint_tonic_lnd::tonic::{Code, Status};
 
 use crate::hexutil::{self, hash32, node_key};
 use crate::{
-    BackendError, ChannelView, HoldInvoiceRequest, HoldState, LightningBackend, NodeInfo,
-    OpenRequest, PaymentState,
+    BackendError, ChannelView, GraphChannel, HoldInvoiceRequest, HoldState, LightningBackend,
+    NodeInfo, OpenRequest, PaymentState,
 };
 
 /// Deadline for an ordinary RPC.
@@ -400,6 +400,37 @@ impl LightningBackend for LndBackend {
                 )))
             }
             Ok(Err(status)) if status.code() == Code::NotFound => Ok(None),
+            Ok(Err(status)) => Err(status_error(status)),
+            Err(_) => Err(BackendError::Unavailable(
+                "LND did not answer in time".into(),
+            )),
+        }
+    }
+
+    async fn graph_channels(&self, node_pubkey: &str) -> Result<Vec<GraphChannel>, BackendError> {
+        node_key(node_pubkey)?;
+        let mut c = self.client.clone();
+        let req = NodeInfoRequest {
+            pub_key: node_pubkey.to_string(),
+            include_channels: true,
+        };
+        let limit = tokio::time::timeout(RPC_TIMEOUT, c.lightning().get_node_info(req)).await;
+        match limit {
+            Ok(Ok(resp)) => Ok(resp
+                .into_inner()
+                .channels
+                .into_iter()
+                .map(|edge| GraphChannel {
+                    peer: if edge.node1_pub == node_pubkey {
+                        edge.node2_pub
+                    } else {
+                        edge.node1_pub
+                    },
+                    capacity_sat: u64::try_from(edge.capacity).unwrap_or(0),
+                    funding_outpoint: edge.chan_point,
+                })
+                .collect()),
+            Ok(Err(status)) if status.code() == Code::NotFound => Ok(Vec::new()),
             Ok(Err(status)) => Err(status_error(status)),
             Err(_) => Err(BackendError::Unavailable(
                 "LND did not answer in time".into(),

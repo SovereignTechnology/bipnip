@@ -235,6 +235,27 @@ impl LightningBackend for Node {
     async fn graph_node(&self, _: &str) -> Result<Option<(u32, u64)>, BackendError> {
         unsupported()
     }
+    /// The simulated graph: every announced channel with six confirmations, as gossip would
+    /// carry it.
+    async fn graph_channels(
+        &self,
+        node: &str,
+    ) -> Result<Vec<bipnip_ln::GraphChannel>, BackendError> {
+        let w = self.world.lock().expect("world");
+        Ok(w.channels
+            .iter()
+            .filter(|c| c.announced && c.confirmations >= 6 && (c.opener == node || c.peer == node))
+            .map(|c| bipnip_ln::GraphChannel {
+                peer: if c.opener == node {
+                    c.peer.clone()
+                } else {
+                    c.opener.clone()
+                },
+                capacity_sat: c.capacity_sat,
+                funding_outpoint: c.outpoint.clone(),
+            })
+            .collect())
+    }
 }
 
 fn pair() -> (Node, Node, Arc<Mutex<World>>) {

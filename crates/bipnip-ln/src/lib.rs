@@ -115,6 +115,18 @@ pub struct ChannelView {
     pub active: bool,
 }
 
+/// A public channel of some node, as the local node's graph knows it. This is what the rest of
+/// the network can see too, which is why an instance may judge by it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphChannel {
+    /// The node at the other end, 66 lower-case hex.
+    pub peer: String,
+    /// Capacity in satoshi.
+    pub capacity_sat: u64,
+    /// Funding outpoint `txid:vout`.
+    pub funding_outpoint: String,
+}
+
 /// A request to open a channel from the node's own wallet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenRequest {
@@ -188,6 +200,11 @@ pub trait LightningBackend: Send + Sync {
     /// What the node's graph knows about another node: number of public channels and their
     /// total capacity in satoshi, or `None` if the node is not in the graph.
     async fn graph_node(&self, node_pubkey: &str) -> Result<Option<(u32, u64)>, BackendError>;
+
+    /// The public channels the node's graph knows for another node; empty if that node is not
+    /// in the graph. A channel appears here only once it is announced, which takes some
+    /// confirmations and gossip, so "not here yet" is not "never opened".
+    async fn graph_channels(&self, node_pubkey: &str) -> Result<Vec<GraphChannel>, BackendError>;
 }
 
 #[cfg(test)]

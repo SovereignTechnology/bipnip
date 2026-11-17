@@ -279,5 +279,38 @@ async fn main() {
     })
     .await;
 
+    step("graph_channels: the announced channel, from either end, and nothing for a stranger");
+    let ia = a.node_info().await.expect("A info");
+    let in_graph = a
+        .graph_channels(&ib.node_pubkey)
+        .await
+        .expect("graph channels of B");
+    let ours = in_graph
+        .iter()
+        .find(|c| c.funding_outpoint == outpoint)
+        .expect("the channel we opened is in the graph");
+    assert_eq!(ours.peer, ia.node_pubkey, "seen from B, the peer is A");
+    assert_eq!(ours.capacity_sat, 1_000_000);
+    let from_a = a
+        .graph_channels(&ia.node_pubkey)
+        .await
+        .expect("graph channels of A");
+    assert!(
+        from_a
+            .iter()
+            .any(|c| c.funding_outpoint == outpoint && c.peer == ib.node_pubkey),
+        "seen from A, the peer is B"
+    );
+    assert!(
+        a.graph_channels(&unknown)
+            .await
+            .expect("graph channels of a stranger")
+            .is_empty()
+    );
+    assert!(matches!(
+        a.graph_channels("02abc").await,
+        Err(BackendError::Rejected(_))
+    ));
+
     println!("CONFORMANCE PASS: LndBackend, all steps");
 }

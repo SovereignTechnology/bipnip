@@ -201,6 +201,12 @@ mod tests {
         async fn channels_with(&self, _: &str) -> Result<Vec<ChannelView>, BackendError> {
             unsupported()
         }
+        async fn graph_channels(
+            &self,
+            _: &str,
+        ) -> Result<Vec<bipnip_ln::GraphChannel>, BackendError> {
+            unsupported()
+        }
         async fn graph_node(&self, _: &str) -> Result<Option<(u32, u64)>, BackendError> {
             unsupported()
         }
