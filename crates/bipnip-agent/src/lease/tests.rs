@@ -15,34 +15,34 @@ use super::*;
 
 mod run_tests;
 
-const NOW: u64 = 1_794_800_000;
+pub(crate) const NOW: u64 = 1_794_800_000;
 
 #[derive(Clone)]
-struct Channel {
-    opener: String,
-    peer: String,
-    outpoint: String,
-    capacity_sat: u64,
-    announced: bool,
-    confirmations: u32,
+pub(crate) struct Channel {
+    pub(crate) opener: String,
+    pub(crate) peer: String,
+    pub(crate) outpoint: String,
+    pub(crate) capacity_sat: u64,
+    pub(crate) announced: bool,
+    pub(crate) confirmations: u32,
 }
 
 #[derive(Default)]
-struct World {
-    invoices: HashMap<String, HoldState>,
-    payments: HashMap<String, PaymentState>,
-    channels: Vec<Channel>,
+pub(crate) struct World {
+    pub(crate) invoices: HashMap<String, HoldState>,
+    pub(crate) payments: HashMap<String, PaymentState>,
+    pub(crate) channels: Vec<Channel>,
     /// Payment hashes of plain (not hold) invoices: paying one settles it at once.
     plain: HashSet<String>,
 }
 
-struct Node {
-    world: Arc<Mutex<World>>,
-    secret: SecretKey,
-    network: &'static str,
+pub(crate) struct Node {
+    pub(crate) world: Arc<Mutex<World>>,
+    pub(crate) secret: SecretKey,
+    pub(crate) network: &'static str,
 }
 
-fn secret(n: u8) -> SecretKey {
+pub(crate) fn secret(n: u8) -> SecretKey {
     let mut b = [0u8; 32];
     b[31] = n;
     SecretKey::from_slice(&b).expect("key")
@@ -77,7 +77,7 @@ fn invoice(
 }
 
 impl Node {
-    fn id(&self) -> String {
+    pub(crate) fn id(&self) -> String {
         pubkey(&self.secret)
     }
 }
@@ -259,7 +259,7 @@ fn terms() -> LeaseTerms {
     }
 }
 
-fn confirm(world: &Arc<Mutex<World>>, outpoint: &str, confirmations: u32) {
+pub(crate) fn confirm(world: &Arc<Mutex<World>>, outpoint: &str, confirmations: u32) {
     let mut w = world.lock().expect("world");
     for c in w.channels.iter_mut().filter(|c| c.outpoint == outpoint) {
         c.confirmations = confirmations;
