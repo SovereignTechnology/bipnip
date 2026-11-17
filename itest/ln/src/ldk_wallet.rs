@@ -1,12 +1,12 @@
 //! What the harness needs from an LDK Server that the backend trait has no place for: an
 //! on-chain address to fund, the spendable balance, and the node id.
 //!
-//! `ldk-wallet <address | spendable | id>`, with `LDK_ADDR` (host:port), `LDK_CERT` (tls.crt) and
+//! `ldk-wallet <address | spendable | id | channels>`, with `LDK_ADDR` (host:port), `LDK_CERT` (tls.crt) and
 //! `LDK_MAC` (the hex macaroon file). Regtest throwaway values only.
 
 use ldk_server_client::client::LdkServerClient;
 use ldk_server_client::ldk_server_grpc::api::{
-    GetBalancesRequest, GetNodeInfoRequest, OnchainReceiveRequest,
+    GetBalancesRequest, GetNodeInfoRequest, ListChannelsRequest, OnchainReceiveRequest,
 };
 
 fn env(k: &str) -> String {
@@ -41,6 +41,25 @@ async fn main() {
                 .expect("info");
             println!("{}", answer.node_id);
         }
-        other => panic!("ldk-wallet <address | spendable | id>, not {other:?}"),
+        // One line per channel: capacity in satoshi, who opened it, whether it can be used.
+        Some("channels") => {
+            let answer = client
+                .list_channels(ListChannelsRequest {})
+                .await
+                .expect("channels");
+            for channel in answer.channels {
+                println!(
+                    "{} {} {}",
+                    channel.channel_value_sats,
+                    if channel.is_outbound { "out" } else { "in" },
+                    if channel.is_usable {
+                        "usable"
+                    } else {
+                        "not-usable"
+                    },
+                );
+            }
+        }
+        other => panic!("ldk-wallet <address | spendable | id | channels>, not {other:?}"),
     }
 }
