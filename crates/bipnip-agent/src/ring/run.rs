@@ -337,6 +337,11 @@ impl RingRun {
         (run, message)
     }
 
+    /// The ring's terms: what the order showed, and what the roster is held to.
+    pub fn terms(&self) -> &RingTerms {
+        &self.terms
+    }
+
     /// Where the run stands.
     pub fn state(&self) -> RingState {
         self.state

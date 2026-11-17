@@ -4,6 +4,7 @@
 
 use std::time::Duration;
 
+use mostro_core::prelude::Message;
 use mostro_core::ring_message::{RingOffer, RingSeat};
 use uuid::Uuid;
 
@@ -12,8 +13,8 @@ use super::run::{JoinRequest, RingRun};
 use super::store::RingStore;
 use crate::config::Config;
 use crate::lease::cmd::{
-    NEW_RUN_LOOKBACK_SECS, RESUME_LOOKBACK_SECS, Session, instance, link_for, next_trade_index,
-    own_binding, unix_now,
+    NEW_RUN_LOOKBACK_SECS, RESUME_LOOKBACK_SECS, Session, link_for, next_trade_index, own_binding,
+    unix_now,
 };
 use crate::lease::link::{Link, StepReport};
 use crate::relay;
@@ -50,7 +51,7 @@ pub struct JoinParams {
     pub feerate_sat_vb: u64,
 }
 
-fn store(config: &Config) -> Result<RingStore, String> {
+pub(crate) fn store(config: &Config) -> Result<RingStore, String> {
     let dir = config.rings_dir();
     RingStore::open(&dir).map_err(|e| format!("{}: {e}", dir.display()))
 }
@@ -87,16 +88,19 @@ fn note_unsent(report: &StepReport, what: &str) -> Result<(), String> {
 
 /// For a ring or a lease with a bond: checks the bond against our own limit and finds the node
 /// the bond would be paid to, from the instance's own verified binding. Without a bond, nothing.
+/// The daemon weighs the bond with its other limits itself, and may have had it approved, so
+/// for it only the node is looked up.
 pub(crate) async fn instance_node_for(
-    config: &Config,
+    session: &Session<'_>,
     instance: &crate::config::InstanceConfig,
     bond_sat: u64,
 ) -> Result<Option<String>, String> {
     if bond_sat == 0 {
         return Ok(None);
     }
+    let config = session.config;
     let limit = config.policy.max_bond_sat;
-    if bond_sat > limit {
+    if !session.caller_checks_limits && bond_sat > limit {
         return Err(format!(
             "this asks for a bond of {bond_sat} sat; this agent locks at most {limit} \
              (policy.max_bond_sat in the config)"
@@ -114,9 +118,22 @@ pub async fn create(
     session: &Session<'_>,
     params: CreateParams,
 ) -> Result<(RingRun, Link), String> {
+    let (ring, first, link) = prepare_create(session, params).await?;
+    let store = store(session.config)?;
+    let report = launch(&ring, &first, &link, &store)
+        .await
+        .map_err(|e| e.to_string())?;
+    note_unsent(&report, "the ring")?;
+    Ok((ring, link))
+}
+
+/// Everything [`create`] does short of storing the run and sending the offer.
+pub async fn prepare_create(
+    session: &Session<'_>,
+    params: CreateParams,
+) -> Result<(RingRun, Message, Link), String> {
     let config = session.config;
-    let instance = instance(config)?;
-    let store = store(config)?;
+    let instance = &session.instance().await?;
     let now = unix_now();
     let offer = RingOffer {
         network: config.network,
@@ -129,7 +146,7 @@ pub async fn create(
         seat: own_seat(session, params.node_address, now).await?,
     };
     offer.validate().map_err(|e| e.to_string())?;
-    let instance_node = instance_node_for(config, instance, params.bond_sat).await?;
+    let instance_node = instance_node_for(session, instance, params.bond_sat).await?;
     let trade_index = next_trade_index(config)?;
     let (ring, first) = RingRun::create(
         instance.pubkey,
@@ -146,20 +163,30 @@ pub async fn create(
         now.saturating_sub(NEW_RUN_LOOKBACK_SECS),
     )
     .await?;
-    let report = launch(&ring, &first, &link, &store)
-        .await
-        .map_err(|e| e.to_string())?;
-    note_unsent(&report, "the ring")?;
-    Ok((ring, link))
+    Ok((ring, first, link))
 }
 
 /// Takes a slot of a ring on the configured instance. The order is read from the relays and
 /// must be open, signed by the instance and on our network; the terms and size it shows are
 /// what the roster is later held to. Returns the run and its link, to drive with [`run`].
 pub async fn join(session: &Session<'_>, params: JoinParams) -> Result<(RingRun, Link), String> {
+    let (ring, first, link) = prepare_join(session, params).await?;
+    let store = store(session.config)?;
+    let report = launch(&ring, &first, &link, &store)
+        .await
+        .map_err(|e| e.to_string())?;
+    note_unsent(&report, "the take")?;
+    Ok((ring, link))
+}
+
+/// Everything [`join`] does short of storing the run and sending the take: the checks on the
+/// order and the bond, then the run, its first message and its link.
+pub async fn prepare_join(
+    session: &Session<'_>,
+    params: JoinParams,
+) -> Result<(RingRun, Message, Link), String> {
     let config = session.config;
-    let instance = instance(config)?;
-    let store = store(config)?;
+    let instance = &session.instance().await?;
     let now = unix_now();
     let order = relay::fetch_ring_order(params.order_id, &instance.pubkey, &config.relays)
         .await?
@@ -179,7 +206,7 @@ pub async fn join(session: &Session<'_>, params: JoinParams) -> Result<(RingRun,
             config.network.as_str()
         ));
     }
-    let instance_node = instance_node_for(config, instance, order.bond_sat).await?;
+    let instance_node = instance_node_for(session, instance, order.bond_sat).await?;
     let trade_index = next_trade_index(config)?;
     let request = JoinRequest {
         order_id: params.order_id,
@@ -199,11 +226,7 @@ pub async fn join(session: &Session<'_>, params: JoinParams) -> Result<(RingRun,
         now.saturating_sub(NEW_RUN_LOOKBACK_SECS),
     )
     .await?;
-    let report = launch(&ring, &first, &link, &store)
-        .await
-        .map_err(|e| e.to_string())?;
-    note_unsent(&report, "the take")?;
-    Ok((ring, link))
+    Ok((ring, first, link))
 }
 
 fn or_dash(value: Option<String>) -> String {
@@ -280,7 +303,7 @@ pub async fn resume(
     say: &mut dyn FnMut(String),
 ) -> Result<(), String> {
     let config = session.config;
-    let instance = instance(config)?;
+    let instance = &session.instance().await?;
     let store = store(config)?;
     let loaded = store.load().map_err(|e| e.to_string())?;
     for (file, why) in &loaded.problems {

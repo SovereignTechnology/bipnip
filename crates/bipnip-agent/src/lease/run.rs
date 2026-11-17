@@ -471,6 +471,11 @@ impl SellerRun {
         self.instance
     }
 
+    /// What this run offers.
+    pub fn offered(&self) -> &LeaseOffer {
+        &self.offer
+    }
+
     /// The order id, once the instance has given one.
     pub fn order_id(&self) -> Option<Uuid> {
         self.order_id
@@ -1148,6 +1153,11 @@ impl BuyerRun {
             (Some(bond), Some(_)) if bond.sent => "sent",
             (Some(_), Some(_)) => "checked",
         }
+    }
+
+    /// The bond the order asks of us, in satoshi; 0 for none.
+    pub fn bond_sat(&self) -> u64 {
+        self.bond_terms.as_ref().map_or(0, |terms| terms.bond_sat)
     }
 
     /// Our bond payment, once the instance's invoice passed our checks.

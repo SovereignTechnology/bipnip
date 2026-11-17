@@ -1,8 +1,11 @@
 //! `bipnip-agent`: runs next to a node runner's Lightning node, holds the mnemonic and the node
-//! credentials (`docs/decisions/0002-instance-and-agent-roles.md`). For now a command at a time;
-//! the long-running daemon and its unix-socket API come next.
+//! credentials (`docs/decisions/0002-instance-and-agent-roles.md`). `run` is the daemon: it
+//! carries every lease and ring on and answers the `bipnip` command line on a unix socket
+//! (`docs/agent-api.md`). The other commands do one thing and end; those that drive a lease or
+//! a ring cannot run beside the daemon, which holds the data directory.
 //!
 //! ```text
+//! bipnip-agent --config FILE run [--poll SECS] the daemon: every stored run, and the socket
 //! bipnip-agent --config FILE init              create the data dir and a new mnemonic file (600)
 //! bipnip-agent --config FILE whoami            show the public keys (and the node, if configured)
 //! bipnip-agent --config FILE bind [--revoke] [--publish]
@@ -30,10 +33,10 @@
 //! bipnip-agent --config FILE ring list         show the stored rings
 //! ```
 //!
-//! The `lease` and `ring` commands need an `[instance]` section and a node. A ring command runs
+//! The `lease` and `ring` commands need exactly one `[instance]` and a node. A ring command runs
 //! until the ring is over: every channel confirmed, or its window ended.
 //!
-//! The `lease` commands need an `[instance]` section and a node. They run until the lease is
+//! The `lease` commands run until the lease is
 //! finished: active when all of the fee was upfront (the default), otherwise until the rest is
 //! paid at the end of the lease. A lease interrupted before that is picked up by `lease resume`.
 //!
@@ -50,6 +53,7 @@ use bipnip_agent::keys::Wallet;
 use bipnip_agent::lease::cmd::{self, OfferParams, Session, TakeParams};
 use bipnip_agent::lease::run::{BuyerConfig, SellerConfig};
 use bipnip_agent::lease::{DEFAULT_MAX_CLTV_DELTA, DEFAULT_SELLER_CLTV_DELTA};
+use bipnip_agent::lock::DataDirLock;
 use bipnip_agent::ring::cmd::{self as ring_cmd, CreateParams, JoinParams};
 use bipnip_agent::{relay, secretfile};
 use bipnip_ln::LightningBackend;
@@ -57,7 +61,8 @@ use mostro_core::node_binding::{Action, latest_for_node};
 use nostr_sdk::prelude::ToBech32;
 
 fn usage() -> String {
-    "usage: bipnip-agent --config FILE <init | whoami | bind [--revoke] [--publish] | \
+    "usage: bipnip-agent --config FILE <run [--poll SECS] | init | whoami | \
+     bind [--revoke] [--publish] | \
      verify-binding NODE_PUBKEY | lease <offer | take ORDER_ID | resume | list> [options] | \
      ring <create | join ORDER_ID | resume | list> [options]> \
      (the options are listed at the top of the agent's source and in the README)"
@@ -272,6 +277,20 @@ fn say(line: String) {
     println!("{line}");
 }
 
+/// The daemon. Runs until the process is stopped; a stop at any moment loses nothing, since
+/// every run is saved before anything it says is sent.
+async fn daemon(config: &Config, args: &[String]) -> Result<(), String> {
+    let mut options = Options::parse(args, &[])?;
+    let poll = Duration::from_secs(options.or("poll", 5u64)?.max(1));
+    if !options.done()?.is_empty() {
+        return Err(usage());
+    }
+    let _lock = DataDirLock::acquire(config)?;
+    let wallet = load_wallet(config)?;
+    let node = backend(config).await?;
+    bipnip_agent::daemon::server::serve(config.clone(), wallet, node, poll, Box::new(say)).await
+}
+
 async fn lease(config: &Config, args: &[String]) -> Result<(), String> {
     let Some((command, rest)) = args.split_first() else {
         return Err(usage());
@@ -284,12 +303,17 @@ async fn lease(config: &Config, args: &[String]) -> Result<(), String> {
     }
     let mut options = Options::parse(rest, &["private"])?;
     let poll = Duration::from_secs(options.or("poll", 5u64)?.max(1));
+    // One process at a time drives the runs of a data directory.
+    let _lock = DataDirLock::acquire(config)?;
     let wallet = load_wallet(config)?;
     let node = backend(config).await?;
     let session = Session {
         config,
         wallet: &wallet,
         backend: node.as_ref(),
+        instance: None,
+        hub: None,
+        caller_checks_limits: false,
     };
     match command.as_str() {
         "offer" => {
@@ -369,12 +393,17 @@ async fn ring(config: &Config, args: &[String]) -> Result<(), String> {
     }
     let mut options = Options::parse(rest, &["private"])?;
     let poll = Duration::from_secs(options.or("poll", 5u64)?.max(1));
+    // One process at a time drives the runs of a data directory.
+    let _lock = DataDirLock::acquire(config)?;
     let wallet = load_wallet(config)?;
     let node = backend(config).await?;
     let session = Session {
         config,
         wallet: &wallet,
         backend: node.as_ref(),
+        instance: None,
+        hub: None,
+        caller_checks_limits: false,
     };
     match command.as_str() {
         "create" => {
@@ -444,6 +473,7 @@ async fn run() -> Result<(), String> {
             bind(&config, has("--revoke"), has("--publish")).await
         }
         [cmd, node] if cmd == "verify-binding" => verify_binding(&config, node).await,
+        [cmd, rest @ ..] if cmd == "run" => daemon(&config, rest).await,
         [cmd, rest @ ..] if cmd == "lease" => lease(&config, rest).await,
         [cmd, rest @ ..] if cmd == "ring" => ring(&config, rest).await,
         _ => Err(usage()),

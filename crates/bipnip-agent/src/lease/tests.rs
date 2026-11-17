@@ -34,6 +34,9 @@ pub(crate) struct World {
     pub(crate) channels: Vec<Channel>,
     /// Payment hashes of plain (not hold) invoices: paying one settles it at once.
     plain: HashSet<String>,
+    /// When the nodes' invoices are dated, unix seconds; [`NOW`] unless a test sets it (one
+    /// that runs on the real clock).
+    pub(crate) clock: Option<u64>,
 }
 
 pub(crate) struct Node {
@@ -61,13 +64,35 @@ fn invoice(
     expiry_secs: u32,
     cltv_delta: u32,
 ) -> String {
+    invoice_at(
+        sk,
+        currency,
+        payment_hash,
+        amount_msat,
+        expiry_secs,
+        cltv_delta,
+        NOW,
+    )
+}
+
+/// A signed BOLT 11 invoice from `sk`, dated `at` (unix seconds).
+#[allow(clippy::too_many_arguments)]
+fn invoice_at(
+    sk: &SecretKey,
+    currency: Currency,
+    payment_hash: &str,
+    amount_msat: u64,
+    expiry_secs: u32,
+    cltv_delta: u32,
+    at: u64,
+) -> String {
     let hash =
         sha256::Hash::from_slice(&hexutil::decode(payment_hash).expect("hex")).expect("hash");
     InvoiceBuilder::new(currency)
         .description("test".into())
         .payment_hash(hash)
         .payment_secret(PaymentSecret([7u8; 32]))
-        .duration_since_epoch(Duration::from_secs(NOW))
+        .duration_since_epoch(Duration::from_secs(at))
         .min_final_cltv_expiry_delta(u64::from(cltv_delta))
         .expiry_time(Duration::from_secs(u64::from(expiry_secs)))
         .amount_milli_satoshis(amount_msat)
@@ -96,19 +121,22 @@ impl LightningBackend for Node {
             synced: true,
         })
     }
-    async fn sign_message(&self, _: &[u8]) -> Result<String, BackendError> {
-        unsupported()
+    async fn sign_message(&self, msg: &[u8]) -> Result<String, BackendError> {
+        // As a node's `signmessage` does, so a binding made through this node verifies.
+        let secret = secp256k1::SecretKey::from_slice(&self.secret.secret_bytes()).expect("key");
+        Ok(mostro_core::node_binding::sign_ln_message(msg, &secret))
     }
     async fn add_hold_invoice(&self, req: &HoldInvoiceRequest) -> Result<String, BackendError> {
         let mut w = self.world.lock().expect("world");
         w.invoices.insert(req.payment_hash.clone(), HoldState::Open);
-        Ok(invoice(
+        Ok(invoice_at(
             &self.secret,
             Currency::Regtest,
             &req.payment_hash,
             req.amount_msat,
             req.expiry_secs,
             req.cltv_delta,
+            w.clock.unwrap_or(NOW),
         ))
     }
     async fn hold_invoice_state(&self, hash: &str) -> Result<HoldState, BackendError> {
@@ -188,13 +216,14 @@ impl LightningBackend for Node {
         let hash = sha256_hex(format!("plain invoice {}", w.plain.len()).as_bytes());
         w.invoices.insert(hash.clone(), HoldState::Open);
         w.plain.insert(hash.clone());
-        Ok(invoice(
+        Ok(invoice_at(
             &self.secret,
             Currency::Regtest,
             &hash,
             amount_msat,
             expiry_secs,
             18,
+            w.clock.unwrap_or(NOW),
         ))
     }
     async fn connect(&self, _: &str, _: &str) -> Result<(), BackendError> {
