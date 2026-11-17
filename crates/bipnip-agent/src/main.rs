@@ -20,7 +20,8 @@
 //!                                              carry on with stored leases after a restart
 //! bipnip-agent --config FILE lease list        show the stored leases
 //! bipnip-agent --config FILE ring create --capacity SAT --slots N --feerate SAT_PER_VB
-//!         [--window SECS] [--expires-in SECS] [--private] [--node-address HOST:PORT] [--poll SECS]
+//!         [--window SECS] [--expires-in SECS] [--bond SAT] [--private]
+//!         [--node-address HOST:PORT] [--poll SECS]
 //!                                              propose a ring, take its first slot, see it through
 //! bipnip-agent --config FILE ring join ORDER_ID --feerate SAT_PER_VB [--node-address HOST:PORT]
 //!         [--poll SECS]                        take a slot of a ring and see it through
@@ -382,6 +383,7 @@ async fn ring(config: &Config, args: &[String]) -> Result<(), String> {
                 announce: !options.switch("private"),
                 // Two days to open, as LN+ rings give; a day to fill.
                 open_window_secs: options.or("window", 172_800u64)?,
+                bond_sat: options.or("bond", 0u64)?,
                 expires_in_secs: options.or("expires-in", 86_400u64)?,
                 node_address: options.take("node-address")?,
                 feerate_sat_vb: options.required("feerate")?,

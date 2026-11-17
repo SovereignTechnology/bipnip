@@ -3,15 +3,17 @@
 
 use std::sync::{Arc, Mutex};
 
-use bipnip_ln::{LightningBackend, OpenRequest};
+use bipnip_ln::{HoldInvoiceRequest, HoldState, LightningBackend, OpenRequest, PaymentState};
+use lightning_invoice::Bolt11Invoice;
+use mostro_core::bond::{BOND_CLAIM_WINDOW_SECS, MAX_BOND_CLTV_DELTA, payout_sat};
 use mostro_core::node_binding::{
     Action as BindingAction, Network, SignedStatement, Statement, sign_ln_message,
 };
 use mostro_core::prelude::{Action, CantDoReason, Message, Payload};
 use mostro_core::ring::{Ring, RingTerms};
 use mostro_core::ring_message::{
-    RingClosed, RingCommit, RingCommitment, RingEdge, RingMessageError, RingOffer, RingOpen,
-    RingPayload, RingRoster, RingSeat,
+    RingClosed, RingCommit, RingCommitment, RingEdge, RingInvoice, RingMessageError, RingOffer,
+    RingOpen, RingPayload, RingRoster, RingSeat,
 };
 use nostr_sdk::prelude::{FinalizeEvent, Keys};
 use uuid::Uuid;
@@ -22,6 +24,8 @@ use crate::ring::run::{JoinRequest, RingRun, RingRunError, RingState};
 use crate::ring_wire::{self, RingIncoming, RingWireError};
 
 const CAPACITY: u64 = 2_000_000;
+/// What every member of a bonded test ring locks.
+const BOND: u64 = 50_000;
 
 /// A node runner: a node and the keys its agent uses.
 struct Member {
@@ -73,6 +77,12 @@ struct Table {
     members: Vec<Member>,
     instance: Keys,
     order_id: Uuid,
+    /// The bond the ring asks of every member; 0 for none.
+    bond_sat: u64,
+    /// The instance's own node, which bond invoices come from.
+    house: Node,
+    /// Whether the members were given the instance's node when they joined.
+    know_house: bool,
 }
 
 impl Table {
@@ -89,12 +99,33 @@ impl Table {
                 trade: Keys::generate(),
             })
             .collect();
+        let house = Node {
+            world: world.clone(),
+            secret: secret(99),
+            network: "regtest",
+        };
         Table {
             world,
             members,
             instance: Keys::generate(),
             order_id: Uuid::new_v4(),
+            bond_sat: 0,
+            house,
+            know_house: true,
         }
+    }
+
+    /// A table whose ring asks every member for a bond.
+    fn bonded(size: u8) -> Self {
+        Table {
+            bond_sat: BOND,
+            ..Table::new(size)
+        }
+    }
+
+    /// What a member is told about the instance's node: only for a ring with a bond.
+    fn instance_node(&self) -> Option<String> {
+        (self.bond_sat > 0 && self.know_house).then(|| self.house.id())
     }
 
     fn terms(&self) -> RingTerms {
@@ -103,7 +134,38 @@ impl Table {
             capacity_sat: CAPACITY,
             announce: true,
             open_window_secs: 48 * 3_600,
+            bond_sat: self.bond_sat,
         }
+    }
+
+    /// A bond invoice for `ring` as the instance would send it: a hold invoice from `node` for
+    /// `amount_sat`, on a hash only the instance has the preimage of.
+    async fn bond_invoice(
+        &self,
+        ring: &Ring,
+        node: &Node,
+        amount_sat: u64,
+        cltv_delta: u32,
+        n: u8,
+    ) -> RingIncoming {
+        let request = HoldInvoiceRequest {
+            payment_hash: format!("{n:02x}").repeat(32),
+            amount_msat: amount_sat * 1_000,
+            expiry_secs: 3_600,
+            cltv_delta,
+            description: "bond".into(),
+        };
+        RingIncoming::BondInvoice {
+            order_id: self.order_id,
+            invoice: RingInvoice {
+                ring_id: ring.id(),
+                invoice: node.add_hold_invoice(&request).await.expect("invoice"),
+            },
+        }
+    }
+
+    fn payments(&self) -> usize {
+        self.world.lock().expect("world").payments.len()
     }
 
     fn offer(&self, slots: u8) -> RingOffer {
@@ -113,6 +175,7 @@ impl Table {
             slots,
             announce: true,
             open_window_secs: 48 * 3_600,
+            bond_sat: self.bond_sat,
             expires_at: NOW + 86_400,
             seat: self.members[0].seat(),
         }
@@ -168,7 +231,8 @@ impl Table {
         let offer = self.offer(slots);
         let instance = self.instance.public_key();
         let mut runs = Vec::new();
-        let (mut creator, first) = RingRun::create(instance, offer.clone(), 1, 7, 2);
+        let (mut creator, first) =
+            RingRun::create(instance, offer.clone(), 1, 7, 2, self.instance_node());
         assert!(first.verify());
         assert_eq!(creator.state(), RingState::Offering);
         let echo = RingIncoming::Offered {
@@ -192,6 +256,7 @@ impl Table {
                 slots,
                 seat: member.seat(),
                 feerate_sat_vb: 2,
+                instance_node: self.instance_node(),
             };
             let seat = request.seat.clone();
             let (mut run, take) = RingRun::join(instance, request);
@@ -429,6 +494,7 @@ async fn a_ring_of_three_completes_and_survives_restarts_on_the_way() {
             closed: RingClosed {
                 ring_id: ring.id(),
                 verified: vec![0, 1, 2],
+                slashed: vec![],
             },
         };
         table.deliver(run, i, closed).await.expect("closed");
@@ -771,6 +837,7 @@ async fn nothing_is_opened_after_the_window_and_a_crash_after_opening_opens_noth
         closed: RingClosed {
             ring_id: ring.id(),
             verified: vec![],
+            slashed: vec![],
         },
     };
     table.deliver(&mut again, 0, closed).await.expect("closed");
@@ -792,7 +859,7 @@ async fn a_ring_can_be_left_while_it_fills_and_refusals_end_what_they_refuse() {
 
     // The echo of someone else's offer is not ours.
     let offer = table.offer(3);
-    let (mut creator, _) = RingRun::create(instance, offer.clone(), 1, 7, 2);
+    let (mut creator, _) = RingRun::create(instance, offer.clone(), 1, 7, 2, None);
     let mut other = offer.clone();
     other.capacity_sat += 1;
     let echo = |offer: RingOffer, request_id: u64| RingIncoming::Offered {
@@ -830,6 +897,7 @@ async fn a_ring_can_be_left_while_it_fills_and_refusals_end_what_they_refuse() {
         slots: 3,
         seat: table.members[1].seat(),
         feerate_sat_vb: 2,
+        instance_node: None,
     };
     let (mut refused, _) = RingRun::join(instance, request(5));
     let refusal = |request_id: u64| RingIncoming::Refused {
@@ -1015,4 +1083,368 @@ async fn ring_runs_are_stored_owner_only_and_refused_when_opened_up() {
     let mut value: serde_json::Value = serde_json::from_str(&good).expect("json");
     value["roster"] = serde_json::Value::Null;
     assert!(RingRun::from_json(&value.to_string()).is_err());
+}
+
+// ---- bonds ---------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_bond_is_paid_once_and_only_to_the_instances_node_for_the_rings_amount() {
+    let table = Table::bonded(3);
+    let (mut runs, ring) = table.committed(&[0, 1, 2]).await;
+    assert_eq!(ring.terms.bond_sat, BOND);
+    let node = &table.members[0].node;
+    let mut run = runs.remove(0);
+    assert_eq!(run.bond_status(), "awaited");
+    // No invoice yet: a look at the node pays nothing.
+    assert!(run.tick(node, NOW).await.expect("tick").is_empty());
+    assert_eq!(table.payments(), 0);
+
+    // Invoices that are not the ring's bond to the instance's node are never kept, so never paid.
+    let stranger = Node {
+        world: table.world.clone(),
+        secret: secret(42),
+        network: "regtest",
+    };
+    let house = &table.house;
+    let wrong = [
+        (
+            "another node",
+            table.bond_invoice(&ring, &stranger, BOND, 300, 1).await,
+        ),
+        (
+            "a larger amount",
+            table.bond_invoice(&ring, house, BOND + 1, 300, 2).await,
+        ),
+        (
+            "a smaller amount",
+            table.bond_invoice(&ring, house, BOND - 1, 300, 3).await,
+        ),
+        (
+            "too long a lock",
+            table
+                .bond_invoice(&ring, house, BOND, MAX_BOND_CLTV_DELTA + 1, 4)
+                .await,
+        ),
+    ];
+    for (what, incoming) in wrong {
+        let refused = table.deliver(&mut run, 0, incoming).await;
+        assert!(
+            matches!(refused, Err(RingRunError::Bond(_))),
+            "{what}: {refused:?}"
+        );
+        assert!(run.bond().is_none(), "{what}");
+    }
+    let good = table.bond_invoice(&ring, house, BOND, 300, 5).await;
+    let RingIncoming::BondInvoice { invoice, .. } = &good else {
+        panic!("not a bond invoice");
+    };
+    // For another ring, and after it expired.
+    let elsewhere = RingIncoming::BondInvoice {
+        order_id: table.order_id,
+        invoice: RingInvoice {
+            ring_id: "ef".repeat(32),
+            invoice: invoice.invoice.clone(),
+        },
+    };
+    let refused = table.deliver(&mut run, 0, elsewhere).await;
+    assert!(matches!(refused, Err(RingRunError::NotOurRing(_))));
+    let late = run
+        .on_message(
+            good.clone(),
+            &table.instance.public_key(),
+            &table.members[0].identity,
+            node,
+            NOW + 3_600,
+        )
+        .await;
+    assert!(matches!(late, Err(RingRunError::Bond(_))), "{late:?}");
+    // From someone who is not the instance.
+    let forged = run
+        .on_message(
+            good.clone(),
+            &Keys::generate().public_key(),
+            &table.members[0].identity,
+            node,
+            NOW,
+        )
+        .await;
+    assert!(matches!(forged, Err(RingRunError::Sender)));
+    assert!(run.bond().is_none());
+    assert!(run.tick(node, NOW).await.expect("tick").is_empty());
+    assert_eq!(table.payments(), 0);
+
+    // The real one is kept, and paid only on the next look at the node.
+    assert!(
+        table
+            .deliver(&mut run, 0, good.clone())
+            .await
+            .expect("bond invoice")
+            .is_empty()
+    );
+    assert_eq!(run.bond_status(), "checked");
+    assert_eq!(table.payments(), 0);
+    let hash = run.bond().expect("bond").payment_hash.clone();
+    assert_eq!(hash, "05".repeat(32));
+    let before_paying = run.to_json().expect("json");
+    let mut run = restarted(run);
+    assert!(run.tick(node, NOW).await.expect("tick").is_empty());
+    assert_eq!(run.bond_status(), "sent");
+    {
+        let world = table.world.lock().expect("world");
+        assert_eq!(world.invoices.get(&hash), Some(&HoldState::Accepted));
+        assert_eq!(world.payments.get(&hash), Some(&PaymentState::InFlight));
+        assert_eq!(world.payments.len(), 1);
+    }
+    // More looks, the same invoice again, a restart: one payment.
+    assert!(run.tick(node, NOW).await.expect("tick").is_empty());
+    assert!(
+        table
+            .deliver(&mut run, 0, good.clone())
+            .await
+            .expect("again")
+            .is_empty()
+    );
+    let mut run = restarted(run);
+    assert!(run.tick(node, NOW).await.expect("tick").is_empty());
+    assert_eq!(table.payments(), 1);
+    // A second, different invoice is not taken.
+    let second = table.bond_invoice(&ring, house, BOND, 300, 6).await;
+    let refused = table.deliver(&mut run, 0, second).await;
+    assert!(matches!(refused, Err(RingRunError::OutOfOrder(_))));
+    assert_eq!(table.payments(), 1);
+
+    // A run that stopped after paying and before it was saved finds its payment on the node.
+    let mut crashed = RingRun::from_json(&before_paying).expect("the stored run");
+    assert_eq!(crashed.bond_status(), "checked");
+    assert!(crashed.tick(node, NOW).await.expect("tick").is_empty());
+    assert_eq!(crashed.bond_status(), "sent");
+    assert_eq!(table.payments(), 1);
+
+    // With every bond locked the instance sends the commits, and the ring goes on as any other.
+    let open = RingIncoming::Open {
+        order_id: table.order_id,
+        open: table.open(&[0, 1, 2], &ring),
+    };
+    assert!(
+        table
+            .deliver(&mut run, 0, open)
+            .await
+            .expect("open")
+            .is_empty()
+    );
+    assert_eq!(run.state(), RingState::Open);
+}
+
+#[tokio::test]
+async fn a_ring_with_a_bond_gets_no_commit_when_the_instances_node_is_not_known() {
+    let mut table = Table::bonded(3);
+    table.know_house = false;
+    let mut runs = table.seated().await;
+    let roster = RingIncoming::Roster {
+        order_id: table.order_id,
+        roster: table.roster(&[0, 1, 2]),
+    };
+    let refused = table.deliver(&mut runs[0], 0, roster).await;
+    assert!(
+        matches!(refused, Err(RingRunError::NotOurRing(_))),
+        "{refused:?}"
+    );
+    assert_eq!(runs[0].state(), RingState::Seated);
+
+    // A bond the roster names that the order did not: the terms differ, so no commit either.
+    let plain = Table::new(3);
+    let mut runs = plain.seated().await;
+    let mut terms = plain.terms();
+    terms.bond_sat = BOND;
+    let seats = plain.members.iter().map(Member::seat).collect();
+    let roster = RingIncoming::Roster {
+        order_id: plain.order_id,
+        roster: RingRoster::from_seats(terms, seats, NOW).expect("roster"),
+    };
+    for (i, run) in runs.iter_mut().enumerate() {
+        let refused = plain.deliver(run, i, roster.clone()).await;
+        assert!(refused.is_err(), "member {i}: {refused:?}");
+        assert_eq!(run.state(), RingState::Seated);
+    }
+}
+
+#[tokio::test]
+async fn a_bonded_ring_canceled_after_the_commits_ends_the_run_and_a_plain_one_is_not() {
+    let table = Table::bonded(3);
+    let (mut runs, _) = table.committed(&[0, 1, 2]).await;
+    let canceled = RingIncoming::Canceled {
+        order_id: table.order_id,
+    };
+    assert!(
+        table
+            .deliver(&mut runs[0], 0, canceled.clone())
+            .await
+            .expect("canceled")
+            .is_empty()
+    );
+    assert_eq!(runs[0].state(), RingState::Canceled);
+    assert!(runs[0].finished());
+
+    // Without a bond nothing can cancel a ring once its roster is fixed.
+    let plain = Table::new(3);
+    let (mut runs, _) = plain.committed(&[0, 1, 2]).await;
+    let canceled = RingIncoming::Canceled {
+        order_id: plain.order_id,
+    };
+    let refused = plain.deliver(&mut runs[0], 0, canceled).await;
+    assert!(matches!(refused, Err(RingRunError::OutOfOrder(_))));
+    assert_eq!(runs[0].state(), RingState::Committed);
+}
+
+/// The invoice in a bond claim a run sent.
+fn claimed_invoice(out: &[Message], ring: &Ring) -> String {
+    let [message] = out else {
+        panic!("expected one claim, got {out:?}");
+    };
+    assert!(message.verify());
+    let kind = message.get_inner_message_kind();
+    assert_eq!(kind.action, Action::RingBondClaim);
+    let Some(Payload::Ring(RingPayload::Invoice(claim))) = &kind.payload else {
+        panic!("not a claim");
+    };
+    assert_eq!(claim.ring_id, ring.id());
+    claim.invoice.clone()
+}
+
+#[tokio::test]
+async fn a_member_owed_a_bond_claims_the_exact_payout_and_sees_it_paid_on_its_own_node() {
+    let table = Table::bonded(3);
+    let (mut runs, ring) = table.opened(&[0, 1, 2]).await;
+    // The window ended; member 2 never opened to member 0 and lost its bond.
+    let closed = RingIncoming::Closed {
+        order_id: table.order_id,
+        closed: RingClosed {
+            ring_id: ring.id(),
+            verified: vec![0],
+            slashed: vec![2],
+        },
+    };
+    for (i, run) in runs.iter_mut().enumerate() {
+        table.deliver(run, i, closed.clone()).await.expect("closed");
+        assert_eq!(run.state(), RingState::Partial);
+        assert_eq!(run.reported_slashed(), &[2]);
+    }
+    // Only member 0 is owed, and only its run has more to do.
+    assert_eq!(runs[0].owed_status(), "owed");
+    assert!(!runs[0].finished());
+    for (i, run) in runs.iter_mut().enumerate().skip(1) {
+        assert_eq!(run.owed_status(), "-");
+        assert!(run.finished());
+        let node = &table.members[i].node;
+        assert!(run.tick(node, NOW).await.expect("tick").is_empty());
+    }
+
+    let node = &table.members[0].node;
+    let mut run = restarted(runs.remove(0));
+    let out = run.tick(node, NOW).await.expect("tick");
+    let invoice = claimed_invoice(&out, &ring);
+    let parsed: Bolt11Invoice = invoice.parse().expect("an invoice");
+    assert_eq!(
+        parsed.amount_milli_satoshis(),
+        Some(payout_sat(BOND) * 1_000)
+    );
+    assert_eq!(parsed.get_payee_pub_key().to_string(), node.id());
+    assert_eq!(run.owed_status(), "claimed");
+    // Not paid yet: nothing more is sent, also after a restart.
+    let mut run = restarted(run);
+    assert!(run.tick(node, NOW + 30).await.expect("tick").is_empty());
+    assert!(!run.finished());
+
+    // The instance refuses the claim (it has not settled the bond yet): a new one goes out, but
+    // not at once.
+    let refusal = RingIncoming::Refused {
+        order_id: Some(table.order_id),
+        request_id: None,
+        reason: Some(CantDoReason::NotAllowedByStatus),
+    };
+    let refused = table.deliver(&mut run, 0, refusal).await;
+    assert!(matches!(refused, Err(RingRunError::Refused(_))));
+    assert_eq!(run.owed_status(), "owed");
+    assert!(run.tick(node, NOW + 30).await.expect("tick").is_empty());
+    let out = run.tick(node, NOW + 61).await.expect("tick");
+    let second = claimed_invoice(&out, &ring);
+    assert_ne!(second, invoice);
+
+    // An invoice that expires unpaid is replaced too.
+    assert!(
+        run.tick(node, NOW + 61 + 3_600)
+            .await
+            .expect("tick")
+            .is_empty()
+    );
+    assert_eq!(run.owed_status(), "owed");
+    let out = run.tick(node, NOW + 61 + 3_601).await.expect("tick");
+    let third = claimed_invoice(&out, &ring);
+    assert_ne!(third, second);
+
+    // The instance pays it: our own node says so, and the run is done.
+    table
+        .house
+        .pay_invoice(&third, 0, 0)
+        .await
+        .expect("the payout");
+    assert!(
+        run.tick(node, NOW + 61 + 3_700)
+            .await
+            .expect("tick")
+            .is_empty()
+    );
+    assert_eq!(run.owed_status(), "paid");
+    assert!(run.finished());
+    let mut run = restarted(run);
+    assert!(
+        run.tick(node, NOW + 61 + 3_800)
+            .await
+            .expect("tick")
+            .is_empty()
+    );
+    assert!(run.finished());
+}
+
+#[tokio::test]
+async fn a_bond_that_is_never_paid_out_stops_being_claimed_after_the_claim_window() {
+    let table = Table::bonded(2);
+    let (mut runs, ring) = table.opened(&[0, 1]).await;
+    let closed = RingIncoming::Closed {
+        order_id: table.order_id,
+        closed: RingClosed {
+            ring_id: ring.id(),
+            verified: vec![0],
+            slashed: vec![1],
+        },
+    };
+    table
+        .deliver(&mut runs[0], 0, closed)
+        .await
+        .expect("closed");
+    let node = &table.members[0].node;
+    let run = &mut runs[0];
+    let out = run.tick(node, NOW).await.expect("tick");
+    claimed_invoice(&out, &ring);
+    // The claim expires; past the window no new one is made and the run ends.
+    let end = NOW + BOND_CLAIM_WINDOW_SECS;
+    assert!(run.tick(node, end).await.expect("tick").is_empty());
+    assert!(run.tick(node, end).await.expect("tick").is_empty());
+    assert_eq!(run.owed_status(), "-");
+    assert!(run.finished());
+
+    // A closing report that takes a bond in a ring without bonds is refused.
+    let plain = Table::new(2);
+    let (mut runs, ring) = plain.opened(&[0, 1]).await;
+    let closed = RingIncoming::Closed {
+        order_id: plain.order_id,
+        closed: RingClosed {
+            ring_id: ring.id(),
+            verified: vec![0],
+            slashed: vec![1],
+        },
+    };
+    let refused = plain.deliver(&mut runs[0], 0, closed).await;
+    assert!(refused.is_err(), "{refused:?}");
+    assert_eq!(runs[0].state(), RingState::Open);
 }

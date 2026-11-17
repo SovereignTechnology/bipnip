@@ -60,6 +60,16 @@ pub struct LndConfig {
     pub macaroon: PathBuf,
 }
 
+/// Limits on what the agent does with the node's money without being asked again.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyConfig {
+    /// The largest ring bond the agent will lock at an instance, in satoshi. 0, the default,
+    /// means it joins no ring that asks for a bond.
+    #[serde(default)]
+    pub max_bond_sat: u64,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Raw {
@@ -69,6 +79,8 @@ struct Raw {
     relays: Vec<String>,
     lnd: Option<LndConfig>,
     instance: Option<RawInstance>,
+    #[serde(default)]
+    policy: PolicyConfig,
 }
 
 /// The parsed, checked configuration.
@@ -84,6 +96,8 @@ pub struct Config {
     pub lnd: Option<LndConfig>,
     /// The instance leases run on, if one is configured.
     pub instance: Option<InstanceConfig>,
+    /// Spending limits.
+    pub policy: PolicyConfig,
 }
 
 impl Config {
@@ -138,6 +152,7 @@ impl Config {
             relays: raw.relays,
             lnd: raw.lnd,
             instance,
+            policy: raw.policy,
         })
     }
 
@@ -179,6 +194,16 @@ macaroon = "/tmp/a.macaroon"
         assert_eq!(c.relays.len(), 2);
         assert_eq!(c.mnemonic_path(), PathBuf::from("/tmp/bipnip/mnemonic"));
         assert_eq!(c.lnd.expect("lnd").address, "https://127.0.0.1:10009");
+    }
+
+    #[test]
+    fn no_bond_is_locked_unless_the_config_sets_a_limit() {
+        let c = Config::parse(GOOD).expect("parses");
+        assert_eq!(c.policy.max_bond_sat, 0);
+        let c =
+            Config::parse(&format!("{GOOD}\n[policy]\nmax_bond_sat = 50000\n")).expect("parses");
+        assert_eq!(c.policy.max_bond_sat, 50_000);
+        assert!(Config::parse(&format!("{GOOD}\n[policy]\nmax_bond = 1\n")).is_err());
     }
 
     #[test]

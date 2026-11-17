@@ -76,7 +76,7 @@ for n in alice bob; do
     --bitcoind.rpchost=127.0.0.1:18443 --bitcoind.rpcuser=itest --bitcoind.rpcpass=itest \
     --bitcoind.zmqpubrawblock=tcp://127.0.0.1:28332 --bitcoind.zmqpubrawtx=tcp://127.0.0.1:28333 \
     --noseedbackup --rpclisten=127.0.0.1:${RPC[$n]} --restlisten=127.0.0.1:${REST[$n]} \
-    --listen=127.0.0.1:${P2P[$n]} --alias="$n" > "$W/$n/lnd.log" 2>&1 &
+    --listen=127.0.0.1:${P2P[$n]} --alias="$n" --trickledelay=1000 > "$W/$n/lnd.log" 2>&1 &
 done
 lnc() { local n=$1; shift; lncli --lnddir="$W/$n" --network=regtest --rpcserver=127.0.0.1:${RPC[$n]} "$@"; }
 synced() { [ "$(lnc "$1" getinfo | jget synced_to_chain)" = "True" ]; }
@@ -189,7 +189,7 @@ lnd --lnddir="$W/carol" --bitcoin.regtest --bitcoin.node=bitcoind \
   --bitcoind.rpchost=127.0.0.1:18443 --bitcoind.rpcuser=itest --bitcoind.rpcpass=itest \
   --bitcoind.zmqpubrawblock=tcp://127.0.0.1:28332 --bitcoind.zmqpubrawtx=tcp://127.0.0.1:28333 \
   --noseedbackup --rpclisten=127.0.0.1:${RPC[carol]} --restlisten=127.0.0.1:${REST[carol]} \
-  --listen=127.0.0.1:${P2P[carol]} --alias=carol > "$W/carol/lnd.log" 2>&1 &
+  --listen=127.0.0.1:${P2P[carol]} --alias=carol --trickledelay=1000 > "$W/carol/lnd.log" 2>&1 &
 wait_until 120 synced carol || { log "carol did not sync"; tail -20 "$W/carol/lnd.log"; exit 1; }
 
 log "instance: settings and start"
@@ -213,6 +213,8 @@ values = {
 for key, value in values.items():
     text, n = re.subn(rf"(?m)^{key} = .*$", f"{key} = {value}", text)
     assert n == 1, (key, n)
+# This instance takes ring bonds: its node (carol) holds them.
+text += "\n[liquidity]\nbonds = true\nmax_bond_sat = 100000\n"
 open(sys.argv[2], "w").write(text)
 PY
 chmod 600 "$W/instance/settings.toml"
@@ -391,6 +393,143 @@ rows = db.execute("SELECT position, commit_sig, edge_txid, edge_verified FROM ri
 assert [r[0] for r in rows] == [0, 1, 2], rows
 assert all(r[1] and r[2] and r[3] == 1 for r in rows), rows
 PY
-kill "$INSTANCE_PID"
 
 log "INSTANCE RING E2E PASS: a ring of three through a real bipnipd: slots, roster, commits, three channels opened and confirmed"
+
+# --- rings with bonds: the instance's node (carol) holds each member's bond ----------------------
+BOND=20000
+PAYOUT=19800   # the bond less the 1% routing reserve
+bond_dump() {
+  for f in "$W"/bond-*.out "$W"/bond-*.err; do [ -s "$f" ] && sed "s|^|  $(basename "$f"): |" "$f"; done
+  instance_log 120
+}
+log "bonds: the instance published its node binding; alice and bob may lock up to 50000 sat"
+wait_until 60 grep -q "node binding is published" "$W/instance/mostrod.log" \
+  || { instance_log; fail "the instance did not publish its node binding"; }
+for n in alice bob; do printf '\n[policy]\nmax_bond_sat = 50000\n' >> "$W/$n.toml"; done
+# A bond travels over the ring channels just opened: every node must know all three.
+"$W/mine.sh" 6
+ring_channels_known() {
+  for n in alice bob carol; do
+    [ "$(lnc "$n" describegraph | python3 -c 'import json,sys; print(sum(1 for e in json.load(sys.stdin)["edges"] if e["capacity"] == "314159"))')" = 3 ] || return 1
+  done
+}
+wait_until 180 ring_channels_known || { bond_dump; fail "the ring channels did not reach every node's graph"; }
+order_of() { grep -m1 "state=seated" "$1" | sed 's/.*order=\([^ ]*\).*/\1/'; }
+# value state pairs of a node's invoices or payments of one amount, sorted
+invoices_of() { lnc "$1" listinvoices | python3 -c 'import json,sys; print(sorted(i["state"] for i in json.load(sys.stdin)["invoices"] if i["value"] == sys.argv[1]))' "$2"; }
+payments_of() { lnc "$1" listpayments --include_incomplete | python3 -c 'import json,sys; print(sorted(p["status"] for p in json.load(sys.stdin)["payments"] if p["value_sat"] == sys.argv[1]))' "$2"; }
+
+log "bonded ring: alice proposes two 271828 sat channels with a $BOND sat bond"
+"$AGENT" --config "$W/alice.toml" ring create --capacity 271828 --slots 2 --feerate 2 --bond "$BOND" \
+  --window 900 --expires-in 3600 --node-address "127.0.0.1:${P2P[alice]}" --poll 2 \
+  > "$W/bond-a-alice.out" 2> "$W/bond-a-alice.err" &
+BOND_PIDS=($!)
+wait_until 90 grep -q "state=seated" "$W/bond-a-alice.out" || { bond_dump; fail "the bonded ring was not stored by the instance"; }
+RING_A=$(order_of "$W/bond-a-alice.out")
+log "bonded ring: carol's agent has no bond limit and refuses to join; bob joins"
+if "$AGENT" --config "$W/carol.toml" ring join "$RING_A" --feerate 2 > "$W/bond-a-carol.out" 2> "$W/bond-a-carol.err"; then
+  bond_dump; fail "an agent with no bond limit joined a ring with a bond"
+fi
+cat "$W/bond-a-carol.out" "$W/bond-a-carol.err" | grep -q "locks at most 0" || { bond_dump; fail "carol's refusal does not name its limit"; }
+"$AGENT" --config "$W/bob.toml" ring join "$RING_A" --feerate 2 \
+  --node-address "127.0.0.1:${P2P[bob]}" --poll 2 > "$W/bond-a-bob.out" 2> "$W/bond-a-bob.err" &
+BOND_PIDS+=($!)
+bonded_done() { for n in alice bob; do grep -q "state=success" "$W/bond-a-$n.out" || return 1; done; }
+t=0
+until bonded_done; do
+  for n in alice bob; do
+    grep -q "state=partial\|state=canceled" "$W/bond-a-$n.out" && { bond_dump; fail "the bonded ring ended early for $n"; }
+  done
+  "$W/mine.sh" 1; sleep 2; t=$((t+1))
+  [ "$t" -lt 120 ] || { bond_dump; fail "the bonded ring did not complete"; }
+done
+for pid in "${BOND_PIDS[@]}"; do wait "$pid" || fail "a ring agent exited with an error"; done
+log "bonded ring: both bonds were locked before anyone opened, and both came back"
+for n in alice bob; do
+  # The first line that shows a channel of ours comes after the line that shows our bond paid.
+  python3 - "$W/bond-a-$n.out" <<'PY' || { bond_dump; fail "$n opened before its bond was paid"; }
+import sys
+lines = open(sys.argv[1]).read().splitlines()
+paid = next(i for i, line in enumerate(lines) if " bond=sent " in line)
+opened = next(i for i, line in enumerate(lines) if " opened=" in line and " opened=- " not in line)
+assert paid < opened, (paid, opened)
+PY
+done
+python3 - "$W/instance/mostro.db" "$RING_A" "$BOND" <<'PY' || { bond_dump; fail "the instance's record of the returned bonds is wrong"; }
+import sqlite3, sys
+db = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+assert db.execute("SELECT status FROM ring_offers WHERE id = ?", (sys.argv[2],)).fetchone() == ("success",)
+rows = db.execute("SELECT state, node_done, amount_sat FROM liquidity_bonds WHERE kind = 'ring' AND order_id = ?", (sys.argv[2],)).fetchall()
+assert sorted(rows) == [("released", 1, int(sys.argv[3]))] * 2, rows
+PY
+bonds_back() {
+  [ "$(invoices_of carol "$BOND")" = "['CANCELED', 'CANCELED']" ] || return 1
+  for n in alice bob; do [ "$(payments_of "$n" "$BOND")" = "['FAILED']" ] || return 1; done
+}
+wait_until 60 bonds_back || { invoices_of carol "$BOND"; payments_of alice "$BOND"; payments_of bob "$BOND"; bond_dump; fail "a bond did not come back"; }
+
+log "bonded ring: bob proposes another (161803 sat, 180 s to open); alice joins; bob's agent stops once its bond is paid"
+"$AGENT" --config "$W/bob.toml" ring create --capacity 161803 --slots 2 --feerate 2 --bond "$BOND" \
+  --window 180 --expires-in 3600 --node-address "127.0.0.1:${P2P[bob]}" --poll 2 \
+  > "$W/bond-b-bob.out" 2> "$W/bond-b-bob.err" &
+BOB_PID=$!
+wait_until 90 grep -q "state=seated" "$W/bond-b-bob.out" || { bond_dump; fail "the second bonded ring was not stored by the instance"; }
+RING_B=$(order_of "$W/bond-b-bob.out")
+"$AGENT" --config "$W/alice.toml" ring join "$RING_B" --feerate 2 \
+  --node-address "127.0.0.1:${P2P[alice]}" --poll 2 > "$W/bond-b-alice.out" 2> "$W/bond-b-alice.err" &
+ALICE_PID=$!
+t=0
+until grep -q " bond=sent " "$W/bond-b-bob.out"; do
+  sleep 0.2; t=$((t+1))
+  [ "$t" -lt 600 ] || { bond_dump; fail "bob never paid its bond"; }
+done
+kill "$BOB_PID"; wait "$BOB_PID" 2>/dev/null || true
+grep -q "state=open" "$W/bond-b-bob.out" && { bond_dump; fail "bob's agent saw the ring open before it was stopped"; }
+# Alice opens; her channel needs six confirmations to be announced. No more blocks than that: the
+# bonds are payments held against a block height.
+t=0
+until grep -q " owed-bond=paid " "$W/bond-b-alice.out"; do
+  grep -q "state=success\|state=canceled" "$W/bond-b-alice.out" && { bond_dump; fail "the ring did not end with a channel missing"; }
+  if grep -q " opened=[0-9a-f]" "$W/bond-b-alice.out" && [ "${MINED:-0}" -lt 8 ]; then "$W/mine.sh" 1; MINED=$(( ${MINED:-0} + 1 )); fi
+  sleep 2; t=$((t+1))
+  [ "$t" -lt 240 ] || { bond_dump; fail "alice was not paid the bond bob lost"; }
+done
+wait "$ALICE_PID" || fail "alice's agent exited with an error"
+tail -1 "$W/bond-b-alice.out" | sed 's/^/  alice: /'
+
+log "bonded ring: alice's channel stands and her bond came back; bob's bond was paid on to her"
+"$AGENT" --config "$W/alice.toml" ring list | grep "^ring order=$RING_B state=partial " | grep -q " owed-bond=paid " \
+  || fail "alice's stored ring does not show the bond paid"
+lnc alice listchannels | python3 -c '
+import json, sys
+ring = [c for c in json.load(sys.stdin)["channels"] if c["capacity"] == "161803"]
+assert len(ring) == 1 and ring[0]["initiator"] and ring[0]["active"], ring
+' || fail "alice does not have exactly the one channel she opened"
+python3 - "$W/instance/mostro.db" "$RING_B" <<'PY' || { bond_dump; fail "the instance's record of the taken bond is wrong"; }
+import sqlite3, sys
+db = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+assert db.execute("SELECT status FROM ring_offers WHERE id = ?", (sys.argv[2],)).fetchone() == ("partial",)
+rows = db.execute("SELECT state, node_done, payer_identity, recipient_identity FROM liquidity_bonds WHERE kind = 'ring' AND order_id = ? ORDER BY state", (sys.argv[2],)).fetchall()
+assert [r[0] for r in rows] == ["paid", "released"] and all(r[1] == 1 for r in rows), rows
+# The bond that was taken is owed to the other member, the one that kept its own.
+assert rows[0][3] == rows[1][2] and rows[1][3] is None, rows
+PY
+# On the nodes: alice's bond payment failed (it came back) and bob's succeeded (it was taken);
+# alice was paid the payout; the instance's node paid it once and kept no more than the reserve.
+[ "$(payments_of alice "$BOND")" = "['FAILED', 'FAILED']" ] || { payments_of alice "$BOND"; fail "alice's second bond did not come back"; }
+[ "$(payments_of bob "$BOND")" = "['FAILED', 'SUCCEEDED']" ] || { payments_of bob "$BOND"; fail "bob's second bond was not taken"; }
+[ "$(invoices_of alice "$PAYOUT")" = "['SETTLED']" ] || { invoices_of alice "$PAYOUT"; fail "alice was not paid exactly the payout"; }
+[ "$(invoices_of carol "$BOND")" = "['CANCELED', 'CANCELED', 'CANCELED', 'SETTLED']" ] || { invoices_of carol "$BOND"; fail "the instance's node did not settle exactly one bond"; }
+lnc carol listpayments --include_incomplete | python3 -c '
+import json, sys
+bond, payout = int(sys.argv[1]), int(sys.argv[2])
+paid = [p for p in json.load(sys.stdin)["payments"] if p["status"] == "SUCCEEDED"]
+assert len(paid) == 1 and int(paid[0]["value_sat"]) == payout, paid
+fee = int(paid[0]["fee_sat"])
+assert 0 <= fee <= bond - payout, fee
+print(f"  the instance took {bond}, paid on {payout} plus a routing fee of {fee}, and kept {bond - payout - fee}")
+' "$BOND" "$PAYOUT" || fail "the instance's node paid out something other than the one payout"
+kill "$INSTANCE_PID"
+
+log "INSTANCE BOND E2E PASS: two rings with bonds through a real bipnipd: bonds locked before anyone opened and returned when both opened; with one member gone after paying, the other's channel stood, its bond came back, and the missing member's bond was taken and paid on to it"
