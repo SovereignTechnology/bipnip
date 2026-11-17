@@ -30,7 +30,8 @@
 //!
 //! A run that stops after opening its channel and before it is saved finds that channel on its
 //! node again (it was not there when the roster was checked) and reports it instead of opening
-//! another. Not here yet: sending again what a relay did not take.
+//! another. A message no relay took is kept with the run and sent again
+//! ([`crate::ring::link`]).
 
 use bipnip_ln::{HoldState, LightningBackend, OpenRequest};
 use mostro_core::bond::{BOND_CLAIM_WINDOW_SECS, payout_sat};
@@ -187,6 +188,8 @@ pub struct RingRun {
     closed_at: Option<u64>,
     claim: Option<BondClaim>,
     claim_not_before: u64,
+    /// Messages for the instance that no relay has taken yet, oldest first.
+    unsent: Vec<Message>,
     waiting_on: Option<String>,
 }
 
@@ -232,6 +235,9 @@ struct RingRecord {
     claim: Option<BondClaim>,
     #[serde(default)]
     claim_not_before: u64,
+    /// The messages still owed to the instance, as JSON, oldest first.
+    #[serde(default)]
+    unsent: Vec<String>,
 }
 
 const RECORD_VERSION: u8 = 1;
@@ -289,6 +295,7 @@ impl RingRun {
             closed_at: None,
             claim: None,
             claim_not_before: 0,
+            unsent: Vec::new(),
             waiting_on: None,
         }
     }
@@ -335,6 +342,17 @@ impl RingRun {
         run.state = RingState::Joining;
         run.instance_node = request.instance_node;
         (run, message)
+    }
+
+    /// The messages for the instance that no relay has taken yet, oldest first. Stored with
+    /// the run, so what is owed survives a restart.
+    pub fn unsent(&self) -> &[Message] {
+        &self.unsent
+    }
+
+    /// Records which messages are still owed to the instance.
+    pub fn set_unsent(&mut self, messages: Vec<Message>) {
+        self.unsent = messages;
     }
 
     /// The ring's terms: what the order showed, and what the roster is held to.
@@ -488,6 +506,12 @@ impl RingRun {
             closed_at: self.closed_at,
             claim: self.claim.clone(),
             claim_not_before: self.claim_not_before,
+            unsent: self
+                .unsent
+                .iter()
+                .map(Message::as_json)
+                .collect::<Result<_, _>>()
+                .map_err(|_| corrupt("a message that is owed"))?,
         };
         serde_json::to_string(&record).map_err(|e| StoreError::Corrupt(e.to_string()))
     }
@@ -558,6 +582,13 @@ impl RingRun {
             closed_at: record.closed_at,
             claim: record.claim,
             claim_not_before: record.claim_not_before,
+            unsent: record
+                .unsent
+                .iter()
+                .map(String::as_str)
+                .map(Message::from_json)
+                .collect::<Result<_, _>>()
+                .map_err(|_| corrupt("a message that is owed"))?,
             waiting_on: None,
         })
     }

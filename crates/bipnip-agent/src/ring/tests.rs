@@ -1448,3 +1448,93 @@ async fn a_bond_that_is_never_paid_out_stops_being_claimed_after_the_claim_windo
     assert!(refused.is_err(), "{refused:?}");
     assert_eq!(runs[0].state(), RingState::Open);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_message_no_relay_took_is_kept_and_sent_by_a_later_step() {
+    use std::time::Duration;
+
+    use mostro_core::prelude::unwrap_message_nip44;
+    use nostr_sdk::local_relay::MockRelay;
+    use nostr_sdk::prelude::{Client, Filter, Kind};
+
+    use crate::lease::link::Link;
+    use crate::relay::connected;
+    use crate::ring::link::{launch, step};
+    use crate::ring::store::RingStore;
+
+    let dir = std::env::temp_dir().join(format!("bipnip-ring-owed-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let store = RingStore::open(&dir).expect("store");
+    let table = Table::new(2);
+    let member = &table.members[0];
+    let instance = table.instance.public_key();
+    let (mut run, first) = RingRun::create(instance, table.offer(2), 1, 7, 2, None);
+
+    // A link whose connection has no relay: nothing it sends is taken.
+    let mut dead = Link::shared(
+        Client::default(),
+        member.identity.clone(),
+        member.trade.clone(),
+        instance,
+        0,
+    );
+    let report = launch(&mut run, &first, &dead, &store)
+        .await
+        .expect("launch");
+    assert_eq!(report.sent, 0);
+    assert_eq!(run.unsent().len(), 1);
+    // What is owed is on disk: it survives a restart.
+    assert_eq!(store.load().expect("load").runs[0].unsent().len(), 1);
+    // Still no relay: still owed, and owed once.
+    let report = step(&mut run, &mut dead, &member.node, &store, NOW)
+        .await
+        .expect("step");
+    assert_eq!(report.sent, 0);
+    assert_eq!(run.unsent().len(), 1);
+
+    // With a relay, the next step sends it before anything else.
+    let relay = MockRelay::run().await.expect("relay");
+    let relays = vec![relay.url().await.to_string()];
+    let mut live = Link::connect(
+        &relays,
+        member.identity.clone(),
+        member.trade.clone(),
+        instance,
+        0,
+        0,
+    )
+    .await
+    .expect("link");
+    let report = step(&mut run, &mut live, &member.node, &store, NOW)
+        .await
+        .expect("step");
+    assert_eq!(report.sent, 1);
+    assert!(run.unsent().is_empty());
+    assert!(store.load().expect("load").runs[0].unsent().is_empty());
+    // A step with nothing owed sends nothing more.
+    let report = step(&mut run, &mut live, &member.node, &store, NOW)
+        .await
+        .expect("step");
+    assert_eq!(report.sent, 0);
+
+    // The instance finds the offer, once.
+    let client = connected(&relays).await.expect("connect");
+    let events = client
+        .fetch_events(
+            Filter::new()
+                .kind(Kind::PrivateDirectMessage)
+                .pubkey(instance),
+        )
+        .timeout(Duration::from_secs(5))
+        .await
+        .expect("fetch");
+    assert_eq!(events.len(), 1);
+    let opened = unwrap_message_nip44(events.first().expect("one event"), &table.instance)
+        .expect("unwrap")
+        .expect("for the instance");
+    assert_eq!(
+        opened.message.get_inner_message_kind().action,
+        Action::RingOffer
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -76,14 +76,15 @@ async fn own_seat(
     Ok(seat)
 }
 
-fn note_unsent(report: &StepReport, what: &str) -> Result<(), String> {
+/// Says so when a first message reached no relay. The run is stored as owing it, and the loop
+/// that follows sends it again.
+fn note_unsent(report: &StepReport, what: &str) {
     if report.sent == 0 {
-        return Err(format!(
-            "{what} was not sent: {}",
+        eprintln!(
+            "note: {what} reached no relay yet and will be sent again ({})",
             report.problems.join("; ")
-        ));
+        );
     }
-    Ok(())
 }
 
 /// For a ring or a lease with a bond: checks the bond against our own limit and finds the node
@@ -118,12 +119,12 @@ pub async fn create(
     session: &Session<'_>,
     params: CreateParams,
 ) -> Result<(RingRun, Link), String> {
-    let (ring, first, link) = prepare_create(session, params).await?;
+    let (mut ring, first, link) = prepare_create(session, params).await?;
     let store = store(session.config)?;
-    let report = launch(&ring, &first, &link, &store)
+    let report = launch(&mut ring, &first, &link, &store)
         .await
         .map_err(|e| e.to_string())?;
-    note_unsent(&report, "the ring")?;
+    note_unsent(&report, "the ring");
     Ok((ring, link))
 }
 
@@ -170,12 +171,12 @@ pub async fn prepare_create(
 /// must be open, signed by the instance and on our network; the terms and size it shows are
 /// what the roster is later held to. Returns the run and its link, to drive with [`run`].
 pub async fn join(session: &Session<'_>, params: JoinParams) -> Result<(RingRun, Link), String> {
-    let (ring, first, link) = prepare_join(session, params).await?;
+    let (mut ring, first, link) = prepare_join(session, params).await?;
     let store = store(session.config)?;
-    let report = launch(&ring, &first, &link, &store)
+    let report = launch(&mut ring, &first, &link, &store)
         .await
         .map_err(|e| e.to_string())?;
-    note_unsent(&report, "the take")?;
+    note_unsent(&report, "the take");
     Ok((ring, link))
 }
 
