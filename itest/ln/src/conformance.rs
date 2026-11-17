@@ -284,6 +284,14 @@ async fn main() {
             .is_ok_and(|c| c.iter().any(|c| c.active))
     })
     .await;
+    // A node that follows the chain by polling counts a block a moment later than it is mined.
+    until("six confirmations on both sides", 120, || async {
+        let six = |c: Result<Vec<bipnip_ln::ChannelView>, BackendError>| {
+            c.is_ok_and(|c| c.iter().any(|c| c.confirmations >= 6))
+        };
+        six(a.channels_with(&ib.node_pubkey).await) && six(b.channels_with(&ia.node_pubkey).await)
+    })
+    .await;
     let on_a = &a.channels_with(&ib.node_pubkey).await.expect("channels")[0];
     let on_b = &b.channels_with(&ia.node_pubkey).await.expect("channels")[0];
     assert_eq!(on_a.funding_outpoint, outpoint);
