@@ -11,7 +11,7 @@
 //!                                              read a node's bindings from the relays and resolve them
 //! bipnip-agent --config FILE lease offer --min-capacity SAT --max-capacity SAT --duration BLOCKS
 //!         --fee-base SAT --fee-ppm PPM --feerate SAT_PER_VB [--upfront PERCENT] [--confs N]
-//!         [--private] [--expires-in SECS] [--cltv-delta BLOCKS] [--poll SECS]
+//!         [--private] [--expires-in SECS] [--bond SAT] [--cltv-delta BLOCKS] [--poll SECS]
 //!                                              offer liquidity and see the lease through
 //! bipnip-agent --config FILE lease take ORDER_ID --capacity SAT [--node-address HOST:PORT]
 //!         [--max-fee-msat MSAT] [--max-cltv-delta BLOCKS] [--poll SECS]
@@ -304,6 +304,7 @@ async fn lease(config: &Config, args: &[String]) -> Result<(), String> {
                 min_confirmations: options.or("confs", 3u32)?,
                 announce: !options.switch("private"),
                 expires_in_secs: options.or("expires-in", 86_400u64)?,
+                bond_sat: options.or("bond", 0u64)?,
             };
             let seller = SellerConfig {
                 cltv_delta: options.or("cltv-delta", DEFAULT_SELLER_CLTV_DELTA)?,

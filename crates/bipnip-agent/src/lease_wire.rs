@@ -118,6 +118,19 @@ pub fn upfront_invoice(order_id: Uuid, contract: &LeaseContract, bolt11: String)
     )
 }
 
+/// Seller → instance: our invoice for the buyer's bond the instance says we are owed.
+pub fn bond_claim(order_id: Uuid, contract: &LeaseContract, bolt11: String) -> Message {
+    lease_message(
+        Some(order_id),
+        None,
+        Action::LeaseBondClaim,
+        Some(LeasePayload::Invoice(LeaseInvoice {
+            lease_id: contract.id(),
+            invoice: bolt11,
+        })),
+    )
+}
+
 /// Seller → instance → buyer: the channel's funding outpoint, `<txid>:<index>` as nodes print it.
 pub fn channel_opened(
     order_id: Uuid,
@@ -249,6 +262,18 @@ pub enum Incoming {
         /// The preimage and the lease it is for. Its `Debug` does not print the secret.
         preimage: LeasePreimage,
     },
+    /// The instance's hold invoice for the buyer's bond.
+    BondInvoice {
+        /// The lease's order id.
+        order_id: Uuid,
+        /// The invoice and the lease it is for; checked before it is paid.
+        invoice: LeaseInvoice,
+    },
+    /// The instance says the buyer's bond was taken and is owed to us, the seller.
+    BondOwed {
+        /// The lease's order id.
+        order_id: Uuid,
+    },
     /// The offer or the lease was canceled.
     Canceled {
         /// The order canceled.
@@ -285,6 +310,8 @@ impl Incoming {
             | Incoming::Active { order_id }
             | Incoming::CompletionInvoice { order_id, .. }
             | Incoming::Preimage { order_id, .. }
+            | Incoming::BondInvoice { order_id, .. }
+            | Incoming::BondOwed { order_id }
             | Incoming::Canceled { order_id } => Some(*order_id),
             Incoming::Refused { order_id, .. } => *order_id,
         }
@@ -363,6 +390,16 @@ pub fn read(message: &Message) -> Result<Incoming, WireError> {
                 preimage: preimage.clone(),
             }
         }
+        (Action::LeaseBondInvoice, Some(LeasePayload::Invoice(invoice)), _) => {
+            invoice.validate()?;
+            Incoming::BondInvoice {
+                order_id,
+                invoice: invoice.clone(),
+            }
+        }
+        // Without a payload it is the instance's notice to the seller. With an invoice it is
+        // a seller's claim, which only an instance reads.
+        (Action::LeaseBondClaim, None, None) => Incoming::BondOwed { order_id },
         (Action::Canceled, None, None) => Incoming::Canceled { order_id },
         _ => return Err(WireError::Shape("not a lease message")),
     })

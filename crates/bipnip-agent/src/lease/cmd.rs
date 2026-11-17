@@ -11,7 +11,7 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use super::link::{Link, StepReport, launch_buyer, launch_seller, step_buyer, step_seller};
-use super::run::{BuyerConfig, BuyerRun, SellerConfig, SellerRun, TakeRequest};
+use super::run::{BondTerms, BuyerConfig, BuyerRun, SellerConfig, SellerRun, TakeRequest};
 use super::store::LeaseStore;
 use crate::binding::make_binding_event;
 use crate::config::{Config, InstanceConfig};
@@ -56,6 +56,8 @@ pub struct OfferParams {
     pub announce: bool,
     /// How long the offer stays open, in seconds.
     pub expires_in_secs: u64,
+    /// What the buyer locks at the instance while the lease is set up, in satoshi; 0 for none.
+    pub bond_sat: u64,
 }
 
 /// What a buyer takes.
@@ -190,7 +192,7 @@ pub async fn offer(
         min_confirmations: params.min_confirmations,
         announce: params.announce,
         expires_at: now.saturating_add(params.expires_in_secs),
-        bond_sat: 0,
+        bond_sat: params.bond_sat,
     };
     offer.validate().map_err(|e| e.to_string())?;
     // Buyers look the binding up on the relays before they take the offer.
@@ -251,6 +253,14 @@ pub async fn take(
         .terms_for(params.capacity_sat)
         .map_err(|e| e.to_string())?;
     let binding = own_binding(session, now).await?;
+    // A bond is paid only up to our own limit, and only to the node the instance's own binding
+    // names: both are settled before the take is sent.
+    let bond = crate::ring::cmd::instance_node_for(config, instance, order.bond_sat)
+        .await?
+        .map(|instance_node| BondTerms {
+            instance_node,
+            bond_sat: order.bond_sat,
+        });
 
     let trade_index = next_trade_index(config)?;
     let request = TakeRequest {
@@ -262,6 +272,7 @@ pub async fn take(
         terms,
         binding: binding.as_json(),
         node_address: params.node_address,
+        bond,
     };
     let (mut run, first) = BuyerRun::take(session.backend, instance.pubkey, request, buyer, now)
         .await
@@ -293,21 +304,23 @@ fn or_dash(value: Option<String>) -> String {
 /// One line about a seller's run: nothing secret in it.
 pub fn describe_seller(run: &SellerRun) -> String {
     format!(
-        "seller order={} state={} lease={} channel={}",
+        "seller order={} state={} lease={} channel={} buyer-bond={}",
         or_dash(run.order_id().map(|id| id.to_string())),
         name(&run.state()),
         or_dash(run.contract().map(|contract| contract.id())),
         or_dash(run.funding_outpoint().map(str::to_string)),
+        run.bond_status(),
     )
 }
 
 /// One line about a buyer's run: nothing secret in it.
 pub fn describe_buyer(run: &BuyerRun) -> String {
     format!(
-        "buyer order={} state={} lease={} waiting-on={}",
+        "buyer order={} state={} lease={} bond={} waiting-on={}",
         run.order_id(),
         name(&run.state()),
         run.contract().id(),
+        run.bond_status(),
         or_dash(run.waiting_on().map(str::to_string)),
     )
 }

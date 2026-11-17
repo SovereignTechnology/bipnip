@@ -33,6 +33,16 @@
 //! An answer no relay took is not lost: each run can make the message its state implies again
 //! ([`SellerRun::pending`], [`BuyerRun::pending`]), and remembers on disk that it still owes it.
 //!
+//! **The buyer's bond**, when the offer asks for one. The instance sends the buyer a hold
+//! invoice on the instance's own node right after the take, and passes the take on to the seller
+//! only once that payment is locked. The buyer pays it only if it pays the node the instance's
+//! own binding names, for exactly the bond the order showed, with a bounded lock time
+//! ([`crate::ring::bond`]). The instance returns it when the lease becomes active or ends before
+//! the seller reported a channel. A seller told by the instance that the bond is owed to it
+//! (the buyer walked away from a channel the instance's node can see) answers with an invoice
+//! on its own node for the payout; once its node shows that paid, it gives the buyer's upfront
+//! payment back and the lease is over: a seller is paid for one or the other, never both.
+//!
 //! The end of a lease is judged the same way on both sides: by how many confirmations the
 //! channel has on the party's own node. Once that reaches the lease's length the seller bills the
 //! completion share, and the buyer pays it only if its node still has the channel. A channel
@@ -41,6 +51,7 @@
 use std::path::Path;
 
 use bipnip_ln::{HoldState, LightningBackend, PaymentState, hexutil};
+use mostro_core::bond::payout_sat;
 use mostro_core::lease::{LeaseContract, LeaseTerms};
 use mostro_core::lease_message::{LeaseInvoice, LeaseOffer};
 use mostro_core::node_binding::Network;
@@ -53,6 +64,12 @@ use uuid::Uuid;
 use super::store::StoreError;
 use super::{BuyerLease, LeaseStepError, SellerLease};
 use crate::lease_wire::{self, Incoming, WireError};
+use crate::ring::bond::{self, BondClaim, BondPayment};
+
+/// How long the seller's invoice for a bond it is owed stays payable.
+const CLAIM_INVOICE_EXPIRY_SECS: u32 = 3_600;
+/// How many looks at the node a seller waits before claiming again after a refused claim.
+const CLAIM_RETRY_TICKS: u32 = 12;
 
 /// How long the buyer's node may take over the completion payment before the run looks again.
 const COMPLETION_PAY_WAIT_SECS: u32 = 30;
@@ -125,6 +142,10 @@ impl std::fmt::Display for RunError {
 }
 
 impl std::error::Error for RunError {}
+
+fn bond_error(why: String) -> RunError {
+    RunError::Step(LeaseStepError::Invoice(why))
+}
 
 impl From<WireError> for RunError {
     fn from(e: WireError) -> Self {
@@ -207,6 +228,12 @@ pub struct SellerRun {
     invoice: Option<String>,
     /// The completion invoice, once the lease has run its length.
     completion_invoice: Option<String>,
+    /// True once the instance said the buyer's bond was taken and is owed to us.
+    bond_owed: bool,
+    /// Our invoice for that bond.
+    bond_claim: Option<BondClaim>,
+    /// Looks at the node still to wait before claiming again.
+    claim_wait_ticks: u32,
     /// True when the answer the current state implies has not reached a relay.
     unsent: bool,
 }
@@ -232,6 +259,12 @@ struct SellerRecord {
     canceled_by_instance: bool,
     invoice: Option<String>,
     completion_invoice: Option<String>,
+    #[serde(default)]
+    bond_owed: bool,
+    #[serde(default)]
+    bond_claim: Option<BondClaim>,
+    #[serde(default)]
+    claim_wait_ticks: u32,
     unsent: bool,
 }
 
@@ -282,6 +315,9 @@ impl SellerRun {
             canceled_by_instance: false,
             invoice: None,
             completion_invoice: None,
+            bond_owed: false,
+            bond_claim: None,
+            claim_wait_ticks: 0,
             unsent: false,
         };
         (run, Outgoing::ToInstance(message))
@@ -317,6 +353,9 @@ impl SellerRun {
             canceled_by_instance: self.canceled_by_instance,
             invoice: self.invoice.clone(),
             completion_invoice: self.completion_invoice.clone(),
+            bond_owed: self.bond_owed,
+            bond_claim: self.bond_claim.clone(),
+            claim_wait_ticks: self.claim_wait_ticks,
             unsent: self.unsent,
         })
     }
@@ -388,6 +427,9 @@ impl SellerRun {
             canceled_by_instance: record.canceled_by_instance,
             invoice: record.invoice,
             completion_invoice: record.completion_invoice,
+            bond_owed: record.bond_owed,
+            bond_claim: record.bond_claim,
+            claim_wait_ticks: record.claim_wait_ticks,
             unsent: record.unsent,
         })
     }
@@ -448,6 +490,17 @@ impl SellerRun {
     /// waiting for the preimage regardless.
     pub fn canceled_by_instance(&self) -> bool {
         self.canceled_by_instance
+    }
+
+    /// The buyer's bond, as far as it concerns us, in a word: `-` (nothing owed), `owed` (the
+    /// instance said so), `claimed` (our invoice is sent) or `paid`.
+    pub fn bond_status(&self) -> &'static str {
+        match &self.bond_claim {
+            Some(claim) if claim.paid => "paid",
+            Some(_) => "claimed",
+            None if self.bond_owed => "owed",
+            None => "-",
+        }
     }
 
     /// True when the answer the current state implies has not reached a relay yet.
@@ -541,6 +594,12 @@ impl SellerRun {
                 if self.state == SellerState::Offering {
                     self.state = SellerState::Canceled;
                 }
+                // A bond claim the instance refused (it may not have settled the bond yet) is
+                // dropped; a new one goes out after a while.
+                if self.bond_claim.as_ref().is_some_and(|claim| !claim.paid) {
+                    self.bond_claim = None;
+                    self.claim_wait_ticks = CLAIM_RETRY_TICKS;
+                }
                 return Err(RunError::Refused(reason.clone()));
             }
             _ => {}
@@ -633,6 +692,12 @@ impl SellerRun {
                 self.canceled_by_instance = true;
                 Ok(Vec::new())
             }
+            (Incoming::BondOwed { .. }, SellerState::Opened) if self.offer.bond_sat > 0 => {
+                // The buyer never released the preimage and the instance took its bond for us.
+                // Claimed on the next look at our node.
+                self.bond_owed = true;
+                Ok(Vec::new())
+            }
             _ => Err(RunError::OutOfOrder("the message does not fit this lease")),
         }
     }
@@ -679,6 +744,9 @@ impl SellerRun {
                     &outpoint,
                 )?)])
             }
+            SellerState::Opened if self.bond_owed => {
+                self.claim_bond(&lease, order_id, backend).await
+            }
             SellerState::Active => self.bill(&lease, order_id, backend).await,
             SellerState::Completing => {
                 let Some(bolt11) = &self.completion_invoice else {
@@ -697,6 +765,58 @@ impl SellerRun {
             }
             _ => Ok(Vec::new()),
         }
+    }
+
+    /// Claims the buyer's bond the instance said we are owed: an invoice on our own node for
+    /// exactly the payout, sent to the instance and watched on our node. Once it is paid, the
+    /// buyer's upfront payment, still locked at our node, is given back and the lease is over:
+    /// we are paid the bond or the fee, never both. An invoice our node let expire is replaced.
+    async fn claim_bond(
+        &mut self,
+        lease: &SellerLease,
+        order_id: Uuid,
+        backend: &dyn LightningBackend,
+    ) -> Result<Vec<Outgoing>, RunError> {
+        if let Some(claim) = self.bond_claim.clone() {
+            let seen = backend
+                .hold_invoice_state(&claim.payment_hash)
+                .await
+                .map_err(LeaseStepError::from)?;
+            match seen {
+                HoldState::Settled => {
+                    lease.cancel(backend).await?;
+                    self.bond_claim = Some(BondClaim {
+                        paid: true,
+                        ..claim
+                    });
+                    self.state = SellerState::Canceled;
+                }
+                HoldState::Canceled => self.bond_claim = None,
+                _ => {}
+            }
+            return Ok(Vec::new());
+        }
+        if self.claim_wait_ticks > 0 {
+            self.claim_wait_ticks -= 1;
+            return Ok(Vec::new());
+        }
+        let amount_msat = payout_sat(self.offer.bond_sat).saturating_mul(1_000);
+        let bolt11 = backend
+            .add_invoice(amount_msat, CLAIM_INVOICE_EXPIRY_SECS, "bipnip lease bond")
+            .await
+            .map_err(LeaseStepError::from)?;
+        let payment_hash = bond::payment_hash_of(&bolt11).map_err(bond_error)?;
+        self.bond_claim = Some(BondClaim {
+            invoice: bolt11.clone(),
+            payment_hash,
+            expires_at: 0,
+            paid: false,
+        });
+        Ok(vec![Outgoing::ToInstance(lease_wire::bond_claim(
+            order_id,
+            lease.contract(),
+            bolt11,
+        ))])
     }
 
     /// Once the leased channel has as many confirmations as the lease is long, bills the
@@ -814,6 +934,19 @@ pub struct TakeRequest {
     pub binding: String,
     /// Where the seller can reach our node.
     pub node_address: Option<String>,
+    /// The bond the order asks of its buyer, if any, and the node it must be paid to.
+    pub bond: Option<BondTerms>,
+}
+
+/// The bond a lease order asks of its buyer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BondTerms {
+    /// The instance's node (66 hex), from the instance's own verified binding. A bond invoice
+    /// must pay this node.
+    pub instance_node: String,
+    /// The bond, in satoshi, as the order showed it.
+    pub bond_sat: u64,
 }
 
 /// The buyer's side of one lease.
@@ -834,6 +967,9 @@ pub struct BuyerRun {
     /// Our node binding event and node address, kept so the take can be sent again.
     binding: String,
     node_address: Option<String>,
+    /// The bond the order asks for, and our payment of it once the invoice passed our checks.
+    bond_terms: Option<BondTerms>,
+    bond: Option<BondPayment>,
     /// True when the answer the current state implies has not reached a relay.
     unsent: bool,
 }
@@ -856,6 +992,10 @@ struct BuyerRecord {
     outpoint: Option<String>,
     binding: String,
     node_address: Option<String>,
+    #[serde(default)]
+    bond_terms: Option<BondTerms>,
+    #[serde(default)]
+    bond: Option<BondPayment>,
     unsent: bool,
 }
 
@@ -889,6 +1029,8 @@ impl BuyerRun {
             outpoint: self.outpoint.clone(),
             binding: self.binding.clone(),
             node_address: self.node_address.clone(),
+            bond_terms: self.bond_terms.clone(),
+            bond: self.bond.clone(),
             unsent: self.unsent,
         })
     }
@@ -913,6 +1055,9 @@ impl BuyerRun {
         if (needs_outpoint && record.outpoint.is_none()) || (needs_peer && seller_trade.is_none()) {
             return Err(corrupt("the state does not fit the rest of the record"));
         }
+        if record.bond.is_some() && record.bond_terms.is_none() {
+            return Err(corrupt("a bond payment in a lease without a bond"));
+        }
         Ok(BuyerRun {
             instance: stored_key(&record.instance)?,
             order_id: Uuid::parse_str(&record.order_id).map_err(|_| corrupt("the order id"))?,
@@ -930,6 +1075,8 @@ impl BuyerRun {
             waiting_on: None,
             binding: record.binding,
             node_address: record.node_address,
+            bond_terms: record.bond_terms,
+            bond: record.bond,
             unsent: record.unsent,
         })
     }
@@ -980,6 +1127,8 @@ impl BuyerRun {
             waiting_on: None,
             binding: request.binding,
             node_address: request.node_address,
+            bond_terms: request.bond,
+            bond: None,
             unsent: false,
         };
         Ok((run, Outgoing::ToInstance(message)))
@@ -988,6 +1137,22 @@ impl BuyerRun {
     /// Where the run stands.
     pub fn state(&self) -> BuyerState {
         self.state
+    }
+
+    /// Our bond, in a word: `-` (the order asks for none), `awaited` (no invoice yet),
+    /// `checked` (the invoice passed our checks; not paid yet) or `sent` (our payment is out).
+    pub fn bond_status(&self) -> &'static str {
+        match (&self.bond, &self.bond_terms) {
+            (_, None) => "-",
+            (None, Some(_)) => "awaited",
+            (Some(bond), Some(_)) if bond.sent => "sent",
+            (Some(_), Some(_)) => "checked",
+        }
+    }
+
+    /// Our bond payment, once the instance's invoice passed our checks.
+    pub fn bond(&self) -> Option<&BondPayment> {
+        self.bond.as_ref()
     }
 
     /// Which of the wallet's lease trade keys this run talks under.
@@ -1080,7 +1245,9 @@ impl BuyerRun {
             if !ours {
                 return Err(RunError::OtherOrder);
             }
-            if self.state == BuyerState::Taking {
+            // A refusal ends a take the instance never accepted. Once it sent us a bond invoice
+            // it did accept it, and a refusal (of a take sent twice, say) changes nothing.
+            if self.state == BuyerState::Taking && self.bond.is_none() {
                 self.state = BuyerState::Canceled;
             }
             return Err(RunError::Refused(reason.clone()));
@@ -1095,6 +1262,37 @@ impl BuyerRun {
                 BuyerState::Taking | BuyerState::Paid | BuyerState::Verifying,
             ) => {
                 learn_peer(&mut self.seller_trade, trade_key)?;
+                Ok(Vec::new())
+            }
+            (Incoming::BondInvoice { invoice, .. }, BuyerState::Taking) => {
+                lease_wire::check_names(self.lease.contract(), &invoice.lease_id)?;
+                let Some(terms) = &self.bond_terms else {
+                    return Err(RunError::OutOfOrder("this lease has no bond"));
+                };
+                let payment_hash = bond::check_bond_invoice(
+                    &invoice.invoice,
+                    &terms.instance_node,
+                    terms.bond_sat,
+                    self.lease.contract().network,
+                    None,
+                )
+                .map_err(bond_error)?;
+                match &self.bond {
+                    Some(known) if known.invoice != invoice.invoice => {
+                        return Err(RunError::OutOfOrder(
+                            "another bond invoice was already sent to us",
+                        ));
+                    }
+                    Some(_) => {}
+                    // Kept first; paid on the next look at our node, once this is saved.
+                    None => {
+                        self.bond = Some(BondPayment {
+                            invoice: invoice.invoice,
+                            payment_hash,
+                            sent: false,
+                        });
+                    }
+                }
                 Ok(Vec::new())
             }
             (Incoming::UpfrontInvoice { invoice, .. }, BuyerState::Taking) => {
@@ -1163,12 +1361,22 @@ impl BuyerRun {
         }
     }
 
-    /// Looks at our node. Once the channel the seller reported passes the check, and only while
-    /// our payment is still locked, releases the preimage to the seller's trade key.
+    /// Looks at our node. After the take, in a lease with a bond: pays the bond invoice that
+    /// passed our checks, once. Once the channel the seller reported passes the check, and only
+    /// while our payment is still locked, releases the preimage to the seller's trade key.
     pub async fn tick(
         &mut self,
         backend: &dyn LightningBackend,
     ) -> Result<Vec<Outgoing>, RunError> {
+        if self.state == BuyerState::Taking {
+            if let (Some(bond), Some(terms)) = (&mut self.bond, &self.bond_terms) {
+                let failure = bond::pay_bond(backend, bond, terms.bond_sat)
+                    .await
+                    .map_err(LeaseStepError::from)?;
+                self.waiting_on = failure.map(|why| format!("the bond payment failed: {why}"));
+            }
+            return Ok(Vec::new());
+        }
         if self.state != BuyerState::Verifying {
             return Ok(Vec::new());
         }

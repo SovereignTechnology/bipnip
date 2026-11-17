@@ -85,9 +85,9 @@ fn note_unsent(report: &StepReport, what: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// For a ring with a bond: checks the bond against our own limit and finds the node the bond
-/// would be paid to, from the instance's own verified binding. Without a bond, nothing.
-async fn instance_node_for(
+/// For a ring or a lease with a bond: checks the bond against our own limit and finds the node
+/// the bond would be paid to, from the instance's own verified binding. Without a bond, nothing.
+pub(crate) async fn instance_node_for(
     config: &Config,
     instance: &crate::config::InstanceConfig,
     bond_sat: u64,
@@ -98,7 +98,7 @@ async fn instance_node_for(
     let limit = config.policy.max_bond_sat;
     if bond_sat > limit {
         return Err(format!(
-            "the ring asks for a bond of {bond_sat} sat; this agent locks at most {limit} \
+            "this asks for a bond of {bond_sat} sat; this agent locks at most {limit} \
              (policy.max_bond_sat in the config)"
         ));
     }
