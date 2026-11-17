@@ -243,8 +243,13 @@ EVENTS_PID=$!
 sleep 10
 echo "    events after subscribing again:"; cut -c1-800 "$W/events.log" | say
 echo "    claim by the hash as id, without ever having seen the event:"; p claim "$H6" "$P6" 1500000
+echo "    the payment list, searched for the hash:"; p find "$H6"
+found_id() { { "$PROBE" find "$1" 2>&1 | sed -n 's/^FOUND id=\([0-9a-f]*\) .*/\1/p' | sed -n 1p; } || true; }
+ID6=$(found_id "$H6")
+echo "    claim by the id the list gave (${ID6:-none}), the event never seen:"; p claim "${ID6:-$H6}" "$P6" 1500000
 sleep 5
-echo "    record:"; p details "$H6"
+echo "    record:"; p details "${ID6:-$H6}"
+echo "    a hash nobody has paid, searched for:"; p find "$H4"
 echo "    alice's payment: $(tr -d '\n' < "$W/pay6.out" | tail -c 300)"
 
 log "Q4': the same, and ldk-server is restarted while the payment is held"
@@ -261,9 +266,19 @@ EVENTS_PID=$!
 sleep 30
 echo "    events after the restart:"; cut -c1-800 "$W/events.log" | say
 echo "    record under the hash:"; p details "$H7"
-ID7=$(claimable_id 0)
-echo "    fail it (id ${ID7:-$H7}):"; p fail "${ID7:-$H7}"
-sleep 5; echo "    alice's payment: $(tr -d '\n' < "$W/pay7.out" | tail -c 300)"
+echo "    the payment list, searched for the hash, after the restart:"; p find "$H7"
+ID7=$(found_id "$H7")
+echo "    claim it by the id the list gave (${ID7:-none}):"; p claim "${ID7:-$H7}" "$P7" 1500000
+sleep 5; echo "    record:"; p details "${ID7:-$H7}"
+echo "    alice's payment: $(tr -d '\n' < "$W/pay7.out" | tail -c 300)"
+log "Q4'': held past its claim deadline with nobody acting"
+newhash; H10=$H
+hold "$H10" 1500000 "$W/hold10.out"; INV10=$INV
+pay_from_alice "$INV10" "$W/pay10.out"; sleep 15
+echo "    before: height $($BCLI getblockcount)"; p find "$H10"
+mine 8; sleep 20
+echo "    after 8 blocks: height $($BCLI getblockcount)"; p find "$H10"
+echo "    alice's payment: $(tr -d '\n' < "$W/pay10.out" | tail -c 200)"
 
 log "Q6b: an announced channel dave (ldk-server) -> alice (LND)"
 wait_until 120 dave_usable || log "dave's first channel is not usable after the restart"
@@ -283,7 +298,7 @@ log "Q5a: dave pays a plain invoice of alice's"
 INVA=$(lnc addinvoice --amt 2000 | jget payment_request)
 HA=$(lnc decodepayreq "$INVA" | jget payment_hash)
 "$PROBE" pay "$INVA" 10000 > "$W/dpay1.out" 2>&1 || true; cut -c1-400 "$W/dpay1.out" | say
-IDA=$(sed -n 's/.*payment_id: "\([0-9a-f]*\)".*/\1/p' "$W/dpay1.out" | head -1 || true)
+IDA=$(sed -n 's/.*payment_id: "\([0-9a-f]*\)".*/\1/p' "$W/dpay1.out" | sed -n 1p || true)
 echo "    outbound payment id: ${IDA:-none}; the payment hash: $HA; same: $([ "$IDA" = "$HA" ] && echo yes || echo no)"
 sleep 8; echo "    record:"; p details "${IDA:-$HA}"
 echo "    paying the same invoice again:"; p pay "$INVA" 10000

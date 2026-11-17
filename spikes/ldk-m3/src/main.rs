@@ -119,6 +119,39 @@ async fn main() {
             c.get_payment_details(GetPaymentDetailsRequest { payment_id: arg(1) })
         ),
         Some("payments") => show!("payments", c.list_payments(ListPaymentsRequest::default())),
+        // Every payment record that carries this payment hash, through every page of the list.
+        Some("find") => {
+            let hash = arg(1);
+            let (mut page_token, mut pages, mut seen) = (None, 0u32, 0usize);
+            loop {
+                let request = ListPaymentsRequest { page_token };
+                let page = match c.list_payments(request).await {
+                    Ok(page) => page,
+                    Err(e) => {
+                        println!("ERR find code={:?} message={:?}", e.error_code, e.message);
+                        break;
+                    }
+                };
+                pages += 1;
+                seen += page.payments.len();
+                for payment in &page.payments {
+                    if format!("{payment:?}").contains(&format!("hash: \"{hash}\"")) {
+                        println!(
+                            "FOUND id={} direction={} status={} amount_msat={:?}",
+                            payment.payment_id,
+                            payment.direction,
+                            payment.status,
+                            payment.amount_msat
+                        );
+                    }
+                }
+                page_token = page.next_page_token;
+                if page_token.is_none() {
+                    break;
+                }
+            }
+            println!("SEARCHED {seen} payments in {pages} pages");
+        }
         Some("claim") => show!(
             "claim",
             c.bolt11_claim_for_id(Bolt11ClaimForIdRequest {

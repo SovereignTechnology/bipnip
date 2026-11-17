@@ -50,7 +50,7 @@ log "tools"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq python3 curl xz-utils ca-certificates libpq5 libsqlite3-0 libsodium23 zlib1g >/dev/null
-ldd --version | head -1 | say
+{ ldd --version 2>&1 || true; } | sed -n 1p | say
 
 log "downloads (sha256-pinned)"
 fetch "https://bitcoincore.org/bin/bitcoin-core-$BTC_V/bitcoin-$BTC_V-x86_64-linux-gnu.tar.gz" "$BTC_SHA" "$W/dl/btc.tgz"
@@ -61,8 +61,8 @@ tar xzf "$W/dl/btc.tgz" -C "$W/dl"; cp "$W/dl/bitcoin-$BTC_V/bin/"{bitcoind,bitc
 tar xzf "$W/dl/lnd.tgz" -C "$W/dl"; cp "$W/dl/lnd-linux-amd64-$LND_V/"{lnd,lncli} "$W/bin/"
 tar xJf "$W/dl/cln.txz" -C "$W/cln"
 tar xzf "$W/dl/hold.tgz" -C "$W/dl"
-HOLD=$(find "$W/dl" -type f -name 'hold-linux-amd64' | head -1); chmod +x "$HOLD"
-CLN_BIN=$(dirname "$(find "$W/cln" -type f -name lightningd | head -1)")
+HOLD=$(find "$W/dl" -type f -name 'hold-linux-amd64' | sed -n 1p); chmod +x "$HOLD"
+CLN_BIN=$(dirname "$(find "$W/cln" -type f -name lightningd | sed -n 1p)")
 export PATH=$W/bin:$CLN_BIN:$PATH
 log "Q1: does the prebuilt Core Lightning run here?"
 { lightningd --version 2>&1 || echo "lightningd does not run: exit $?"; } | say
