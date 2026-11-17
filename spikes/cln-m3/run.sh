@@ -106,8 +106,8 @@ start_carol() {
   lightningd --network=regtest --lightning-dir="$W/carol" --daemon --log-file="$W/carol/log" \
     --bitcoin-rpcconnect=127.0.0.1 --bitcoin-rpcport=18443 --bitcoin-rpcuser=spike \
     --bitcoin-rpcpassword=spike --bitcoin-cli="$W/bin/bitcoin-cli" \
-    --addr=127.0.0.1:9737 --alias=carol --grpc-port=9740 --dev-fast-gossip \
-    --plugin="$HOLD" --hold-grpc-port=9292 "$@"
+    --addr=127.0.0.1:9737 --alias=carol --dev-fast-gossip \
+    --plugin="$HOLD" "$@"
 }
 clc() { lightning-cli --network=regtest --lightning-dir="$W/carol" "$@"; }
 c() { { clc "$@" 2>&1 || echo "(exit $?)"; } | flat | say; }
@@ -118,8 +118,8 @@ if ! start_carol > "$W/carol/start.out" 2>&1; then
     lightningd --network=regtest --lightning-dir="$W/carol" --daemon --log-file="$W/carol/log" \
       --bitcoin-rpcconnect=127.0.0.1 --bitcoin-rpcport=18443 --bitcoin-rpcuser=spike \
       --bitcoin-rpcpassword=spike --bitcoin-cli="$W/bin/bitcoin-cli" \
-      --addr=127.0.0.1:9737 --alias=carol --grpc-port=9740 \
-      --plugin="$HOLD" --hold-grpc-port=9292 "$@"
+      --addr=127.0.0.1:9737 --alias=carol \
+      --plugin="$HOLD" "$@"
   }
   start_carol > "$W/carol/start.out" 2>&1 || { log "Core Lightning did not start"; cat "$W/carol/start.out" | say; carol_log 60; exit 1; }
 fi
@@ -128,8 +128,8 @@ CAROL=$(clc getinfo | jget id)
 echo "    version $(clc getinfo | jget version), height $(clc getinfo | jget blockheight)"
 echo "    plugins: $(clc plugin list | python3 -c 'import json,sys; print(sorted(p["name"].split("/")[-1] for p in json.load(sys.stdin)["plugins"] if p["active"]))')"
 echo "    hold's commands: $(clc help | python3 -c 'import json,sys; print(sorted(h["command"] for h in json.load(sys.stdin)["help"] if "hold" in h["command"]))')"
-ls "$W/carol/regtest" | tr '\n' ' ' | say; echo
-ls "$W/carol/regtest/hold" 2>/dev/null | tr '\n' ' ' | say; echo
+{ ls "$W/carol/regtest" 2>&1 || true; } | tr '\n' ' ' | say; echo
+{ ls "$W/carol/regtest/hold" 2>&1 || true; } | tr '\n' ' ' | say; echo
 c signmessage "bipnip cln probe"
 
 log "fund alice and carol"
