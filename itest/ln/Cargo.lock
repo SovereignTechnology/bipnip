@@ -1309,7 +1309,7 @@ dependencies = [
 [[package]]
 name = "mostro-core"
 version = "0.17.3"
-source = "git+https://github.com/SovereignTechnology/bipnip-core?rev=13355e32e7afc68ef2042220fb67dfbf49fbc6c3#13355e32e7afc68ef2042220fb67dfbf49fbc6c3"
+source = "git+https://github.com/SovereignTechnology/bipnip-core?rev=752279d811753ce95dec1fdf8cceb5e217d08f33#752279d811753ce95dec1fdf8cceb5e217d08f33"
 dependencies = [
  "bitcoin",
  "chrono",
