@@ -65,5 +65,9 @@ Two things a long-running agent adds that a one-shot command did not need:
 - A run a one-shot command started has no grant, and the daemon carries it on unguarded.
 - Known gap, older than the daemon: a run is saved before its answer is sent, and only an answer that
   *failed* to send is marked as owed. A process killed between the save and the send leaves that one
-  message unsent and unmarked. The resend rules for that case are still to be written.
+  message unsent and unmarked. The one message whose loss costs money is covered: a buyer's run that is
+  taken up again in the state "released" sends its preimage again (to the seller alone, after checking
+  the channel again; a second copy does no harm). The others are not sent again on a restart, because the
+  instance answers a second take or offer with a refusal, and a refusal can end a run. Closing the gap
+  for them needs the instance to answer a repeated message with its first answer.
 - Not in this step: remote access, a second user, TLS, an HTTP API.

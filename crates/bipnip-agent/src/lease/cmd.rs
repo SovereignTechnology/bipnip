@@ -491,8 +491,9 @@ pub async fn resume(
         }
     }
     let mut buyers = Vec::new();
-    for run in loaded.buyers {
+    for mut run in loaded.buyers {
         if !buyer_done(&run) && run.instance() == instance.pubkey {
+            run.resumed();
             let link = link_for(session, instance, run.trade_index(), since).await?;
             say(describe_buyer(&run));
             buyers.push((run, link));

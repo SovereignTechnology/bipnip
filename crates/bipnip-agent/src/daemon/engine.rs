@@ -366,10 +366,14 @@ impl Engine {
             .map(Run::Seller)
             .chain(leases.buyers.into_iter().map(Run::Buyer))
             .chain(rings.runs.into_iter().map(Run::Ring));
-        for run in runs {
+        for mut run in runs {
             let name = run.name();
             if run.finished() || self.entries.iter().any(|entry| entry.name == name) {
                 continue;
+            }
+            // A preimage released by the process before may never have left it.
+            if let Run::Buyer(buyer) = &mut run {
+                buyer.resumed();
             }
             let Some(instance) = self
                 .instances

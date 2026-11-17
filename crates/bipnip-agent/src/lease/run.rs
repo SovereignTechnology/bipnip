@@ -1195,6 +1195,21 @@ impl BuyerRun {
         self.unsent
     }
 
+    /// Call when a stored run is taken up again by a new process. If the preimage was released,
+    /// it is marked to be sent again: the process before may have ended after storing that it
+    /// released and before the message left. Without the preimage the seller is never paid for
+    /// a channel it did open, and a buyer's bond could be taken for it. Sent twice it does no
+    /// harm: it goes to the seller alone, only after our node has checked the channel again,
+    /// and a seller that already settled ignores it.
+    ///
+    /// No other state is sent again on a restart. A second take or a second offer is answered
+    /// by the instance with a refusal, and a refusal can end a run.
+    pub fn resumed(&mut self) {
+        if self.state == BuyerState::Released {
+            self.unsent = true;
+        }
+    }
+
     /// Records whether the current state's answer still has to be sent. Stored with the run.
     pub fn set_unsent(&mut self, unsent: bool) {
         self.unsent = unsent;

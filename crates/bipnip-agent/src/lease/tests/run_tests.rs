@@ -476,6 +476,33 @@ fn wire(out: &[Outgoing]) -> Vec<String> {
 }
 
 #[tokio::test]
+async fn a_released_preimage_is_sent_again_after_a_restart_and_nothing_else_is() {
+    let stage = Stage::new();
+    let (seller, mut buyer) = stage.opened().await;
+    // Taken up again while it waits for confirmations: nothing is owed.
+    buyer.resumed();
+    assert!(!buyer.unsent());
+
+    stage.confirm(&seller);
+    let out = buyer.tick(&stage.buyer_node).await.expect("tick");
+    assert_eq!(buyer.state(), BuyerState::Released);
+    assert_eq!(out.len(), 1);
+    assert!(!buyer.unsent());
+    // The process ends here, the release stored and the preimage perhaps never sent. The next
+    // process owes it again, and makes it again from its own node's view of the channel.
+    buyer.resumed();
+    assert!(buyer.unsent());
+    let again = buyer.pending(&stage.buyer_node).await.expect("pending");
+    let [Outgoing::ToPeer { to, .. }] = again.as_slice() else {
+        panic!("expected the preimage for the peer, got {again:?}");
+    };
+    assert_eq!(*to, stage.seller.trade.public_key());
+    // If the channel is gone by then, nothing is released.
+    stage.close_channels();
+    assert!(buyer.pending(&stage.buyer_node).await.is_err());
+}
+
+#[tokio::test]
 async fn each_state_can_make_its_message_again() {
     let stage = Stage::new();
 
