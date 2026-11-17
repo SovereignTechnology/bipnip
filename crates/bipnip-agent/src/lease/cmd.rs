@@ -190,6 +190,7 @@ pub async fn offer(
         min_confirmations: params.min_confirmations,
         announce: params.announce,
         expires_at: now.saturating_add(params.expires_in_secs),
+        bond_sat: 0,
     };
     offer.validate().map_err(|e| e.to_string())?;
     // Buyers look the binding up on the relays before they take the offer.

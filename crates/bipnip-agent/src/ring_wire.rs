@@ -10,8 +10,8 @@
 use mostro_core::prelude::{Action, CantDoReason, Message, Payload, unwrap_message_nip44};
 use mostro_core::ring::Ring;
 use mostro_core::ring_message::{
-    RingClosed, RingCommit, RingEdge, RingMessageError, RingOffer, RingOpen, RingPayload,
-    RingRoster, RingSeat,
+    RingClosed, RingCommit, RingEdge, RingInvoice, RingMessageError, RingOffer, RingOpen,
+    RingPayload, RingRoster, RingSeat,
 };
 use nostr_sdk::prelude::{Event, Keys, PublicKey};
 use uuid::Uuid;
@@ -134,6 +134,19 @@ pub fn edge_verified(
     ))
 }
 
+/// Our invoice for a bond we are owed: the member that should have opened to us lost its own.
+pub fn bond_claim(order_id: Uuid, ring: &Ring, invoice: &str) -> Message {
+    ring_message(
+        Some(order_id),
+        None,
+        Action::RingBondClaim,
+        RingPayload::Invoice(RingInvoice {
+            ring_id: ring.id(),
+            invoice: invoice.to_string(),
+        }),
+    )
+}
+
 /// Creator or member → instance, while slots are open: withdraw the ring, or give the slot back.
 pub fn cancel(order_id: Uuid, request_id: u64) -> Message {
     Message::new_order(Some(order_id), Some(request_id), None, Action::Cancel, None)
@@ -189,11 +202,18 @@ pub enum RingIncoming {
         /// The channel confirmed.
         edge: RingEdge,
     },
+    /// The instance's hold invoice for our bond.
+    BondInvoice {
+        /// The ring's order id.
+        order_id: Uuid,
+        /// The invoice; checked before it is paid.
+        invoice: RingInvoice,
+    },
     /// The ring is over.
     Closed {
         /// The ring's order id.
         order_id: Uuid,
-        /// Which members' channels were confirmed.
+        /// Which members' channels were confirmed, and whose bond was taken.
         closed: RingClosed,
     },
     /// The ring was withdrawn or expired before it filled, or our slot was given back.
@@ -223,6 +243,7 @@ impl RingIncoming {
             | RingIncoming::EdgeOpened { order_id, .. }
             | RingIncoming::EdgeVerified { order_id, .. }
             | RingIncoming::Closed { order_id, .. }
+            | RingIncoming::BondInvoice { order_id, .. }
             | RingIncoming::Canceled { order_id } => Some(*order_id),
             RingIncoming::Refused { order_id, .. } => *order_id,
         }
@@ -281,6 +302,12 @@ pub fn read(message: &Message) -> Result<RingIncoming, RingWireError> {
             RingIncoming::EdgeVerified {
                 order_id,
                 edge: edge.clone(),
+            }
+        }
+        (Action::RingBondInvoice, Some(RingPayload::Invoice(invoice)), _) => {
+            RingIncoming::BondInvoice {
+                order_id,
+                invoice: invoice.clone(),
             }
         }
         (Action::RingClosed, Some(RingPayload::Closed(closed)), _) => RingIncoming::Closed {

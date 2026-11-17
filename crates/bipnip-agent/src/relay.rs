@@ -7,7 +7,9 @@
 use std::time::Duration;
 
 use mostro_core::lease_order::{KIND_LEASE_ORDER, LeaseOrder};
-use mostro_core::node_binding::{KIND_NODE_BINDING, SignedStatement};
+use mostro_core::node_binding::{
+    Action as BindingAction, KIND_NODE_BINDING, Network, SignedStatement,
+};
 use mostro_core::ring_order::RingOrder;
 use nostr_sdk::prelude::{Client, Event, Filter, Kind, PublicKey};
 use uuid::Uuid;
@@ -87,6 +89,48 @@ pub async fn fetch_statements(
     statements.sort_by_key(|s| s.statement.created_at);
     statements.dedup();
     Ok(statements)
+}
+
+/// The node `instance` runs on `network`, by its own published binding (66 hex), if the relays
+/// hold one. Only statements that verify count: signed by the instance's key and by the node
+/// they name. The newest decides, so a revocation ends an older binding. A relay can withhold
+/// the binding, but cannot point it at another node.
+pub async fn fetch_instance_node(
+    instance: &PublicKey,
+    network: Network,
+    relays: &[String],
+) -> Result<Option<String>, String> {
+    let client = connected(relays).await?;
+    let filter = Filter::new()
+        .kind(Kind::Custom(KIND_NODE_BINDING))
+        .author(*instance);
+    let fetched = client.fetch_events(filter).timeout(RELAY_TIMEOUT).await;
+    client.shutdown().await;
+    let events = fetched.map_err(|e| format!("fetch: {e}"))?;
+    Ok(newest_instance_node(
+        events
+            .iter()
+            .filter(|event| event.pubkey == *instance)
+            .filter_map(|event| SignedStatement::from_event(event).ok()),
+        instance,
+        network,
+    ))
+}
+
+/// The node the newest of `statements` binds to `instance` on `network`; none if that newest
+/// statement is a revocation.
+fn newest_instance_node(
+    statements: impl Iterator<Item = SignedStatement>,
+    instance: &PublicKey,
+    network: Network,
+) -> Option<String> {
+    let instance = instance.to_hex();
+    statements
+        .map(|signed| signed.statement)
+        .filter(|statement| statement.nostr_pubkey == instance && statement.network == network)
+        .max_by_key(|statement| statement.created_at)
+        .filter(|statement| statement.action == BindingAction::Bind)
+        .map(|statement| statement.node_pubkey.to_string())
 }
 
 /// The newest lease order `instance` published under `order_id`, if the relays hold one. Only
@@ -266,6 +310,7 @@ mod tests {
             min_confirmations: 3,
             announce: true,
             expires_at: 2_000_000_000,
+            bond_sat: 0,
         };
         let id = Uuid::new_v4();
         let order = |status, at: u64, keys: &Keys| {
@@ -323,5 +368,42 @@ mod tests {
         let event = binding(&Keys::generate(), 1, Action::Bind, 1_000);
         assert!(publish(&event, &[]).await.is_err());
         assert!(fetch_statements("02", &[]).await.is_err());
+    }
+
+    #[test]
+    fn the_instances_node_is_the_one_its_newest_binding_names() {
+        let instance = Keys::generate();
+        let statements = |events: &[Event]| {
+            events
+                .iter()
+                .map(|event| SignedStatement::from_event(event).expect("verifies"))
+                .collect::<Vec<_>>()
+                .into_iter()
+        };
+        let node = |n: u8| node_key(n).1.to_string();
+        let pick = |events: &[Event]| {
+            newest_instance_node(statements(events), &instance.public_key(), Network::Regtest)
+        };
+        assert_eq!(pick(&[]), None);
+        let first = binding(&instance, 1, Action::Bind, 100);
+        assert_eq!(pick(std::slice::from_ref(&first)), Some(node(1)));
+        // A newer binding wins, whatever order the relays return them in.
+        let moved = binding(&instance, 2, Action::Bind, 300);
+        assert_eq!(pick(&[moved.clone(), first.clone()]), Some(node(2)));
+        assert_eq!(pick(&[first.clone(), moved.clone()]), Some(node(2)));
+        // A newer revocation leaves the instance without a node.
+        let revoked = binding(&instance, 2, Action::Revoke, 400);
+        assert_eq!(pick(&[first.clone(), moved, revoked]), None);
+        // Someone else's binding and another network's do not count.
+        let other = binding(&Keys::generate(), 3, Action::Bind, 900);
+        assert_eq!(pick(&[first.clone(), other]), Some(node(1)));
+        assert_eq!(
+            newest_instance_node(
+                statements(&[first]),
+                &instance.public_key(),
+                Network::Signet
+            ),
+            None
+        );
     }
 }

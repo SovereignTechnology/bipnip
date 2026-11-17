@@ -552,6 +552,7 @@ mod tests {
                 min_confirmations: 3,
                 announce: true,
                 expires_at: NOW + 86_400,
+                bond_sat: 0,
             }
         }
 

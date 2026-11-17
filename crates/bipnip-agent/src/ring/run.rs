@@ -16,14 +16,24 @@
 //!   with the ring's capacity and announce flag, confirmed and active, and that was not there
 //!   before the roster.
 //!
+//! - **The bond invoice**, in a ring that asks for a bond. It is paid only if it pays the node
+//!   the instance's own binding names, for exactly the bond in the roster we signed, and cannot
+//!   lock our payment for longer than the limit ([`super::bond`]). We do not open before the
+//!   instance says every member committed, which in such a ring it says only once every bond is
+//!   locked.
+//!
 //! What it does on the instance's word: wait. An instance that withholds messages stalls a ring;
-//! the window then ends it.
+//! the window then ends it. In a ring with a bond the instance also decides, at the end of the
+//! window, whose bond is taken: that is the trust a member gives it by joining, bounded by the
+//! size of the bond. When the closing report says the member that should have opened to us lost
+//! its bond, we send an invoice for it and watch our own node for the payment.
 //!
 //! A run that stops after opening its channel and before it is saved finds that channel on its
 //! node again (it was not there when the roster was checked) and reports it instead of opening
 //! another. Not here yet: sending again what a relay did not take.
 
-use bipnip_ln::{LightningBackend, OpenRequest};
+use bipnip_ln::{BackendError, HoldState, LightningBackend, OpenRequest, PaymentState};
+use mostro_core::bond::{BOND_CLAIM_WINDOW_SECS, payout_sat, routing_reserve_sat};
 use mostro_core::prelude::{CantDoReason, Message};
 use mostro_core::ring::{Ring, RingTerms};
 use mostro_core::ring_message::{RingOffer, RingRoster, RingSeat};
@@ -31,8 +41,16 @@ use nostr_sdk::prelude::{Keys, PublicKey};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use super::bond::{check_bond_invoice, payment_hash_of};
 use crate::lease::store::StoreError;
 use crate::ring_wire::{self, RingIncoming, RingWireError};
+
+/// How long one tick waits for the bond payment to lock at the instance.
+const BOND_PAY_WAIT_SECS: u32 = 5;
+/// How long our invoice for a bond we are owed stays payable.
+const CLAIM_INVOICE_EXPIRY_SECS: u32 = 3_600;
+/// How long to wait before claiming again after the instance refused a claim.
+const CLAIM_RETRY_SECS: u64 = 60;
 
 /// Why a message or a tick did nothing.
 #[derive(Debug)]
@@ -51,6 +69,8 @@ pub enum RingRunError {
     Node(String),
     /// The instance refused what we sent.
     Refused(Option<CantDoReason>),
+    /// The bond invoice failed our checks; it is not paid.
+    Bond(String),
 }
 
 impl std::fmt::Display for RingRunError {
@@ -64,6 +84,7 @@ impl std::fmt::Display for RingRunError {
             RingRunError::Node(e) => write!(f, "node: {e}"),
             RingRunError::Refused(Some(reason)) => write!(f, "the instance refused: {reason:?}"),
             RingRunError::Refused(None) => write!(f, "the instance refused"),
+            RingRunError::Bond(why) => write!(f, "bond: {why}"),
         }
     }
 }
@@ -113,6 +134,8 @@ pub enum RingState {
 /// A ring to join: what the order said, and our seat.
 #[derive(Debug, Clone)]
 pub struct JoinRequest {
+    /// The instance's node (66 hex), from its verified binding; needed when the ring has a bond.
+    pub instance_node: Option<String>,
     /// The order to join.
     pub order_id: Uuid,
     /// Our request id for the take.
@@ -127,6 +150,32 @@ pub struct JoinRequest {
     pub seat: RingSeat,
     /// Fee rate of our funding transaction, in sat/vB.
     pub feerate_sat_vb: u64,
+}
+
+/// Our bond on a ring: the instance's invoice, checked, and whether our payment for it is out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BondPayment {
+    /// The instance's hold invoice.
+    pub invoice: String,
+    /// Its payment hash, 64 hex.
+    pub payment_hash: String,
+    /// True once our node has a payment out for it.
+    pub sent: bool,
+}
+
+/// Our claim on a bond we are owed: an invoice on our own node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BondClaim {
+    /// Our invoice.
+    pub invoice: String,
+    /// Its payment hash, 64 hex.
+    pub payment_hash: String,
+    /// Unix seconds after which it can no longer be paid.
+    pub expires_at: u64,
+    /// True once our node shows it paid.
+    pub paid: bool,
 }
 
 /// One member's part in one ring.
@@ -154,6 +203,17 @@ pub struct RingRun {
     in_confirmed: bool,
     /// Positions the closing report named as confirmed.
     verified: Vec<u8>,
+    /// The instance's node (66 hex), from its own verified binding; known when the ring has a
+    /// bond. A bond invoice must pay this node.
+    instance_node: Option<String>,
+    bond: Option<BondPayment>,
+    /// Positions the closing report named as having lost their bond.
+    slashed: Vec<u8>,
+    /// True while we are owed the bond of the member that should have opened to us.
+    owed: bool,
+    closed_at: Option<u64>,
+    claim: Option<BondClaim>,
+    claim_not_before: u64,
     waiting_on: Option<String>,
 }
 
@@ -183,6 +243,22 @@ struct RingRecord {
     in_outpoint: Option<String>,
     in_confirmed: bool,
     verified: Vec<u8>,
+    #[serde(default)]
+    bond_sat: u64,
+    #[serde(default)]
+    instance_node: Option<String>,
+    #[serde(default)]
+    bond: Option<BondPayment>,
+    #[serde(default)]
+    slashed: Vec<u8>,
+    #[serde(default)]
+    owed: bool,
+    #[serde(default)]
+    closed_at: Option<u64>,
+    #[serde(default)]
+    claim: Option<BondClaim>,
+    #[serde(default)]
+    claim_not_before: u64,
 }
 
 const RECORD_VERSION: u8 = 1;
@@ -233,6 +309,13 @@ impl RingRun {
             in_outpoint: None,
             in_confirmed: false,
             verified: Vec::new(),
+            instance_node: None,
+            bond: None,
+            slashed: Vec::new(),
+            owed: false,
+            closed_at: None,
+            claim: None,
+            claim_not_before: 0,
             waiting_on: None,
         }
     }
@@ -245,6 +328,7 @@ impl RingRun {
         request_id: u64,
         trade_index: u32,
         feerate_sat_vb: u64,
+        instance_node: Option<String>,
     ) -> (Self, Message) {
         let mut run = RingRun::new(
             instance,
@@ -257,6 +341,7 @@ impl RingRun {
         );
         let message = ring_wire::offer(request_id, offer.clone());
         run.offer = Some(offer);
+        run.instance_node = instance_node;
         (run, message)
     }
 
@@ -275,6 +360,7 @@ impl RingRun {
         );
         run.order_id = Some(request.order_id);
         run.state = RingState::Joining;
+        run.instance_node = request.instance_node;
         (run, message)
     }
 
@@ -283,12 +369,51 @@ impl RingRun {
         self.state
     }
 
-    /// True when nothing more will happen in this run.
+    /// True when nothing more will happen in this run. A ring that ended with a bond owed to
+    /// us is not finished until our claim is paid, or the time to claim has passed.
     pub fn finished(&self) -> bool {
-        matches!(
-            self.state,
-            RingState::Success | RingState::Partial | RingState::Canceled
-        )
+        match self.state {
+            RingState::Success | RingState::Canceled => true,
+            RingState::Partial => !self.owed || self.claim.as_ref().is_some_and(|c| c.paid),
+            _ => false,
+        }
+    }
+
+    /// Our bond, in a word: `-` (the ring has none), `awaited` (no invoice yet), `checked` (the
+    /// invoice passed our checks; not paid yet) or `sent` (our payment is out).
+    pub fn bond_status(&self) -> &'static str {
+        match (&self.bond, self.terms.bond_sat) {
+            (_, 0) => "-",
+            (None, _) => "awaited",
+            (Some(bond), _) if bond.sent => "sent",
+            (Some(_), _) => "checked",
+        }
+    }
+
+    /// A bond owed to us, in a word: `-` (none), `owed`, `claimed` (our invoice is sent) or
+    /// `paid`.
+    pub fn owed_status(&self) -> &'static str {
+        match &self.claim {
+            Some(claim) if claim.paid => "paid",
+            Some(_) => "claimed",
+            None if self.owed => "owed",
+            None => "-",
+        }
+    }
+
+    /// Positions the closing report named as having lost their bond.
+    pub fn reported_slashed(&self) -> &[u8] {
+        &self.slashed
+    }
+
+    /// Our bond payment, once the instance's invoice passed our checks.
+    pub fn bond(&self) -> Option<&BondPayment> {
+        self.bond.as_ref()
+    }
+
+    /// Our claim on a bond we are owed, once sent.
+    pub fn claim(&self) -> Option<&BondClaim> {
+        self.claim.as_ref()
     }
 
     /// The order id, once known.
@@ -377,6 +502,14 @@ impl RingRun {
             in_outpoint: self.in_outpoint.clone(),
             in_confirmed: self.in_confirmed,
             verified: self.verified.clone(),
+            bond_sat: self.terms.bond_sat,
+            instance_node: self.instance_node.clone(),
+            bond: self.bond.clone(),
+            slashed: self.slashed.clone(),
+            owed: self.owed,
+            closed_at: self.closed_at,
+            claim: self.claim.clone(),
+            claim_not_before: self.claim_not_before,
         };
         serde_json::to_string(&record).map_err(|e| StoreError::Corrupt(e.to_string()))
     }
@@ -393,8 +526,15 @@ impl RingRun {
             capacity_sat: record.capacity_sat,
             announce: record.announce,
             open_window_secs: record.open_window_secs,
+            bond_sat: record.bond_sat,
         };
         terms.validate().map_err(|_| corrupt("the terms"))?;
+        if (record.bond.is_some() || record.owed) && terms.bond_sat == 0 {
+            return Err(corrupt("a bond in a ring without bonds"));
+        }
+        if record.owed && record.closed_at.is_none() {
+            return Err(corrupt("a bond owed in a ring that has not ended"));
+        }
         record.seat.validate().map_err(|_| corrupt("the seat"))?;
         let order_id = record
             .order_id
@@ -433,6 +573,13 @@ impl RingRun {
             in_outpoint: record.in_outpoint,
             in_confirmed: record.in_confirmed,
             verified: record.verified,
+            instance_node: record.instance_node,
+            bond: record.bond,
+            slashed: record.slashed,
+            owed: record.owed,
+            closed_at: record.closed_at,
+            claim: record.claim,
+            claim_not_before: record.claim_not_before,
             waiting_on: None,
         })
     }
@@ -490,6 +637,13 @@ impl RingRun {
                 if matches!(self.state, RingState::Offering | RingState::Joining) {
                     self.state = RingState::Canceled;
                 }
+                // A claim the instance refused (it may not have settled the bond yet) is
+                // dropped; a new one goes out later.
+                if self.state == RingState::Partial && self.claim.as_ref().is_some_and(|c| !c.paid)
+                {
+                    self.claim = None;
+                    self.claim_not_before = now.saturating_add(CLAIM_RETRY_SECS);
+                }
                 return Err(RingRunError::Refused(reason.clone()));
             }
             _ => {}
@@ -537,12 +691,47 @@ impl RingRun {
                 else {
                     return Err(RingRunError::NotOurRing("our node is not in the roster"));
                 };
+                // The bond is in the terms just compared. Without the instance's node there
+                // would be nothing to check its invoice against: no commit.
+                if ring.terms.bond_sat > 0 && self.instance_node.is_none() {
+                    return Err(RingRunError::NotOurRing(
+                        "the ring asks for a bond and the instance's node is not known",
+                    ));
+                }
                 // What our node has with its two neighbours now is not part of this ring.
                 self.out_before = outpoints(backend, &next).await?;
                 self.in_before = outpoints(backend, &previous).await?;
                 self.roster = Some(roster);
                 self.state = RingState::Committed;
                 Ok(vec![ring_wire::commit(order_id, &ring, identity)])
+            }
+            (RingIncoming::BondInvoice { invoice, .. }, RingState::Committed) => {
+                let (ring, _) = self.checked_roster(now)?;
+                if invoice.ring_id != ring.id() {
+                    return Err(RingRunError::NotOurRing("another ring id"));
+                }
+                let Some(node) = &self.instance_node else {
+                    return Err(RingRunError::NotOurRing("this ring has no bond"));
+                };
+                let payment_hash = check_bond_invoice(&invoice.invoice, node, &ring.terms, now)
+                    .map_err(RingRunError::Bond)?;
+                match &self.bond {
+                    Some(known) if known.invoice != invoice.invoice => {
+                        return Err(RingRunError::OutOfOrder(
+                            "another bond invoice was already sent to us",
+                        ));
+                    }
+                    Some(_) => {}
+                    // Kept first; paid on the next look at our node, once this is saved.
+                    None => {
+                        self.bond = Some(BondPayment {
+                            invoice: invoice.invoice,
+                            payment_hash,
+                            sent: false,
+                        });
+                    }
+                }
+                Ok(Vec::new())
             }
             (RingIncoming::Open { open, .. }, RingState::Committed) => {
                 let (ring, keys) = self.checked_roster(now)?;
@@ -592,7 +781,20 @@ impl RingRun {
                 } else {
                     RingState::Partial
                 };
+                let own = self.seat.node_key()?;
+                self.owed = ring
+                    .position(&own)
+                    .is_some_and(|position| closed.owed_a_bond(&ring, position));
+                self.closed_at = Some(now);
                 self.verified = closed.verified;
+                self.slashed = closed.slashed;
+                Ok(Vec::new())
+            }
+            // In a ring with a bond, the instance cancels after the commits when a bond was not
+            // paid in time. Nothing was opened: no member is told to open before every bond is
+            // locked.
+            (RingIncoming::Canceled { .. }, RingState::Committed) if self.terms.bond_sat > 0 => {
+                self.state = RingState::Canceled;
                 Ok(Vec::new())
             }
             (
@@ -608,16 +810,122 @@ impl RingRun {
         }
     }
 
-    /// Looks at our node, at `now`. While the ring is open and its window has not ended, opens
-    /// our channel to the next member once and reports it; and confirms the channel reported to
-    /// us once our node shows it as the ring describes.
+    /// Pays our bond, once: only an invoice that passed [`check_bond_invoice`] is ever stored,
+    /// and our node is asked first whether a payment for it is already out.
+    async fn pay_bond(&mut self, backend: &dyn LightningBackend) -> Result<(), RingRunError> {
+        let Some(bond) = self.bond.clone() else {
+            return Ok(());
+        };
+        if bond.sent {
+            return Ok(());
+        }
+        let known = match backend.payment_state(&bond.payment_hash).await {
+            Ok(state) => Some(state),
+            // Refused: our node has no payment for this hash.
+            Err(BackendError::Rejected(_)) => None,
+            Err(e) => return Err(e.into()),
+        };
+        let state = match known {
+            None | Some(PaymentState::Failed { .. }) => {
+                let max_fee_msat = routing_reserve_sat(self.terms.bond_sat)
+                    .max(10)
+                    .saturating_mul(1_000);
+                backend
+                    .pay_invoice(&bond.invoice, max_fee_msat, BOND_PAY_WAIT_SECS)
+                    .await?
+            }
+            Some(state) => state,
+        };
+        match state {
+            PaymentState::Failed { reason } => {
+                self.waiting_on = Some(format!("the bond payment failed: {reason}"));
+            }
+            PaymentState::InFlight | PaymentState::Succeeded { .. } => {
+                if let Some(bond) = &mut self.bond {
+                    bond.sent = true;
+                }
+                self.waiting_on = None;
+            }
+        }
+        Ok(())
+    }
+
+    /// Claims the bond we are owed: an invoice on our own node for exactly the payout, sent to
+    /// the instance, and watched on our node. An invoice that expired unpaid is replaced.
+    async fn claim_bond(
+        &mut self,
+        backend: &dyn LightningBackend,
+        now: u64,
+    ) -> Result<Vec<Message>, RingRunError> {
+        if !self.owed {
+            return Ok(Vec::new());
+        }
+        let (Some(order_id), Some(roster), Some(closed_at)) =
+            (self.order_id, self.roster.clone(), self.closed_at)
+        else {
+            return Ok(Vec::new());
+        };
+        if let Some(claim) = self.claim.clone() {
+            if claim.paid {
+                return Ok(Vec::new());
+            }
+            let paid = matches!(
+                backend.hold_invoice_state(&claim.payment_hash).await?,
+                HoldState::Settled
+            );
+            if paid {
+                self.claim = Some(BondClaim {
+                    paid: true,
+                    ..claim
+                });
+                self.waiting_on = None;
+            } else if now >= claim.expires_at {
+                self.claim = None;
+            }
+            return Ok(Vec::new());
+        }
+        if now >= closed_at.saturating_add(BOND_CLAIM_WINDOW_SECS) {
+            self.owed = false;
+            self.waiting_on = Some("the time to claim the bond has passed".into());
+            return Ok(Vec::new());
+        }
+        if now < self.claim_not_before {
+            return Ok(Vec::new());
+        }
+        let ring = roster.validate()?;
+        let amount_msat = payout_sat(ring.terms.bond_sat).saturating_mul(1_000);
+        let invoice = backend
+            .add_invoice(amount_msat, CLAIM_INVOICE_EXPIRY_SECS, "bipnip ring bond")
+            .await?;
+        let payment_hash = payment_hash_of(&invoice).map_err(RingRunError::Bond)?;
+        self.claim = Some(BondClaim {
+            invoice: invoice.clone(),
+            payment_hash,
+            expires_at: now.saturating_add(u64::from(CLAIM_INVOICE_EXPIRY_SECS)),
+            paid: false,
+        });
+        self.waiting_on = Some("the instance has not paid the bond we are owed yet".into());
+        Ok(vec![ring_wire::bond_claim(order_id, &ring, &invoice)])
+    }
+
+    /// Looks at our node, at `now`. After our commit, in a ring with a bond: pays the bond
+    /// invoice that passed our checks. While the ring is open and its window has not ended:
+    /// opens our channel to the next member once and reports it; and confirms the channel
+    /// reported to us once our node shows it as the ring describes. After a ring that ended
+    /// with a bond owed to us: claims it.
     pub async fn tick(
         &mut self,
         backend: &dyn LightningBackend,
         now: u64,
     ) -> Result<Vec<Message>, RingRunError> {
-        if self.state != RingState::Open {
-            return Ok(Vec::new());
+        match self.state {
+            RingState::Committed => {
+                self.pay_bond(backend).await?;
+                return Ok(Vec::new());
+            }
+            RingState::Partial => return self.claim_bond(backend, now).await,
+            RingState::Open => {}
+            _ => return Ok(Vec::new()),
         }
         let (Some(order_id), Some(roster)) = (self.order_id, self.roster.clone()) else {
             return Ok(Vec::new());

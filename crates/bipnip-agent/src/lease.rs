@@ -118,7 +118,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hexutil::encode(&Sha256::digest(bytes))
 }
 
-fn currency_of(network: Network) -> Option<Currency> {
+pub(crate) fn currency_of(network: Network) -> Option<Currency> {
     match network {
         Network::Bitcoin => Some(Currency::Bitcoin),
         Network::Testnet | Network::Testnet4 => Some(Currency::BitcoinTestnet),

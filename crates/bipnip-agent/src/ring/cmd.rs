@@ -29,6 +29,8 @@ pub struct CreateParams {
     pub announce: bool,
     /// Seconds members have to open once the ring is full.
     pub open_window_secs: u64,
+    /// What every member locks at the instance until the ring ends, in satoshi; 0 for none.
+    pub bond_sat: u64,
     /// How long the slots stay open, in seconds.
     pub expires_in_secs: u64,
     /// Where the member that opens to us can reach our node (`host:port`).
@@ -83,6 +85,29 @@ fn note_unsent(report: &StepReport, what: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// For a ring with a bond: checks the bond against our own limit and finds the node the bond
+/// would be paid to, from the instance's own verified binding. Without a bond, nothing.
+async fn instance_node_for(
+    config: &Config,
+    instance: &crate::config::InstanceConfig,
+    bond_sat: u64,
+) -> Result<Option<String>, String> {
+    if bond_sat == 0 {
+        return Ok(None);
+    }
+    let limit = config.policy.max_bond_sat;
+    if bond_sat > limit {
+        return Err(format!(
+            "the ring asks for a bond of {bond_sat} sat; this agent locks at most {limit} \
+             (policy.max_bond_sat in the config)"
+        ));
+    }
+    let node = relay::fetch_instance_node(&instance.pubkey, config.network, &config.relays)
+        .await?
+        .ok_or("the instance has published no node binding, so a bond cannot be checked")?;
+    Ok(Some(node))
+}
+
 /// Proposes a ring on the configured instance and takes its first slot. Returns the run and
 /// its link, to drive with [`run`].
 pub async fn create(
@@ -99,10 +124,12 @@ pub async fn create(
         slots: params.slots,
         announce: params.announce,
         open_window_secs: params.open_window_secs,
+        bond_sat: params.bond_sat,
         expires_at: now.saturating_add(params.expires_in_secs),
         seat: own_seat(session, params.node_address, now).await?,
     };
     offer.validate().map_err(|e| e.to_string())?;
+    let instance_node = instance_node_for(config, instance, params.bond_sat).await?;
     let trade_index = next_trade_index(config)?;
     let (ring, first) = RingRun::create(
         instance.pubkey,
@@ -110,6 +137,7 @@ pub async fn create(
         now,
         trade_index,
         params.feerate_sat_vb,
+        instance_node,
     );
     let link = link_for(
         session,
@@ -151,6 +179,7 @@ pub async fn join(session: &Session<'_>, params: JoinParams) -> Result<(RingRun,
             config.network.as_str()
         ));
     }
+    let instance_node = instance_node_for(config, instance, order.bond_sat).await?;
     let trade_index = next_trade_index(config)?;
     let request = JoinRequest {
         order_id: params.order_id,
@@ -160,6 +189,7 @@ pub async fn join(session: &Session<'_>, params: JoinParams) -> Result<(RingRun,
         slots: order.slots,
         seat: own_seat(session, params.node_address, now).await?,
         feerate_sat_vb: params.feerate_sat_vb,
+        instance_node,
     };
     let (ring, first) = RingRun::join(instance.pubkey, request);
     let link = link_for(
@@ -187,13 +217,15 @@ pub fn describe(ring: &RingRun) -> String {
         .unwrap_or_default();
     format!(
         "ring order={} state={} ring={} opened={} ours-confirmed={} incoming-confirmed={} \
-         waiting-on={}",
+         bond={} owed-bond={} waiting-on={}",
         or_dash(ring.order_id().map(|id| id.to_string())),
         state,
         or_dash(ring.ring().map(|ring| ring.id())),
         or_dash(ring.opened_outpoint().map(str::to_string)),
         ring.our_channel_confirmed(),
         ring.incoming_confirmed(),
+        ring.bond_status(),
+        ring.owed_status(),
         or_dash(ring.waiting_on().map(str::to_string)),
     )
 }

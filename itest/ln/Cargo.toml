@@ -32,5 +32,5 @@ nostr-sdk = { version = "0.45.1", features = ["local-relay"] }
 bipnip-ln = { path = "../../crates/bipnip-ln", features = ["lnd"] }
 bipnip-agent = { path = "../../crates/bipnip-agent", features = ["lnd"] }
 # bipnip-core main (#3): the same revision the agent uses.
-mostro-core = { git = "https://github.com/SovereignTechnology/bipnip-core", rev = "13355e32e7afc68ef2042220fb67dfbf49fbc6c3" }
+mostro-core = { git = "https://github.com/SovereignTechnology/bipnip-core", rev = "752279d811753ce95dec1fdf8cceb5e217d08f33" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }

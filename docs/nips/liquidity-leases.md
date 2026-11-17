@@ -38,8 +38,12 @@ unless noted):
 | `expiration` | NIP-40 |
 
 Implemented so far (`bipnip-core`, `lease`, `lease_message` and `lease_order`): `node`, `network`,
-`capacity`, `duration`, `fee`, `split`, `confs`, `announce` and the expiry. `fee_caps`, `channel_type`,
-`rules` and `bond` are not part of the v1 contract yet.
+`capacity`, `duration`, `fee`, `split`, `confs`, `announce`, `bond` and the expiry. `fee_caps`,
+`channel_type` and `rules` are not part of the v1 contract yet. The `bond` tag and the offer's `bond_sat`
+are defined (0, or at least 1 000 sat, at most the smallest capacity on offer, announced channels only;
+the bond is not in the contract text: the buyer agrees to it by paying the instance's bond invoice), with
+the actions `lease-bond-invoice` and `lease-bond-claim`; instances do not take a lease bond yet and refuse
+an offer that asks for one. Ring bonds work (`liquidity-rings.md`).
 
 ### Status
 

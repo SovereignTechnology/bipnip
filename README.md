@@ -20,9 +20,11 @@ a buyer's agent takes the order, pays the seller's hold invoice, checks the chan
 releases the preimage, between real LND nodes and through a real `bipnipd`, which never sees the preimage.
 When part of the fee is due at the end, the seller bills it once the channel is as old as the lease is
 long, and the buyer pays if its node still has the channel. The instance side is in `bipnipd`. Rings work
-the same way, without bonds for now: a creator proposes a ring, others take its slots, every member checks
-the roster and signs it, and each opens one channel to the next and confirms the one opened to it. Not
-written yet: bonds, a long-running agent with a local API, and the Core Lightning and LDK backends. Nothing
+the same way: a creator proposes a ring, others take its slots, every member checks the roster and signs
+it, and each opens one channel to the next and confirms the one opened to it. A ring can ask every member
+for a bond, locked at the instance's node before anyone opens and paid on to the member that was let down
+when a channel is missing (the instance side of bonds is still in review). Not written yet: the buyer's
+bond on a lease, a long-running agent with a local API, and the Core Lightning and LDK backends. Nothing
 here is ready for real funds.
 
 ## Try the agent (regtest or signet only)
@@ -90,8 +92,20 @@ bipnip-agent --config agent.toml ring resume
 ```
 
 Each member opens one channel, to the next member, and only after every member has signed the same
-roster. A member that signs and never opens costs the others the channel they opened, which stands; there
-are no bonds yet.
+roster. A member that signs and never opens costs the others the channel they opened, which stands.
+
+A ring can ask for a bond (`ring create … --bond 20000`, on an instance that takes bonds): every member
+locks that much at the instance's node before anyone opens. It comes back when your channel is there. If
+the member that should have opened to you never does, its bond is paid on to you. Your agent joins such a
+ring only up to a limit you set, and pays a bond only to the node the instance's own binding names:
+
+```toml
+[policy]
+max_bond_sat = 50000    # 0, the default: join no ring that asks for a bond
+```
+
+A bond is money the instance holds until the ring ends, and the instance decides whose bond is taken
+(`docs/nips/liquidity-rings.md` says on what evidence, and what that leaves you trusting).
 
 ## Repositories
 
