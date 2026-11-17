@@ -10,6 +10,7 @@ use std::time::Duration;
 use bipnip_agent::lease::{
     BuyerLease, DEFAULT_MAX_CLTV_DELTA, DEFAULT_SELLER_CLTV_DELTA, LeaseStepError, SellerLease,
 };
+use bipnip_ln::ldk::LdkBackend;
 use bipnip_ln::lnd::LndBackend;
 use bipnip_ln::{LightningBackend, OpenRequest, PaymentState};
 use mostro_core::lease::LeaseTerms;
@@ -54,18 +55,27 @@ where
     panic!("timed out waiting for: {what}");
 }
 
-/// The node behind `prefix` (`A` or `B`), through the backend `BACKEND` names (`lnd`, the default).
+/// The node behind `prefix` (`A` or `B`), through the backend `<prefix>_BACKEND` names, or else
+/// `BACKEND`, or else `lnd`. For `lnd`: `<prefix>_ADDR` (https://host:port), `_CERT` (tls.cert),
+/// `_MAC` (a macaroon file). For `ldk`: `_ADDR` (host:port of the LDK Server's gRPC service),
+/// `_CERT` (its tls.crt), `_MAC` (its hex macaroon file).
 async fn node(prefix: &str) -> Box<dyn LightningBackend> {
-    let backend = std::env::var("BACKEND").unwrap_or_else(|_| "lnd".into());
+    let backend = std::env::var(format!("{prefix}_BACKEND"))
+        .or_else(|_| std::env::var("BACKEND"))
+        .unwrap_or_else(|_| "lnd".into());
+    let (addr, cert, mac) = (
+        env(&format!("{prefix}_ADDR")),
+        env(&format!("{prefix}_CERT")),
+        env(&format!("{prefix}_MAC")),
+    );
     match backend.as_str() {
         "lnd" => Box::new(
-            LndBackend::connect(
-                &env(&format!("{prefix}_ADDR")),
-                Path::new(&env(&format!("{prefix}_CERT"))),
-                Path::new(&env(&format!("{prefix}_MAC"))),
-            )
-            .await
-            .expect("connect"),
+            LndBackend::connect(&addr, Path::new(&cert), Path::new(&mac))
+                .await
+                .expect("connect"),
+        ),
+        "ldk" => Box::new(
+            LdkBackend::connect(&addr, Path::new(&cert), Path::new(&mac)).expect("connect"),
         ),
         other => panic!("no backend {other:?} in this build"),
     }

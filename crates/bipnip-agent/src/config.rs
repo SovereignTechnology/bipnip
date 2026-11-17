@@ -10,6 +10,11 @@
 //! tls_cert = "/home/me/.lnd/tls.cert"
 //! macaroon = "/home/me/.lnd/bipnip.macaroon"
 //!
+//! [ldk]                               # instead of [lnd]: an LDK Server (ldk-server)
+//! address = "127.0.0.1:3536"          # its gRPC service, host:port
+//! tls_cert = "/home/me/.ldk-server/tls.crt"
+//! macaroon = "/home/me/.ldk-server/bitcoin/macaroons/bipnip.macaroon"
+//!
 //! [[instance]]                        # a bipnip instance to trade on; may appear more than once
 //! pubkey = "npub1…"                   # its Nostr key, npub or hex
 //! pow = 0                             # optional: proof of work, in bits. Left out, it is read
@@ -95,6 +100,18 @@ pub struct LndConfig {
     pub macaroon: PathBuf,
 }
 
+/// How to reach an LDK Server.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LdkConfig {
+    /// Its gRPC service, `host:port` (no scheme).
+    pub address: String,
+    /// The server's TLS certificate (`<storage_dir>/tls.crt`).
+    pub tls_cert: PathBuf,
+    /// A macaroon file as the server writes it (hex), limited to what the agent needs.
+    pub macaroon: PathBuf,
+}
+
 /// Limits on what the agent does with the node's money without being asked again.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -131,6 +148,7 @@ struct Raw {
     #[serde(default)]
     relays: Vec<String>,
     lnd: Option<LndConfig>,
+    ldk: Option<LdkConfig>,
     instance: Option<RawInstances>,
     #[serde(default)]
     policy: PolicyConfig,
@@ -147,6 +165,8 @@ pub struct Config {
     pub relays: Vec<String>,
     /// The LND node, if one is configured.
     pub lnd: Option<LndConfig>,
+    /// The LDK Server, if one is configured. An agent has one node: never both.
+    pub ldk: Option<LdkConfig>,
     /// The instances to trade on, in the order the configuration lists them.
     pub instances: Vec<InstanceEntry>,
     /// Spending limits.
@@ -180,6 +200,17 @@ impl Config {
             }
             if !lnd.tls_cert.is_absolute() || !lnd.macaroon.is_absolute() {
                 return Err("config: lnd.tls_cert and lnd.macaroon must be absolute paths".into());
+            }
+        }
+        if let Some(ldk) = &raw.ldk {
+            if raw.lnd.is_some() {
+                return Err("config: an agent has one node: [lnd] or [ldk], not both".into());
+            }
+            if ldk.address.contains("://") || !ldk.address.contains(':') {
+                return Err("config: ldk.address must be host:port, without a scheme".into());
+            }
+            if !ldk.tls_cert.is_absolute() || !ldk.macaroon.is_absolute() {
+                return Err("config: ldk.tls_cert and ldk.macaroon must be absolute paths".into());
             }
         }
         let raw_instances = match raw.instance {
@@ -222,6 +253,7 @@ impl Config {
             data_dir: raw.data_dir,
             relays: raw.relays,
             lnd: raw.lnd,
+            ldk: raw.ldk,
             instances,
             policy,
         })
@@ -359,6 +391,40 @@ macaroon = "/tmp/a.macaroon"
         assert!(Config::parse(&text.replace(&node, &"zz".repeat(33))).is_err());
         assert_eq!(c.socket_path(), PathBuf::from("/tmp/bipnip/agent.sock"));
         assert_eq!(c.lock_path(), PathBuf::from("/tmp/bipnip/agent.lock"));
+    }
+
+    #[test]
+    fn an_ldk_server_instead_of_lnd_and_never_both() {
+        let ldk = "\n[ldk]\naddress = \"127.0.0.1:3536\"\ntls_cert = \"/tmp/tls.crt\"\n\
+                   macaroon = \"/tmp/a.macaroon\"\n";
+        let base = "network = \"regtest\"\ndata_dir = \"/tmp/bipnip\"\n";
+        let c = Config::parse(&format!("{base}{ldk}")).expect("parses");
+        assert!(c.lnd.is_none());
+        assert_eq!(c.ldk.expect("ldk").address, "127.0.0.1:3536");
+        for (bad, why) in [
+            (format!("{GOOD}{ldk}"), "two nodes"),
+            (
+                format!(
+                    "{base}{}",
+                    ldk.replace("127.0.0.1:3536", "https://127.0.0.1:3536")
+                ),
+                "a scheme",
+            ),
+            (
+                format!("{base}{}", ldk.replace("127.0.0.1:3536", "localhost")),
+                "no port",
+            ),
+            (
+                format!("{base}{}", ldk.replace("/tmp/tls.crt", "tls.crt")),
+                "relative cert",
+            ),
+            (
+                format!("{base}{}", ldk.replace("macaroon =", "token =")),
+                "unknown key",
+            ),
+        ] {
+            assert!(Config::parse(&bad).is_err(), "{why}");
+        }
     }
 
     #[test]

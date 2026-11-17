@@ -2,15 +2,21 @@
 //! way a lease uses them. The steps know only the trait: the same run is the conformance test
 //! of every backend. Driven by `run-lnd.sh`; exits non-zero on the first failed step.
 //!
-//! Environment: `BACKEND` (which backend both nodes are; `lnd`, the default), `MINE` (a command
-//! that mines its argument's blocks), `HASHES` (three "preimage:hash" pairs, comma-separated),
-//! `B_P2P` (host:port), and how to reach each node. For LND: `A_ADDR`/`A_CERT`/`A_MAC`, `B_…`
-//! (gRPC address, tls.cert, admin.macaroon).
+//! Environment: `A_BACKEND`, `B_BACKEND` (or `BACKEND` for both; `lnd` by default), how to reach
+//! each node (`A_ADDR`/`A_CERT`/`A_MAC`, `B_…`; see `node`), `B_P2P` (host:port), `MINE` (a
+//! command that mines its argument's blocks), `HASHES` (three "preimage:hash" pairs,
+//! comma-separated), and `HOLD_CLTV` (the lock time asked of B's hold invoices, in blocks; 144 by
+//! default; a backend that cannot give what is asked must refuse, so a node with a fixed lock
+//! time is tested with its own).
+//!
+//! What a backend may lack, and the run then says so and goes on: `graph_channels`
+//! (`BackendError::Unsupported`). Everything else is required.
 
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
+use bipnip_ln::ldk::LdkBackend;
 use bipnip_ln::lnd::LndBackend;
 use bipnip_ln::{
     BackendError, HoldInvoiceRequest, HoldState, LightningBackend, OpenRequest, PaymentState,
@@ -49,18 +55,27 @@ where
     panic!("timed out waiting for: {what}");
 }
 
-/// The node behind `prefix` (`A` or `B`), through the backend `BACKEND` names.
+/// The node behind `prefix` (`A` or `B`), through the backend `<prefix>_BACKEND` names, or else
+/// `BACKEND`, or else `lnd`. For `lnd`: `<prefix>_ADDR` (https://host:port), `_CERT` (tls.cert),
+/// `_MAC` (a macaroon file). For `ldk`: `_ADDR` (host:port of the LDK Server's gRPC service),
+/// `_CERT` (its tls.crt), `_MAC` (its hex macaroon file).
 async fn node(prefix: &str) -> Box<dyn LightningBackend> {
-    let backend = std::env::var("BACKEND").unwrap_or_else(|_| "lnd".into());
+    let backend = std::env::var(format!("{prefix}_BACKEND"))
+        .or_else(|_| std::env::var("BACKEND"))
+        .unwrap_or_else(|_| "lnd".into());
+    let (addr, cert, mac) = (
+        env(&format!("{prefix}_ADDR")),
+        env(&format!("{prefix}_CERT")),
+        env(&format!("{prefix}_MAC")),
+    );
     match backend.as_str() {
         "lnd" => Box::new(
-            LndBackend::connect(
-                &env(&format!("{prefix}_ADDR")),
-                Path::new(&env(&format!("{prefix}_CERT"))),
-                Path::new(&env(&format!("{prefix}_MAC"))),
-            )
-            .await
-            .expect("connect"),
+            LndBackend::connect(&addr, Path::new(&cert), Path::new(&mac))
+                .await
+                .expect("connect"),
+        ),
+        "ldk" => Box::new(
+            LdkBackend::connect(&addr, Path::new(&cert), Path::new(&mac)).expect("connect"),
         ),
         other => panic!("no backend {other:?} in this build"),
     }
@@ -180,12 +195,16 @@ async fn main() {
     );
 
     step("hold invoice on the payer's hash: held without the preimage, then settled with it");
+    let hold_cltv: u32 = std::env::var("HOLD_CLTV")
+        .ok()
+        .map(|v| v.parse().expect("HOLD_CLTV is a number of blocks"))
+        .unwrap_or(144);
     let (pre, hash) = &hashes[0];
     let hold = HoldInvoiceRequest {
         payment_hash: hash.clone(),
         amount_msat: 1_500_000,
         expiry_secs: 3600,
-        cltv_delta: 144,
+        cltv_delta: hold_cltv,
         description: "bipnip-ln conformance: hold".into(),
     };
     let invoice = b.add_hold_invoice(&hold).await.expect("add hold");
@@ -301,40 +320,50 @@ async fn main() {
     .await;
 
     step("graph_channels: the announced channel, from either end, and nothing for a stranger");
-    let ia = a.node_info().await.expect("A info");
-    let in_graph = a
-        .graph_channels(&ib.node_pubkey)
-        .await
-        .expect("graph channels of B");
-    let ours = in_graph
-        .iter()
-        .find(|c| c.funding_outpoint == outpoint)
-        .expect("the channel we opened is in the graph");
-    assert_eq!(ours.peer, ia.node_pubkey, "seen from B, the peer is A");
-    assert_eq!(ours.capacity_sat, 1_000_000);
-    let from_a = a
-        .graph_channels(&ia.node_pubkey)
-        .await
-        .expect("graph channels of A");
-    assert!(
-        from_a
-            .iter()
-            .any(|c| c.funding_outpoint == outpoint && c.peer == ib.node_pubkey),
-        "seen from A, the peer is B"
-    );
-    assert!(
-        a.graph_channels(&unknown)
+    if let Err(BackendError::Unsupported(why)) = a.graph_channels(&ib.node_pubkey).await {
+        println!("  not supported by A's backend ({why}); skipped");
+    } else {
+        let ia = a.node_info().await.expect("A info");
+        let in_graph = a
+            .graph_channels(&ib.node_pubkey)
             .await
-            .expect("graph channels of a stranger")
-            .is_empty()
-    );
-    assert!(matches!(
-        a.graph_channels("02abc").await,
-        Err(BackendError::Rejected(_))
-    ));
+            .expect("graph channels of B");
+        let ours = in_graph
+            .iter()
+            .find(|c| c.funding_outpoint == outpoint)
+            .expect("the channel we opened is in the graph");
+        assert_eq!(ours.peer, ia.node_pubkey, "seen from B, the peer is A");
+        assert_eq!(ours.capacity_sat, 1_000_000);
+        let from_a = a
+            .graph_channels(&ia.node_pubkey)
+            .await
+            .expect("graph channels of A");
+        assert!(
+            from_a
+                .iter()
+                .any(|c| c.funding_outpoint == outpoint && c.peer == ib.node_pubkey),
+            "seen from A, the peer is B"
+        );
+        assert!(
+            a.graph_channels(&unknown)
+                .await
+                .expect("graph channels of a stranger")
+                .is_empty()
+        );
+        assert!(matches!(
+            a.graph_channels("02abc").await,
+            Err(BackendError::Rejected(_))
+        ));
+    }
 
+    let named = |prefix: &str| {
+        std::env::var(format!("{prefix}_BACKEND"))
+            .or_else(|_| std::env::var("BACKEND"))
+            .unwrap_or_else(|_| "lnd".into())
+    };
     println!(
-        "CONFORMANCE PASS: {} backend, all steps",
-        std::env::var("BACKEND").unwrap_or_else(|_| "lnd".into())
+        "CONFORMANCE PASS: payer {}, payee {}, all steps",
+        named("A"),
+        named("B")
     );
 }

@@ -18,6 +18,8 @@ path = "src/main.rs"
 [features]
 # Talk to an LND node (needs `protoc` at build time; see bipnip-ln).
 lnd = ["bipnip-ln/lnd"]
+# Talk to an LDK Server (ldk-server) over its gRPC API; see bipnip-ln's `ldk` module for its limits.
+ldk = ["bipnip-ln/ldk"]
 
 [dependencies]
 bipnip-ln.workspace = true

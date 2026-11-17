@@ -30,4 +30,8 @@ wildcards = "allow"   # cargo-deny reports `workspace = true` lines as wildcards
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = []
+allow-git = [
+    "https://github.com/SovereignTechnology/bipnip-core",
+    # ldk-server-client is not on crates.io (bipnip-ln's `ldk` feature).
+    "https://github.com/lightningdevkit/ldk-server",
+]
