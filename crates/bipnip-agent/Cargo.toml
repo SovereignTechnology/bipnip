@@ -20,6 +20,8 @@ path = "src/main.rs"
 lnd = ["bipnip-ln/lnd"]
 # Talk to an LDK Server (ldk-server) over its gRPC API; see bipnip-ln's `ldk` module for its limits.
 ldk = ["bipnip-ln/ldk"]
+# Talk to a Core Lightning node over its JSON-RPC socket (hold invoices need the `hold` plugin).
+cln = ["bipnip-ln/cln"]
 
 [dependencies]
 bipnip-ln.workspace = true

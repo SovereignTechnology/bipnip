@@ -15,6 +15,7 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
+use bipnip_ln::cln::ClnBackend;
 use bipnip_ln::ldk::LdkBackend;
 use bipnip_ln::lnd::LndBackend;
 use bipnip_ln::{
@@ -57,25 +58,25 @@ where
 /// The node behind `prefix` (`A` or `B`), through the backend `<prefix>_BACKEND` names, or else
 /// `BACKEND`, or else `lnd`. For `lnd`: `<prefix>_ADDR` (https://host:port), `_CERT` (tls.cert),
 /// `_MAC` (a macaroon file). For `ldk`: `_ADDR` (host:port of the LDK Server's gRPC service),
-/// `_CERT` (its tls.crt), `_MAC` (its hex macaroon file).
+/// `_CERT` (its tls.crt), `_MAC` (its hex macaroon file). For `cln`: `_ADDR` (the path of the
+/// node's `lightning-rpc` socket).
 async fn node(prefix: &str) -> Box<dyn LightningBackend> {
     let backend = std::env::var(format!("{prefix}_BACKEND"))
         .or_else(|_| std::env::var("BACKEND"))
         .unwrap_or_else(|_| "lnd".into());
-    let (addr, cert, mac) = (
-        env(&format!("{prefix}_ADDR")),
-        env(&format!("{prefix}_CERT")),
-        env(&format!("{prefix}_MAC")),
-    );
+    let addr = env(&format!("{prefix}_ADDR"));
+    let file = |what: &str| env(&format!("{prefix}_{what}"));
     match backend.as_str() {
         "lnd" => Box::new(
-            LndBackend::connect(&addr, Path::new(&cert), Path::new(&mac))
+            LndBackend::connect(&addr, Path::new(&file("CERT")), Path::new(&file("MAC")))
                 .await
                 .expect("connect"),
         ),
         "ldk" => Box::new(
-            LdkBackend::connect(&addr, Path::new(&cert), Path::new(&mac)).expect("connect"),
+            LdkBackend::connect(&addr, Path::new(&file("CERT")), Path::new(&file("MAC")))
+                .expect("connect"),
         ),
+        "cln" => Box::new(ClnBackend::connect(Path::new(&addr))),
         other => panic!("no backend {other:?} in this build"),
     }
 }
@@ -312,7 +313,8 @@ async fn main() {
         payment_hash: hashes[0].1.clone(),
         amount_msat: 1_500_000,
         expiry_secs: 3600,
-        cltv_delta: 144,
+        // A day of blocks, or as many as B's node can give.
+        cltv_delta: b.max_hold_cltv_delta().map_or(144, |most| most.min(144)),
         description: "bipnip-ln conformance: hold".into(),
     };
     // A backend may be unable to hold a payment at all, and then says so before anything is

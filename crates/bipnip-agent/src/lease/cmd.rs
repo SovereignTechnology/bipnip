@@ -230,6 +230,32 @@ pub(crate) async fn can_hold(backend: &dyn LightningBackend) -> Result<(), Strin
     }
 }
 
+/// The seller's settings with the lock time brought down to what our node can give a hold
+/// invoice, if it has a limit. Refused when that is too short for the confirmations the offer
+/// asks buyers to wait for: the payment would go back while the channel is still confirming.
+/// Asked before anything is offered, not when a buyer has already taken the offer.
+pub(crate) fn fit_lock_time(
+    backend: &dyn LightningBackend,
+    seller: SellerConfig,
+    min_confirmations: u32,
+) -> Result<SellerConfig, String> {
+    let cltv_delta = match backend.max_hold_cltv_delta() {
+        Some(most) => seller.cltv_delta.min(most),
+        None => seller.cltv_delta,
+    };
+    let needed = min_confirmations.saturating_add(super::SELLER_SETTLE_MARGIN_BLOCKS);
+    if cltv_delta < needed {
+        return Err(format!(
+            "a hold invoice here would lock the buyer's payment for {cltv_delta} blocks; waiting \
+             for {min_confirmations} confirmations needs {needed}"
+        ));
+    }
+    Ok(SellerConfig {
+        cltv_delta,
+        ..seller
+    })
+}
+
 /// Everything [`offer`] does short of storing the run and sending the offer: the run, its first
 /// message and its link. Our node's binding is published here already; nothing is committed.
 pub async fn prepare_offer(
@@ -239,6 +265,7 @@ pub async fn prepare_offer(
 ) -> Result<(SellerRun, Outgoing, Link), String> {
     let config = session.config;
     can_hold(session.backend).await?;
+    let seller = fit_lock_time(session.backend, seller, params.min_confirmations)?;
     let instance = &session.instance().await?;
     let now = unix_now();
     let info = session
@@ -591,6 +618,104 @@ mod tests {
         assert_eq!(can_hold(&node).await, Ok(()));
         let refused = can_hold(&NoHold(node)).await.expect_err("cannot hold");
         assert!(refused.contains("cannot sell a lease"), "{refused}");
+    }
+
+    #[test]
+    fn the_lock_time_is_what_the_node_can_give_or_the_offer_is_refused() {
+        use std::sync::{Arc, Mutex};
+
+        use async_trait::async_trait;
+        use bipnip_ln::{
+            BackendError, ChannelView, GraphChannel, HoldInvoiceRequest, HoldState, NodeInfo,
+            OpenRequest, PaymentState,
+        };
+
+        use crate::lease::tests::{Node, World, secret};
+        use crate::lease::{DEFAULT_SELLER_CLTV_DELTA, SELLER_SETTLE_MARGIN_BLOCKS};
+
+        /// A node whose hold invoices lock for at most so many blocks.
+        struct Capped(Node, u32);
+
+        #[async_trait]
+        impl LightningBackend for Capped {
+            fn max_hold_cltv_delta(&self) -> Option<u32> {
+                Some(self.1)
+            }
+            async fn node_info(&self) -> Result<NodeInfo, BackendError> {
+                self.0.node_info().await
+            }
+            async fn sign_message(&self, msg: &[u8]) -> Result<String, BackendError> {
+                self.0.sign_message(msg).await
+            }
+            async fn add_hold_invoice(
+                &self,
+                r: &HoldInvoiceRequest,
+            ) -> Result<String, BackendError> {
+                self.0.add_hold_invoice(r).await
+            }
+            async fn hold_invoice_state(&self, h: &str) -> Result<HoldState, BackendError> {
+                self.0.hold_invoice_state(h).await
+            }
+            async fn settle_hold_invoice(&self, p: &str) -> Result<(), BackendError> {
+                self.0.settle_hold_invoice(p).await
+            }
+            async fn cancel_hold_invoice(&self, h: &str) -> Result<(), BackendError> {
+                self.0.cancel_hold_invoice(h).await
+            }
+            async fn pay_invoice(
+                &self,
+                b: &str,
+                f: u64,
+                w: u32,
+            ) -> Result<PaymentState, BackendError> {
+                self.0.pay_invoice(b, f, w).await
+            }
+            async fn payment_state(&self, h: &str) -> Result<PaymentState, BackendError> {
+                self.0.payment_state(h).await
+            }
+            async fn add_invoice(&self, a: u64, e: u32, d: &str) -> Result<String, BackendError> {
+                self.0.add_invoice(a, e, d).await
+            }
+            async fn connect(&self, p: &str, a: &str) -> Result<(), BackendError> {
+                self.0.connect(p, a).await
+            }
+            async fn open_channel(&self, r: &OpenRequest) -> Result<String, BackendError> {
+                self.0.open_channel(r).await
+            }
+            async fn channels_with(&self, r: &str) -> Result<Vec<ChannelView>, BackendError> {
+                self.0.channels_with(r).await
+            }
+            async fn graph_node(&self, n: &str) -> Result<Option<(u32, u64)>, BackendError> {
+                self.0.graph_node(n).await
+            }
+            async fn graph_channels(&self, n: &str) -> Result<Vec<GraphChannel>, BackendError> {
+                self.0.graph_channels(n).await
+            }
+        }
+
+        let node = || Node {
+            world: Arc::new(Mutex::new(World::default())),
+            secret: secret(1),
+            network: "regtest",
+        };
+        let asked = SellerConfig {
+            cltv_delta: DEFAULT_SELLER_CLTV_DELTA,
+            feerate_sat_vb: 2,
+        };
+        // A node without a limit gives what was asked.
+        let fitted = fit_lock_time(&node(), asked, 3).expect("fits");
+        assert_eq!(fitted.cltv_delta, DEFAULT_SELLER_CLTV_DELTA);
+        // A node that gives 80 blocks at most: the offer asks for 80, never more.
+        let fitted = fit_lock_time(&Capped(node(), 80), asked, 3).expect("fits");
+        assert_eq!((fitted.cltv_delta, fitted.feerate_sat_vb), (80, 2));
+        // A limit above what was asked changes nothing.
+        let fitted = fit_lock_time(&Capped(node(), 500), asked, 3).expect("fits");
+        assert_eq!(fitted.cltv_delta, DEFAULT_SELLER_CLTV_DELTA);
+        // 80 blocks hold for 44 confirmations and the margin, and not for 45.
+        let most = 80 - SELLER_SETTLE_MARGIN_BLOCKS;
+        assert!(fit_lock_time(&Capped(node(), 80), asked, most).is_ok());
+        let refused = fit_lock_time(&Capped(node(), 80), asked, most + 1).expect_err("too short");
+        assert!(refused.contains("80 blocks"), "{refused}");
     }
 
     #[test]

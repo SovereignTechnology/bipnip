@@ -478,9 +478,11 @@ name = "bipnip-ln"
 version = "0.0.1"
 dependencies = [
  "async-trait",
+ "cln-rpc",
  "fedimint-tonic-lnd",
  "ldk-server-client",
  "rustls",
+ "serde_json",
  "tokio",
 ]
 
@@ -517,6 +519,7 @@ dependencies = [
  "hex-conservative 0.2.3",
  "hex_lit",
  "secp256k1 0.29.100",
+ "serde",
 ]
 
 [[package]]
@@ -558,6 +561,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9cb95693f371d089a4b5b6fc41c6f3ea6e01ee8c15388335dfac8ea685173b51"
 dependencies = [
  "bitcoin-consensus-encoding",
+ "serde",
 ]
 
 [[package]]
@@ -568,6 +572,7 @@ checksum = "bca4c7abb40c8817d77403c880988cfd484f23ab2365726afb2f798363e2c4a2"
 dependencies = [
  "bitcoin-io",
  "hex-conservative 0.2.3",
+ "serde",
 ]
 
 [[package]]
@@ -810,6 +815,24 @@ dependencies = [
  "crypto-common 0.2.2",
  "inout 0.2.6",
  "zeroize",
+]
+
+[[package]]
+name = "cln-rpc"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d9f5e26f0a2713ea1393eb3117c148295fa4c5f7db529713b20323ca7cc37aa"
+dependencies = [
+ "anyhow",
+ "bitcoin",
+ "bytes",
+ "futures-util",
+ "hex",
+ "log",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -3602,7 +3625,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -3640,9 +3663,9 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4024,7 +4047,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4189,6 +4212,7 @@ checksum = "fa163bcf53957be4beb29c82e6ea07c604dc6e27b7bd904ab8163dfb4ee9a3a9"
 dependencies = [
  "bitcoin_hashes 0.14.101",
  "secp256k1-sys",
+ "serde",
 ]
 
 [[package]]

@@ -125,6 +125,9 @@ impl LightningBackend for NoHold {
     async fn hold_invoice_state(&self, _: &str) -> Result<HoldState, BackendError> {
         Err(BackendError::Unsupported("this node holds no payments"))
     }
+    fn max_hold_cltv_delta(&self) -> Option<u32> {
+        self.0.max_hold_cltv_delta()
+    }
     async fn settle_hold_invoice(&self, _: &str) -> Result<(), BackendError> {
         Err(BackendError::Unsupported("this node holds no payments"))
     }

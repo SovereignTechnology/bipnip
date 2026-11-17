@@ -117,14 +117,28 @@ fn ldk_backend(_: &bipnip_agent::config::LdkConfig) -> Result<Box<dyn LightningB
     Err("this build has no LDK Server support (build with --features ldk)".into())
 }
 
+#[cfg(feature = "cln")]
+fn cln_backend(cln: &bipnip_agent::config::ClnConfig) -> Result<Box<dyn LightningBackend>, String> {
+    Ok(Box::new(bipnip_ln::cln::ClnBackend::connect(
+        &cln.rpc_socket,
+    )))
+}
+
+#[cfg(not(feature = "cln"))]
+fn cln_backend(_: &bipnip_agent::config::ClnConfig) -> Result<Box<dyn LightningBackend>, String> {
+    Err("this build has no Core Lightning support (build with --features cln)".into())
+}
+
 /// The agent's node: the one the configuration names.
 async fn backend(config: &Config) -> Result<Box<dyn LightningBackend>, String> {
-    match (&config.lnd, &config.ldk) {
-        (Some(lnd), _) => lnd_backend(lnd).await,
-        (None, Some(ldk)) => ldk_backend(ldk),
-        (None, None) => {
-            Err("no Lightning node configured (add an [lnd] or an [ldk] section)".into())
-        }
+    if let Some(lnd) = &config.lnd {
+        lnd_backend(lnd).await
+    } else if let Some(ldk) = &config.ldk {
+        ldk_backend(ldk)
+    } else if let Some(cln) = &config.cln {
+        cln_backend(cln)
+    } else {
+        Err("no Lightning node configured (add an [lnd], [ldk] or [cln] section)".into())
     }
 }
 
@@ -159,7 +173,7 @@ fn whoami_keys(wallet: &Wallet) -> Result<(), String> {
 
 async fn whoami(config: &Config) -> Result<(), String> {
     whoami_keys(&load_wallet(config)?)?;
-    if config.lnd.is_some() || config.ldk.is_some() {
+    if config.lnd.is_some() || config.ldk.is_some() || config.cln.is_some() {
         let info = backend(config)
             .await?
             .node_info()
