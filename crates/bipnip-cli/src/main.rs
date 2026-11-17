@@ -28,6 +28,9 @@
 //!
 //! The socket is `--socket`, else `$BIPNIP_SOCKET`, else `~/.bipnip/agent.sock`.
 //!
+//! The result goes to standard output: the lines of the runs for a list, JSON otherwise. What
+//! happens on the way, and errors, go to standard error. `watch` prints one line per change.
+//!
 //! Exit status: 0 when the agent did it, 1 when it refused or failed, 2 when the command line
 //! is wrong or the agent cannot be reached, 3 when the request is parked and waits for
 //! `bipnip approve`.
@@ -301,10 +304,15 @@ fn talk(socket: &Path, method: &str, params: Value) -> Result<u8, String> {
             return Err("the agent answered with something that is not JSON".into());
         };
         match answer["ok"].as_bool() {
-            // A status line: something that happened on the way.
+            // A status line: something that happened on the way. For `watch` these are the
+            // answer; for anything else they are remarks, kept apart from the result.
             None => {
-                let text = answer["line"].as_str().map(str::to_string);
-                println!("{}", text.unwrap_or(line));
+                let text = answer["line"].as_str().map(str::to_string).unwrap_or(line);
+                if method == "watch" {
+                    println!("{text}");
+                } else {
+                    eprintln!("{text}");
+                }
             }
             Some(true) => {
                 show(method, &answer["result"]);
