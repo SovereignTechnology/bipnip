@@ -175,9 +175,10 @@ grep -q "revoked" "$W/verify2.out" || fail "no revocation reported"
 log "AGENT E2E PASS: init, bind, publish, verify, revoke against a real LND node"
 
 # --- two agents lease through a real instance ---------------------------------------------------
-# bipnipd main (lease handlers, the public lease order, ring handlers) plus ring bonds: the head of
-# bipnipd #7, which is still in review. Move this to main once that is merged.
-BIPNIPD_REV=56c5107b5f8d6c8ead78ce9ccd699d443ffb74d8
+# bipnipd main (lease handlers, the public lease order, ring handlers) plus bonds on rings and on
+# leases: the head of the two bipnipd bond PRs, which are still in review. Move this to main once
+# they are merged.
+BIPNIPD_REV=46fa73a07b6d9e8e529aa4663054c618adab1c36
 log "build the instance (bipnipd ${BIPNIPD_REV:0:12})"
 git clone --quiet https://github.com/SovereignTechnology/bipnipd "$W/bipnipd"
 git -C "$W/bipnipd" checkout --quiet "$BIPNIPD_REV"
@@ -215,7 +216,8 @@ for key, value in values.items():
     text, n = re.subn(rf"(?m)^{key} = .*$", f"{key} = {value}", text)
     assert n == 1, (key, n)
 # This instance takes ring bonds: its node (carol) holds them.
-text += "\n[liquidity]\nbonds = true\nmax_bond_sat = 100000\n"
+# A lease buyer's bond is decided 180 seconds after the take (48 hours by default).
+text += "\n[liquidity]\nbonds = true\nmax_bond_sat = 100000\nlease_bond_window_secs = 180\n"
 open(sys.argv[2], "w").write(text)
 PY
 chmod 600 "$W/instance/settings.toml"
@@ -531,6 +533,122 @@ fee = int(paid[0]["fee_sat"])
 assert 0 <= fee <= bond - payout, fee
 print(f"  the instance took {bond}, paid on {payout} plus a routing fee of {fee}, and kept {bond - payout - fee}")
 ' "$BOND" "$PAYOUT" || fail "the instance's node paid out something other than the one payout"
-kill "$INSTANCE_PID"
 
 log "INSTANCE BOND E2E PASS: two rings with bonds through a real bipnipd: bonds locked before anyone opened and returned when both opened; with one member gone after paying, the other's channel stood, its bond came back, and the missing member's bond was taken and paid on to it"
+
+# --- leases with a buyer's bond ------------------------------------------------------------------
+lbond_dump() {
+  for f in "$W"/lbond-*.out "$W"/lbond-*.err; do [ -s "$f" ] && sed "s|^|  $(basename "$f"): |" "$f"; done
+  instance_log 120
+}
+lease_order_of() { grep -m1 "state=open" "$1" | sed 's/.*order=\([^ ]*\).*/\1/'; }
+log "bonded lease: bob offers liquidity and asks its buyer for a $BOND sat bond; alice takes 444444 sat"
+"$AGENT" --config "$W/bob.toml" lease offer --min-capacity 300000 --max-capacity 1000000 \
+  --duration 144 --fee-base 1000 --fee-ppm 2000 --feerate 2 --confs 3 --expires-in 3600 \
+  --bond "$BOND" --poll 2 > "$W/lbond-a-offer.out" 2> "$W/lbond-a-offer.err" &
+OFFER_PID=$!
+wait_until 90 grep -q "state=open" "$W/lbond-a-offer.out" || { lbond_dump; fail "the bonded offer did not open"; }
+LORDER_A=$(lease_order_of "$W/lbond-a-offer.out")
+"$AGENT" --config "$W/alice.toml" lease take "$LORDER_A" --capacity 444444 \
+  --node-address "127.0.0.1:${P2P[alice]}" --poll 2 > "$W/lbond-a-take.out" 2> "$W/lbond-a-take.err" &
+TAKE_PID=$!
+lbond_active() { grep -q "state=active" "$W/lbond-a-offer.out" && grep -q "state=active" "$W/lbond-a-take.out"; }
+t=0
+until lbond_active; do
+  kill -0 "$OFFER_PID" 2>/dev/null || grep -q "state=active" "$W/lbond-a-offer.out" || { lbond_dump; fail "the seller's agent stopped early"; }
+  kill -0 "$TAKE_PID" 2>/dev/null || grep -q "state=active" "$W/lbond-a-take.out" || { lbond_dump; fail "the buyer's agent stopped early"; }
+  "$W/mine.sh" 1; sleep 2; t=$((t+1))
+  [ "$t" -lt 120 ] || { lbond_dump; fail "the bonded lease did not become active"; }
+done
+wait "$OFFER_PID" || fail "the seller's agent exited with an error"
+wait "$TAKE_PID" || fail "the buyer's agent exited with an error"
+log "bonded lease: the bond was paid before the seller was asked for anything, and it came back"
+python3 - "$W/lbond-a-take.out" <(lnc carol listinvoices) <(lnc bob listinvoices) "$BOND" <<'PY' || { lbond_dump; fail "alice paid the seller before her bond was out"; }
+import json, sys
+# The agent prints a line when its state changes. From the line that shows the seller paid, every
+# line must show the bond already out.
+lines = open(sys.argv[1]).read().splitlines()
+after = [line for line in lines if any(f" state={s} " in line for s in ("paid", "verifying", "released", "active"))]
+assert after and all(" bond=sent " in line for line in after), after
+assert any(" state=taking " in line and " bond=awaited " in line for line in lines), lines
+# And on the nodes: the instance's node held the bond before the seller's node made its invoice,
+# since the instance passes the take on only once the bond is locked. 1000 sat + 2000 ppm of
+# 444444 sat is 1888 sat, all of it upfront.
+bonds = [i for i in json.load(open(sys.argv[2]))["invoices"] if i["value"] == sys.argv[4] and i["htlcs"]]
+locked = max(int(h["accept_time"]) for h in max(bonds, key=lambda i: int(i["creation_date"]))["htlcs"])
+asked = max(int(i["creation_date"]) for i in json.load(open(sys.argv[3]))["invoices"] if i["value"] == "1888")
+assert 0 < locked <= asked, (locked, asked)
+PY
+python3 - "$W/instance/mostro.db" "$LORDER_A" "$BOND" <<'PY' || { lbond_dump; fail "the instance's record of the returned lease bond is wrong"; }
+import sqlite3, sys
+db = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+status = db.execute("SELECT status FROM lease_offers WHERE id = ?", (sys.argv[2],)).fetchone()[0]
+assert status in ("active", "completion"), status
+rows = db.execute("SELECT state, node_done, amount_sat FROM liquidity_bonds WHERE kind = 'lease' AND order_id = ?", (sys.argv[2],)).fetchall()
+assert rows == [("released", 1, int(sys.argv[3]))], rows
+PY
+lbond_back() {
+  [ "$(payments_of alice "$BOND")" = "['FAILED', 'FAILED', 'FAILED']" ] || return 1
+  [ "$(invoices_of carol "$BOND")" = "['CANCELED', 'CANCELED', 'CANCELED', 'CANCELED', 'SETTLED']" ] || return 1
+}
+wait_until 60 lbond_back || { payments_of alice "$BOND"; invoices_of carol "$BOND"; lbond_dump; fail "the lease bond did not come back"; }
+
+log "bonded lease: another; alice's agent is stopped once bob has opened the channel"
+"$AGENT" --config "$W/bob.toml" lease offer --min-capacity 300000 --max-capacity 1000000 \
+  --duration 144 --fee-base 1000 --fee-ppm 2000 --feerate 2 --confs 3 --expires-in 3600 \
+  --bond "$BOND" --poll 2 > "$W/lbond-b-offer.out" 2> "$W/lbond-b-offer.err" &
+BOB_PID=$!
+wait_until 90 grep -q "state=open" "$W/lbond-b-offer.out" || { lbond_dump; fail "the second bonded offer did not open"; }
+LORDER_B=$(lease_order_of "$W/lbond-b-offer.out")
+"$AGENT" --config "$W/alice.toml" lease take "$LORDER_B" --capacity 333333 \
+  --node-address "127.0.0.1:${P2P[alice]}" --poll 2 > "$W/lbond-b-take.out" 2> "$W/lbond-b-take.err" &
+ALICE_PID=$!
+# No block is mined until alice's agent is gone: it cannot verify an unconfirmed channel, so it
+# cannot have released the preimage.
+wait_until 150 grep -q "state=opened" "$W/lbond-b-offer.out" || { lbond_dump; fail "bob did not open the channel"; }
+kill "$ALICE_PID"; wait "$ALICE_PID" 2>/dev/null || true
+grep -q "state=released\|state=active" "$W/lbond-b-take.out" && { lbond_dump; fail "alice released the preimage before she was stopped"; }
+# Six confirmations announce the channel, so the instance's node can see it.
+"$W/mine.sh" 8
+t=0
+until grep -q " buyer-bond=paid" "$W/lbond-b-offer.out"; do
+  kill -0 "$BOB_PID" 2>/dev/null || { lbond_dump; fail "the seller's agent stopped before it was paid the bond"; }
+  sleep 2; t=$((t+1))
+  [ "$t" -lt 200 ] || { lbond_dump; fail "bob was not paid the bond alice lost"; }
+done
+wait "$BOB_PID" || fail "the seller's agent exited with an error"
+tail -1 "$W/lbond-b-offer.out" | sed 's/^/  bob: /'
+
+log "bonded lease: bob's channel stands, he was paid alice's bond, and her upfront payment went back"
+"$AGENT" --config "$W/bob.toml" lease list | grep "^seller order=$LORDER_B state=canceled " | grep -q " buyer-bond=paid" \
+  || fail "bob's stored lease does not show the bond paid"
+lnc bob listchannels | python3 -c '
+import json, sys
+leased = [c for c in json.load(sys.stdin)["channels"] if c["capacity"] == "333333"]
+assert len(leased) == 1 and leased[0]["initiator"], leased
+' || fail "bob does not have the one channel he opened for the lease"
+python3 - "$W/instance/mostro.db" "$LORDER_B" <<'PY' || { lbond_dump; fail "the instance's record of the taken lease bond is wrong"; }
+import sqlite3, sys
+db = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+seller = db.execute("SELECT seller_identity FROM lease_offers WHERE id = ?", (sys.argv[2],)).fetchone()[0]
+rows = db.execute("SELECT state, node_done, recipient_identity FROM liquidity_bonds WHERE kind = 'lease' AND order_id = ?", (sys.argv[2],)).fetchall()
+assert rows == [("paid", 1, seller)], rows
+PY
+lbond_taken() {
+  [ "$(payments_of alice "$BOND")" = "['FAILED', 'FAILED', 'FAILED', 'SUCCEEDED']" ] || return 1
+  [ "$(invoices_of bob "$PAYOUT")" = "['SETTLED']" ] || return 1
+  [ "$(invoices_of carol "$BOND")" = "['CANCELED', 'CANCELED', 'CANCELED', 'CANCELED', 'SETTLED', 'SETTLED']" ] || return 1
+  # Paid the bond, bob gave alice's upfront payment back: nothing of hers is still locked.
+  lnc alice listpayments --include_incomplete | python3 -c 'import json,sys; sys.exit(any(p["status"] == "IN_FLIGHT" for p in json.load(sys.stdin)["payments"]))'
+}
+wait_until 60 lbond_taken || { payments_of alice "$BOND"; invoices_of bob "$PAYOUT"; invoices_of carol "$BOND"; lbond_dump; fail "the nodes do not show the lease bond taken and paid on"; }
+lnc carol listpayments --include_incomplete | python3 -c '
+import json, sys
+bond, payout = int(sys.argv[1]), int(sys.argv[2])
+paid = [p for p in json.load(sys.stdin)["payments"] if p["status"] == "SUCCEEDED"]
+assert len(paid) == 2 and all(int(p["value_sat"]) == payout for p in paid), paid
+assert all(0 <= int(p["fee_sat"]) <= bond - payout for p in paid), paid
+' "$BOND" "$PAYOUT" || fail "the instance's node paid out something other than the two payouts"
+kill "$INSTANCE_PID"
+
+log "INSTANCE LEASE BOND E2E PASS: two leases with a buyer's bond through a real bipnipd: the bond was locked before the seller was asked and came back when the lease became active; with the buyer gone after the channel opened, its bond was taken and paid on to the seller, who then gave the upfront payment back"

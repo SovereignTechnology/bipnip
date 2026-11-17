@@ -39,11 +39,10 @@ unless noted):
 
 Implemented so far (`bipnip-core`, `lease`, `lease_message` and `lease_order`): `node`, `network`,
 `capacity`, `duration`, `fee`, `split`, `confs`, `announce`, `bond` and the expiry. `fee_caps`,
-`channel_type` and `rules` are not part of the v1 contract yet. The `bond` tag and the offer's `bond_sat`
-are defined (0, or at least 1 000 sat, at most the smallest capacity on offer, announced channels only;
-the bond is not in the contract text: the buyer agrees to it by paying the instance's bond invoice), with
-the actions `lease-bond-invoice` and `lease-bond-claim`; instances do not take a lease bond yet and refuse
-an offer that asks for one. Ring bonds work (`liquidity-rings.md`).
+`channel_type` and `rules` are not part of the v1 contract yet. The buyer's bond works as described under
+[The buyer's bond](#the-buyers-bond): the `bond` tag and the offer's `bond_sat` (0, or at least 1 000 sat,
+at most the smallest capacity on offer, announced channels only). The bond is not in the contract text:
+the buyer agrees to it by paying the instance's bond invoice.
 
 ### Status
 
@@ -95,6 +94,8 @@ Mostro protocol v2 messages with these actions; all but the first carry the orde
 | `lease-preimage` | buyer → seller, *peer* only | `preimage`: lease id, preimage |
 | `lease-active` | seller → instance → buyer | none |
 | `lease-completion-invoice` | seller → instance → buyer | `invoice`: lease id, BOLT 11 invoice |
+| `lease-bond-invoice` | instance → buyer, when the offer asks for a bond | `invoice`: lease id, a hold invoice on the instance's node |
+| `lease-bond-claim` | instance → seller: none ("the buyer's bond is owed to you"); seller → instance: `invoice`: lease id, the seller's own invoice | |
 
 A binding carried in a message must verify and bind that node, on that network, to the Nostr key that
 sent the message. That shows the node once vouched for the key; a receiver that can reach relays still
@@ -108,8 +109,9 @@ between the two trade keys over the same transport.
 1. **Take.** The buyer's agent generates a random 32-byte preimage `P`, computes `H = sha256(P)`, writes
    the contract (capacity, the offer's terms, both nodes, `H`) and sends `take-lease` with the order id,
    the contract, its binding event and, if needed, its node address. The instance checks the binding,
-   the contract against the offer, and the rules against its own graph; if `bond > 0` it asks the buyer
-   to pay a bond hold invoice (Mostro's bond flow).
+   the contract against the offer, and the rules against its own graph. If the offer asks for a bond,
+   the take waits here: the instance sends the buyer a `lease-bond-invoice`, and goes on only once that
+   payment is locked (an hour at most; otherwise the lease is canceled and the seller was never asked).
 2. **Invoice.** The instance forwards the take to the seller. The seller's agent has its **own node**
    create a hold invoice on `H` for the upfront share, valid ≤ 48 h, `min_final_cltv_expiry_delta` within
    the instance's `payment_cltv_limit` and at least `confs` + 36 blocks (room to open, confirm and
@@ -130,13 +132,36 @@ between the two trade keys over the same transport.
    share (`lease-completion-invoice`); the buyer's agent pays it if its node still sees the channel open.
 8. **Outcomes.** Each party may publish a kind 8735 outcome; both may rate through Mostro's rating flow.
 
+## The buyer's bond
+
+An offer may ask its buyer for a bond, so that a buyer who walks away from an opened channel pays for
+it. It is a hold invoice on the instance's own node, for a preimage only the instance knows, on the same
+terms as a ring's bond (`liquidity-rings.md`): the buyer's agent pays it only if it pays the node the
+instance's own binding names, for exactly the order's bond, with a final CLTV delta of at most 720 blocks,
+and only up to the limit the buyer set on its own agent.
+
+- **Returned** when the seller reports the lease active; when the lease is canceled before the seller
+  reported a channel; and when the seller itself cancels.
+- **Decided at the end of the bond window** (48 hours from the take unless the instance sets less) when
+  the lease never became active after the seller reported a channel, whether the buyer canceled or just
+  went quiet. The instance looks in its own node's graph for the outpoint the seller reported: between
+  the two nodes, of the contract's capacity, and not there when the bond was locked. If it is there, the
+  bond is taken and owed to the seller; if not, it is returned. The seller's word alone never takes it.
+- **Paid on.** The instance tells the seller (`lease-bond-claim` without a payload); the seller answers
+  with an invoice for the bond less the 1% routing reserve. When its own node shows that paid, the seller
+  cancels the lease's hold invoice, so the buyer's upfront payment goes back: a seller is paid the bond or
+  the fee, never both. An unclaimed bond stays with the instance after seven days.
+
+What the buyer trusts the instance with is what a ring member does: the bond itself, the instance's view
+of the graph, and liveness. What the seller trusts it with is being paid on a bond that was taken.
+
 ## Failure handling
 
 | case | result |
 |---|---|
 | seller never opens | the seller cancels, or the HTLC times out; the buyer is refunded; negative outcome |
 | channel differs from the terms | the buyer does not release `P`; the invoice expires; dispute if the seller claims otherwise |
-| buyer withholds `P` after a verified open | announced channel visible in the instance's graph → the buyer bond is slashed to the seller; unannounced → solver decides from the signed messages |
+| buyer withholds `P` after a verified open | with a bond: once the bond window has ended, an announced channel visible in the instance's own graph → the buyer's bond is paid on to the seller, who then gives the upfront payment back. Without a bond, or unannounced: the upfront payment times out and the seller keeps a channel it was not paid for; a solver may later decide from the signed messages |
 | seller closes early | completion share unpaid; negative outcome |
 | seller raises fees above `fee_caps` | negative outcome; buyer may close |
 

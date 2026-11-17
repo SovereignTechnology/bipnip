@@ -4,10 +4,11 @@
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
-use bipnip_ln::{HoldState, LightningBackend, OpenRequest, PaymentState};
+use bipnip_ln::{HoldInvoiceRequest, HoldState, LightningBackend, OpenRequest, PaymentState};
 use lightning_invoice::Bolt11Invoice;
+use mostro_core::bond::{MAX_BOND_CLTV_DELTA, payout_sat};
 use mostro_core::lease::LeaseContract;
-use mostro_core::lease_message::{LeaseOffer, LeasePayload};
+use mostro_core::lease_message::{LeaseInvoice, LeaseOffer, LeasePayload};
 use mostro_core::node_binding::{
     Action as BindingAction, Network, SignedStatement, Statement, sign_ln_message,
 };
@@ -15,10 +16,10 @@ use mostro_core::prelude::{Action, CantDoReason, Message, Payload, Peer};
 use nostr_sdk::prelude::{FinalizeEvent, Keys, PublicKey};
 use uuid::Uuid;
 
-use super::{NOW, Node, World, confirm, pair};
+use super::{NOW, Node, World, confirm, pair, secret};
 use crate::lease::run::{
-    BuyerConfig, BuyerRun, BuyerState, Outgoing, RunError, SellerConfig, SellerRun, SellerState,
-    TakeRequest,
+    BondTerms, BuyerConfig, BuyerRun, BuyerState, Outgoing, RunError, SellerConfig, SellerRun,
+    SellerState, TakeRequest,
 };
 use crate::lease::{DEFAULT_MAX_CLTV_DELTA, DEFAULT_SELLER_CLTV_DELTA, LeaseStepError};
 use crate::lease_wire::{self, Incoming, WireError};
@@ -202,6 +203,7 @@ impl Stage {
             terms: self.offer.terms_for(2_000_000).expect("terms"),
             binding: binding(&self.buyer_node, &self.buyer.identity),
             node_address: Some("203.0.113.7:9735".into()),
+            bond: None,
         }
     }
 
@@ -1073,4 +1075,371 @@ async fn a_refusal_from_the_instance_ends_what_it_refused() {
         .await;
     assert!(matches!(result, Err(RunError::Refused(_))), "{result:?}");
     assert_eq!(buyer.state(), BuyerState::Canceled);
+}
+
+// ---- the buyer's bond ----------------------------------------------------------------------
+
+/// What the buyer of a bonded test lease locks.
+const BOND: u64 = 50_000;
+
+/// A stage whose offer asks its buyer for a bond, and the instance's own node.
+fn bonded_stage() -> (Stage, Node) {
+    let mut stage = Stage::new();
+    stage.offer.bond_sat = BOND;
+    let house = Node {
+        world: stage.world.clone(),
+        secret: secret(99),
+        network: "regtest",
+    };
+    (stage, house)
+}
+
+/// A bond invoice as the instance would send it: a hold invoice from `node` for `amount_sat`.
+async fn bond_invoice(
+    stage: &Stage,
+    node: &Node,
+    lease_id: String,
+    amount_sat: u64,
+    cltv_delta: u32,
+    n: u8,
+) -> Message {
+    let request = HoldInvoiceRequest {
+        payment_hash: format!("{n:02x}").repeat(32),
+        amount_msat: amount_sat * 1_000,
+        expiry_secs: 3_600,
+        cltv_delta,
+        description: "bond".into(),
+    };
+    let invoice = node.add_hold_invoice(&request).await.expect("invoice");
+    Message::new_order(
+        Some(stage.order_id),
+        None,
+        None,
+        Action::LeaseBondInvoice,
+        Some(Payload::Lease(LeasePayload::Invoice(LeaseInvoice {
+            lease_id,
+            invoice,
+        }))),
+    )
+}
+
+#[tokio::test]
+async fn the_buyer_pays_its_bond_once_and_only_to_the_instances_node_for_the_orders_amount() {
+    let (stage, house) = bonded_stage();
+    let mut request = stage.take_request();
+    request.bond = Some(BondTerms {
+        instance_node: house.id(),
+        bond_sat: BOND,
+    });
+    let (mut buyer, take) = stage.take(request).await;
+    let lease_id = buyer.contract().id();
+    assert_eq!(buyer.bond_status(), "awaited");
+    assert!(
+        buyer
+            .tick(&stage.buyer_node)
+            .await
+            .expect("tick")
+            .is_empty()
+    );
+    assert_eq!(stage.payments(), 0);
+
+    // Invoices that are not the order's bond to the instance's node are never kept.
+    let stranger = Node {
+        world: stage.world.clone(),
+        secret: secret(42),
+        network: "regtest",
+    };
+    let wrong = [
+        (
+            "another node",
+            bond_invoice(&stage, &stranger, lease_id.clone(), BOND, 300, 1).await,
+        ),
+        (
+            "the seller's node",
+            bond_invoice(&stage, &stage.seller_node, lease_id.clone(), BOND, 300, 2).await,
+        ),
+        (
+            "a larger amount",
+            bond_invoice(&stage, &house, lease_id.clone(), BOND + 1, 300, 3).await,
+        ),
+        (
+            "too long a lock",
+            bond_invoice(
+                &stage,
+                &house,
+                lease_id.clone(),
+                BOND,
+                MAX_BOND_CLTV_DELTA + 1,
+                4,
+            )
+            .await,
+        ),
+        (
+            "another lease",
+            bond_invoice(&stage, &house, "ef".repeat(32), BOND, 300, 5).await,
+        ),
+    ];
+    for (what, message) in wrong {
+        let refused = stage.to_buyer(&mut buyer, &message).await;
+        assert!(refused.is_err(), "{what}: {refused:?}");
+        assert!(buyer.bond().is_none(), "{what}");
+    }
+    assert!(
+        buyer
+            .tick(&stage.buyer_node)
+            .await
+            .expect("tick")
+            .is_empty()
+    );
+    assert_eq!(stage.payments(), 0);
+
+    // The real one is kept, and paid only on the next look at the node, once.
+    let good = bond_invoice(&stage, &house, lease_id.clone(), BOND, 300, 6).await;
+    assert!(
+        stage
+            .to_buyer(&mut buyer, &good)
+            .await
+            .expect("bond")
+            .is_empty()
+    );
+    assert_eq!(buyer.bond_status(), "checked");
+    assert_eq!(stage.payments(), 0);
+    let hash = "06".repeat(32);
+    assert_eq!(buyer.bond().expect("bond").payment_hash, hash);
+    for _ in 0..3 {
+        assert!(
+            buyer
+                .tick(&stage.buyer_node)
+                .await
+                .expect("tick")
+                .is_empty()
+        );
+        assert_eq!(buyer.bond_status(), "sent");
+        assert_eq!(stage.payments(), 1);
+    }
+    {
+        let world = stage.world.lock().expect("world");
+        assert_eq!(world.invoices.get(&hash), Some(&HoldState::Accepted));
+        assert_eq!(world.payments.get(&hash), Some(&PaymentState::InFlight));
+    }
+    // The same invoice again is fine; another one is not taken.
+    assert!(
+        stage
+            .to_buyer(&mut buyer, &good)
+            .await
+            .expect("again")
+            .is_empty()
+    );
+    let second = bond_invoice(&stage, &house, lease_id, BOND, 300, 7).await;
+    let refused = stage.to_buyer(&mut buyer, &second).await;
+    assert!(
+        matches!(refused, Err(RunError::OutOfOrder(_))),
+        "{refused:?}"
+    );
+    assert_eq!(stage.payments(), 1);
+
+    // The instance accepted the take (it sent the bond invoice), so a later refusal, of a take
+    // that went out twice, does not end the run.
+    let refusal = Message::cant_do(
+        Some(stage.order_id),
+        Some(2),
+        Some(Payload::CantDo(Some(CantDoReason::NotAllowedByStatus))),
+    );
+    let refused = stage.to_buyer(&mut buyer, &refusal).await;
+    assert!(matches!(refused, Err(RunError::Refused(_))), "{refused:?}");
+    assert_eq!(buyer.state(), BuyerState::Taking);
+
+    // With the bond locked the take reaches the seller, and the lease runs as any other.
+    let mut seller = stage.offered().await;
+    let invoice = to_instance(stage.to_seller(&mut seller, &take).await.expect("take"));
+    stage
+        .to_buyer(&mut buyer, &stage.peer_key(&stage.seller.trade))
+        .await
+        .expect("peer key");
+    stage.to_buyer(&mut buyer, &invoice).await.expect("invoice");
+    assert_eq!(buyer.state(), BuyerState::Paid);
+    assert_eq!(stage.payments(), 2);
+}
+
+#[tokio::test]
+async fn a_lease_without_a_bond_takes_no_bond_invoice() {
+    let stage = Stage::new();
+    let house = Node {
+        world: stage.world.clone(),
+        secret: secret(99),
+        network: "regtest",
+    };
+    let (mut buyer, _) = stage.take(stage.take_request()).await;
+    let lease_id = buyer.contract().id();
+    let message = bond_invoice(&stage, &house, lease_id, BOND, 300, 1).await;
+    let refused = stage.to_buyer(&mut buyer, &message).await;
+    assert!(
+        matches!(refused, Err(RunError::OutOfOrder(_))),
+        "{refused:?}"
+    );
+    assert_eq!(buyer.bond_status(), "-");
+    assert!(
+        buyer
+            .tick(&stage.buyer_node)
+            .await
+            .expect("tick")
+            .is_empty()
+    );
+    assert_eq!(stage.payments(), 0);
+}
+
+/// The invoice in a bond claim the seller sent.
+fn claimed(out: Vec<Outgoing>, lease_id: &str) -> String {
+    let message = to_instance(out);
+    assert!(message.verify());
+    let kind = message.get_inner_message_kind();
+    assert_eq!(kind.action, Action::LeaseBondClaim);
+    let Some(Payload::Lease(LeasePayload::Invoice(claim))) = &kind.payload else {
+        panic!("not a claim");
+    };
+    assert_eq!(claim.lease_id, lease_id);
+    claim.invoice.clone()
+}
+
+#[tokio::test]
+async fn a_seller_owed_the_buyers_bond_claims_it_and_then_gives_the_upfront_payment_back() {
+    let (stage, house) = bonded_stage();
+    let (mut seller, _buyer) = stage.opened().await;
+    let contract = seller.contract().expect("contract").clone();
+    let node = &stage.seller_node;
+    let owed = Message::new_order(
+        Some(stage.order_id),
+        None,
+        None,
+        Action::LeaseBondClaim,
+        None,
+    );
+
+    // The buyer never releases the preimage. The instance says the lease is canceled; the
+    // seller keeps the payment locked and claims nothing it was not told it is owed.
+    stage
+        .to_seller(&mut seller, &stage.canceled())
+        .await
+        .expect("canceled");
+    assert_eq!(seller.state(), SellerState::Opened);
+    assert_eq!(seller.bond_status(), "-");
+    assert!(seller.tick(node).await.expect("tick").is_empty());
+
+    // The instance took the buyer's bond for us.
+    assert!(
+        stage
+            .to_seller(&mut seller, &owed)
+            .await
+            .expect("owed")
+            .is_empty()
+    );
+    assert_eq!(seller.bond_status(), "owed");
+    let first = claimed(seller.tick(node).await.expect("tick"), &contract.id());
+    let parsed = Bolt11Invoice::from_str(&first).expect("an invoice");
+    assert_eq!(
+        parsed.amount_milli_satoshis(),
+        Some(payout_sat(BOND) * 1_000)
+    );
+    assert_eq!(parsed.get_payee_pub_key().to_string(), node.id());
+    assert_eq!(seller.bond_status(), "claimed");
+    // Not paid yet: nothing more is sent, also after a restart.
+    let mut seller = SellerRun::from_json(&seller.to_json().expect("json")).expect("stored");
+    assert!(seller.tick(node).await.expect("tick").is_empty());
+    assert_eq!(seller.bond_status(), "claimed");
+
+    // The instance refuses the claim (the bond is not settled yet): a new one goes out, but
+    // only after a while.
+    let refusal = Message::cant_do(
+        Some(stage.order_id),
+        None,
+        Some(Payload::CantDo(Some(CantDoReason::NotAllowedByStatus))),
+    );
+    let refused = stage.to_seller(&mut seller, &refusal).await;
+    assert!(matches!(refused, Err(RunError::Refused(_))), "{refused:?}");
+    assert_eq!(seller.bond_status(), "owed");
+    let mut waited = 0;
+    let second = loop {
+        let out = seller.tick(node).await.expect("tick");
+        if !out.is_empty() {
+            break claimed(out, &contract.id());
+        }
+        waited += 1;
+        assert!(waited < 100, "the claim was never made again");
+    };
+    assert!(waited >= 10, "claimed again after only {waited} looks");
+    assert_ne!(second, first);
+
+    // Until it is paid, the buyer's upfront payment stays locked at our node.
+    let locked = |world: &Arc<Mutex<World>>| {
+        world
+            .lock()
+            .expect("world")
+            .invoices
+            .get(&contract.payment_hash)
+            .copied()
+    };
+    assert_eq!(locked(&stage.world), Some(HoldState::Accepted));
+    house.pay_invoice(&second, 0, 0).await.expect("the payout");
+    assert!(seller.tick(node).await.expect("tick").is_empty());
+    assert_eq!(seller.bond_status(), "paid");
+    // Paid the bond: the upfront payment goes back, and the lease is over.
+    assert_eq!(locked(&stage.world), Some(HoldState::Canceled));
+    assert_eq!(seller.state(), SellerState::Canceled);
+    assert!(seller.finished());
+    let again = SellerRun::from_json(&seller.to_json().expect("json")).expect("stored");
+    assert_eq!(again.bond_status(), "paid");
+}
+
+#[tokio::test]
+async fn a_seller_takes_no_word_that_it_is_owed_a_bond_it_never_asked_for() {
+    let owed = |stage: &Stage| {
+        Message::new_order(
+            Some(stage.order_id),
+            None,
+            None,
+            Action::LeaseBondClaim,
+            None,
+        )
+    };
+    // An offer without a bond.
+    let stage = Stage::new();
+    let (mut seller, _) = stage.opened().await;
+    let refused = stage.to_seller(&mut seller, &owed(&stage)).await;
+    assert!(
+        matches!(refused, Err(RunError::OutOfOrder(_))),
+        "{refused:?}"
+    );
+    assert_eq!(seller.bond_status(), "-");
+    assert!(
+        seller
+            .tick(&stage.seller_node)
+            .await
+            .expect("tick")
+            .is_empty()
+    );
+
+    // An offer with a bond, before any channel was opened.
+    let (stage, _) = bonded_stage();
+    let mut seller = stage.offered().await;
+    let refused = stage.to_seller(&mut seller, &owed(&stage)).await;
+    assert!(
+        matches!(refused, Err(RunError::OutOfOrder(_))),
+        "{refused:?}"
+    );
+    assert_eq!(seller.bond_status(), "-");
+
+    // And not from anyone but the instance.
+    let (stage, _) = bonded_stage();
+    let (mut seller, _) = stage.opened().await;
+    let (incoming, _) = Stage::sent(&owed(&stage), &stage.instance, &stage.seller.trade);
+    let forged = seller
+        .on_message(
+            incoming,
+            &Keys::generate().public_key(),
+            &stage.seller_node,
+            NOW,
+        )
+        .await;
+    assert!(matches!(forged, Err(RunError::Sender)), "{forged:?}");
+    assert_eq!(seller.bond_status(), "-");
 }

@@ -32,8 +32,8 @@
 //! node again (it was not there when the roster was checked) and reports it instead of opening
 //! another. Not here yet: sending again what a relay did not take.
 
-use bipnip_ln::{BackendError, HoldState, LightningBackend, OpenRequest, PaymentState};
-use mostro_core::bond::{BOND_CLAIM_WINDOW_SECS, payout_sat, routing_reserve_sat};
+use bipnip_ln::{HoldState, LightningBackend, OpenRequest};
+use mostro_core::bond::{BOND_CLAIM_WINDOW_SECS, payout_sat};
 use mostro_core::prelude::{CantDoReason, Message};
 use mostro_core::ring::{Ring, RingTerms};
 use mostro_core::ring_message::{RingOffer, RingRoster, RingSeat};
@@ -41,12 +41,11 @@ use nostr_sdk::prelude::{Keys, PublicKey};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub use super::bond::{BondClaim, BondPayment};
 use super::bond::{check_bond_invoice, payment_hash_of};
 use crate::lease::store::StoreError;
 use crate::ring_wire::{self, RingIncoming, RingWireError};
 
-/// How long one tick waits for the bond payment to lock at the instance.
-const BOND_PAY_WAIT_SECS: u32 = 5;
 /// How long our invoice for a bond we are owed stays payable.
 const CLAIM_INVOICE_EXPIRY_SECS: u32 = 3_600;
 /// How long to wait before claiming again after the instance refused a claim.
@@ -150,32 +149,6 @@ pub struct JoinRequest {
     pub seat: RingSeat,
     /// Fee rate of our funding transaction, in sat/vB.
     pub feerate_sat_vb: u64,
-}
-
-/// Our bond on a ring: the instance's invoice, checked, and whether our payment for it is out.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BondPayment {
-    /// The instance's hold invoice.
-    pub invoice: String,
-    /// Its payment hash, 64 hex.
-    pub payment_hash: String,
-    /// True once our node has a payment out for it.
-    pub sent: bool,
-}
-
-/// Our claim on a bond we are owed: an invoice on our own node.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BondClaim {
-    /// Our invoice.
-    pub invoice: String,
-    /// Its payment hash, 64 hex.
-    pub payment_hash: String,
-    /// Unix seconds after which it can no longer be paid.
-    pub expires_at: u64,
-    /// True once our node shows it paid.
-    pub paid: bool,
 }
 
 /// One member's part in one ring.
@@ -713,8 +686,14 @@ impl RingRun {
                 let Some(node) = &self.instance_node else {
                     return Err(RingRunError::NotOurRing("this ring has no bond"));
                 };
-                let payment_hash = check_bond_invoice(&invoice.invoice, node, &ring.terms, now)
-                    .map_err(RingRunError::Bond)?;
+                let payment_hash = check_bond_invoice(
+                    &invoice.invoice,
+                    node,
+                    ring.terms.bond_sat,
+                    ring.terms.network,
+                    Some(now),
+                )
+                .map_err(RingRunError::Bond)?;
                 match &self.bond {
                     Some(known) if known.invoice != invoice.invoice => {
                         return Err(RingRunError::OutOfOrder(
@@ -811,42 +790,14 @@ impl RingRun {
     }
 
     /// Pays our bond, once: only an invoice that passed [`check_bond_invoice`] is ever stored,
-    /// and our node is asked first whether a payment for it is already out.
+    /// and our node is asked first whether a payment for it is already out
+    /// ([`super::bond::pay_bond`]).
     async fn pay_bond(&mut self, backend: &dyn LightningBackend) -> Result<(), RingRunError> {
-        let Some(bond) = self.bond.clone() else {
+        let Some(bond) = &mut self.bond else {
             return Ok(());
         };
-        if bond.sent {
-            return Ok(());
-        }
-        let known = match backend.payment_state(&bond.payment_hash).await {
-            Ok(state) => Some(state),
-            // Refused: our node has no payment for this hash.
-            Err(BackendError::Rejected(_)) => None,
-            Err(e) => return Err(e.into()),
-        };
-        let state = match known {
-            None | Some(PaymentState::Failed { .. }) => {
-                let max_fee_msat = routing_reserve_sat(self.terms.bond_sat)
-                    .max(10)
-                    .saturating_mul(1_000);
-                backend
-                    .pay_invoice(&bond.invoice, max_fee_msat, BOND_PAY_WAIT_SECS)
-                    .await?
-            }
-            Some(state) => state,
-        };
-        match state {
-            PaymentState::Failed { reason } => {
-                self.waiting_on = Some(format!("the bond payment failed: {reason}"));
-            }
-            PaymentState::InFlight | PaymentState::Succeeded { .. } => {
-                if let Some(bond) = &mut self.bond {
-                    bond.sent = true;
-                }
-                self.waiting_on = None;
-            }
-        }
+        let failure = super::bond::pay_bond(backend, bond, self.terms.bond_sat).await?;
+        self.waiting_on = failure.map(|reason| format!("the bond payment failed: {reason}"));
         Ok(())
     }
 
