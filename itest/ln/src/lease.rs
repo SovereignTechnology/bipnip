@@ -118,11 +118,12 @@ async fn until_locked(
 #[tokio::main]
 async fn main() {
     let (buyer, seller) = (node("A").await, node("B").await);
+    let (buyer, seller) = (buyer.as_ref(), seller.as_ref());
     let buyer_id = buyer.node_info().await.expect("info").node_pubkey;
     let buyer_addr = env("A_P2P");
 
     step("lease 1: honest seller");
-    let (b, s) = until_locked(&buyer, &seller).await;
+    let (b, s) = until_locked(buyer, seller).await;
     println!(
         "  contract {} upfront {} sat, completion {} sat",
         &b.contract().id()[..16],
@@ -130,10 +131,10 @@ async fn main() {
         terms().completion_sat().expect("completion")
     );
     let outpoint = s
-        .open(&seller, Some(buyer_addr.clone()), 2)
+        .open(seller, Some(buyer_addr.clone()), 2)
         .await
         .expect("seller opens");
-    let early = b.verify_channel(&buyer, &outpoint).await;
+    let early = b.verify_channel(buyer, &outpoint).await;
     assert!(
         matches!(early, Err(LeaseStepError::Channel(_))),
         "an unconfirmed channel must not verify: {early:?}"
@@ -141,13 +142,13 @@ async fn main() {
     mine(2);
     tokio::time::sleep(Duration::from_secs(3)).await;
     assert!(
-        b.verify_channel(&buyer, &outpoint).await.is_err(),
+        b.verify_channel(buyer, &outpoint).await.is_err(),
         "2 of 3 confirmations must not verify"
     );
     mine(4);
     let mut proof = None;
     for _ in 0..90 {
-        match b.verify_channel(&buyer, &outpoint).await {
+        match b.verify_channel(buyer, &outpoint).await {
             Ok(p) => {
                 proof = Some(p);
                 break;
@@ -157,14 +158,14 @@ async fn main() {
     }
     let proof = proof.expect("the buyer's node verifies the channel");
     assert_eq!(
-        b.payment_state(&buyer).await.expect("state"),
+        b.payment_state(buyer).await.expect("state"),
         PaymentState::InFlight,
         "still unsettled before the release"
     );
     let preimage = b.release(&proof).expect("release");
-    s.settle(&seller, &preimage).await.expect("seller settles");
+    s.settle(seller, &preimage).await.expect("seller settles");
     until("buyer sees the payment settled", 60, || async {
-        b.payment_state(&buyer).await.ok()
+        b.payment_state(buyer).await.ok()
             == Some(PaymentState::Succeeded {
                 preimage: preimage.clone(),
             })
@@ -173,25 +174,25 @@ async fn main() {
     println!("  channel {outpoint} verified by the buyer's node; upfront share settled");
 
     step("lease 2: the seller never opens and cancels; the buyer is refunded");
-    let (b, s) = until_locked(&buyer, &seller).await;
-    s.cancel(&seller).await.expect("cancel");
+    let (b, s) = until_locked(buyer, seller).await;
+    s.cancel(seller).await.expect("cancel");
     until("buyer sees the refund", 60, || async {
         matches!(
-            b.payment_state(&buyer).await,
+            b.payment_state(buyer).await,
             Ok(PaymentState::Failed { .. })
         )
     })
     .await;
     assert!(
         matches!(
-            s.open(&seller, Some(buyer_addr.clone()), 2).await,
+            s.open(seller, Some(buyer_addr.clone()), 2).await,
             Err(LeaseStepError::NotLocked(_))
         ),
         "no open after a cancel"
     );
 
     step("lease 3: the seller opens a smaller channel; nothing is released");
-    let (b, s) = until_locked(&buyer, &seller).await;
+    let (b, s) = until_locked(buyer, seller).await;
     let cheat = seller
         .open_channel(&OpenRequest {
             remote_pubkey: buyer_id.clone(),
@@ -210,18 +211,18 @@ async fn main() {
             .is_ok_and(|c| c.iter().any(|c| c.funding_outpoint == cheat && c.active))
     })
     .await;
-    match b.verify_channel(&buyer, &cheat).await {
+    match b.verify_channel(buyer, &cheat).await {
         Err(LeaseStepError::Channel(why)) => println!("  refused: {why}"),
         other => panic!("a smaller channel must be refused: {other:?}"),
     }
     assert_eq!(
-        b.payment_state(&buyer).await.expect("state"),
+        b.payment_state(buyer).await.expect("state"),
         PaymentState::InFlight
     );
-    s.cancel(&seller).await.expect("cancel");
+    s.cancel(seller).await.expect("cancel");
     until("buyer sees the refund", 60, || async {
         matches!(
-            b.payment_state(&buyer).await,
+            b.payment_state(buyer).await,
             Ok(PaymentState::Failed { .. })
         )
     })
