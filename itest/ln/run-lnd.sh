@@ -175,9 +175,9 @@ grep -q "revoked" "$W/verify2.out" || fail "no revocation reported"
 log "AGENT E2E PASS: init, bind, publish, verify, revoke against a real LND node"
 
 # --- two agents lease through a real instance ---------------------------------------------------
-# bipnipd at the head of its lease branch (PR #5: lease handlers + the public lease order). Move
-# this to a commit on main once that is merged.
-BIPNIPD_REV=3c66bb3e6928fe4ff54bc73c51744d21e4fb5306
+# bipnipd at the head of its ring branch (PR #6, stacked on #4 and #5: lease handlers, the public
+# lease order, ring handlers). Move this to a commit on main once those are merged.
+BIPNIPD_REV=35e6981ca7defca8772f0e83b9e0695c342a1271
 log "build the instance (bipnipd ${BIPNIPD_REV:0:12})"
 git clone --quiet https://github.com/SovereignTechnology/bipnipd "$W/bipnipd"
 git -C "$W/bipnipd" checkout --quiet "$BIPNIPD_REV"
@@ -326,6 +326,72 @@ import json, sys
 settled = sorted(int(i["amt_paid_sat"]) for i in json.load(sys.stdin)["invoices"] if i["state"] == "SETTLED")
 assert settled.count(1277) == 2, f"expected two settled 1277 sat invoices at bob, got {settled}"
 ' || fail "bob was not paid both shares of the second lease"
+log "INSTANCE LEASE E2E PASS: two leases through a real bipnipd, two agents and three LND nodes: offer, take, pay, open, verify, release, settle, and the completion share at the end of the lease"
+
+# --- three agents make a ring through the instance ---------------------------------------------
+log "ring: a third agent (carol), with funds to open a channel"
+agent_conf carol
+printf '\n[instance]\npubkey = "%s"\n' "$INSTANCE_PUB" >> "$W/carol.toml"
+"$AGENT" --config "$W/carol.toml" init > /dev/null
+$BCLI -rpcwallet=miner sendtoaddress "$(lnc carol newaddress p2wkh | jget address)" 1 >/dev/null
+$BCLI generatetoaddress 6 "$MADDR" >/dev/null
+carol_funded() { [ "$(lnc carol walletbalance | jget confirmed_balance)" -gt 0 ]; }
+wait_until 60 carol_funded
+ring_dump() {
+  for n in bob alice carol; do
+    for f in "ring-$n.out" "ring-$n.err"; do [ -s "$W/$f" ] && sed "s/^/  $f: /" "$W/$f"; done
+  done
+  instance_log 80
+}
+
+log "ring: bob proposes a ring of three 314159 sat channels; alice and carol join"
+"$AGENT" --config "$W/bob.toml" ring create --capacity 314159 --slots 3 --feerate 2 \
+  --window 3600 --expires-in 3600 --node-address "127.0.0.1:${P2P[bob]}" --poll 2 \
+  > "$W/ring-bob.out" 2> "$W/ring-bob.err" &
+RING_PIDS=($!)
+wait_until 90 grep -q "state=seated" "$W/ring-bob.out" || { ring_dump; fail "the ring was not stored by the instance"; }
+RING=$(grep -m1 "state=seated" "$W/ring-bob.out" | sed 's/.*order=\([^ ]*\).*/\1/')
+for n in alice carol; do
+  "$AGENT" --config "$W/$n.toml" ring join "$RING" --feerate 2 \
+    --node-address "127.0.0.1:${P2P[$n]}" --poll 2 > "$W/ring-$n.out" 2> "$W/ring-$n.err" &
+  RING_PIDS+=($!)
+  wait_until 90 grep -q "state=seated\|state=committed\|state=open" "$W/ring-$n.out" \
+    || { ring_dump; fail "$n did not get a slot"; }
+done
+ring_done() { for n in bob alice carol; do grep -q "state=success" "$W/ring-$n.out" || return 1; done; }
+t=0
+until ring_done; do
+  for n in bob alice carol; do
+    grep -q "state=partial\|state=canceled" "$W/ring-$n.out" && { ring_dump; fail "the ring ended early for $n"; }
+  done
+  "$W/mine.sh" 1; sleep 2; t=$((t+1))
+  [ "$t" -lt 90 ] || { ring_dump; fail "the ring did not complete"; }
+done
+for pid in "${RING_PIDS[@]}"; do wait "$pid" || fail "a ring agent exited with an error"; done
+for n in bob alice carol; do tail -1 "$W/ring-$n.out" | sed "s/^/  $n: /"; done
+
+log "ring: every node opened one 314159 sat channel and received one, and the instance agrees"
+for n in bob alice carol; do
+  lnc "$n" listchannels | python3 -c '
+import json, sys
+ring = [c for c in json.load(sys.stdin)["channels"] if c["capacity"] == "314159"]
+opened = [c for c in ring if c["initiator"]]
+received = [c for c in ring if not c["initiator"]]
+assert len(opened) == 1 and len(received) == 1, f"opened {len(opened)}, received {len(received)}"
+assert opened[0]["remote_pubkey"] != received[0]["remote_pubkey"], "a ring of three has two different neighbours"
+assert all(c["active"] for c in ring), "a ring channel is not active"
+' || fail "$n does not have one ring channel out and one in"
+  "$AGENT" --config "$W/$n.toml" ring list | grep -q "^ring order=$RING state=success" || fail "$n's stored ring is not a success"
+done
+python3 - "$W/instance/mostro.db" "$RING" <<'PY' || fail "the instance's record of the ring is wrong"
+import sqlite3, sys
+db = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+status, taken = db.execute("SELECT status, taken FROM ring_offers WHERE id = ?", (sys.argv[2],)).fetchone()
+assert (status, taken) == ("success", 3), (status, taken)
+rows = db.execute("SELECT position, commit_sig, edge_txid, edge_verified FROM ring_members WHERE ring_offer_id = ? ORDER BY position", (sys.argv[2],)).fetchall()
+assert [r[0] for r in rows] == [0, 1, 2], rows
+assert all(r[1] and r[2] and r[3] == 1 for r in rows), rows
+PY
 kill "$INSTANCE_PID"
 
-log "INSTANCE LEASE E2E PASS: two leases through a real bipnipd, two agents and three LND nodes: offer, take, pay, open, verify, release, settle, and the completion share at the end of the lease"
+log "INSTANCE RING E2E PASS: a ring of three through a real bipnipd: slots, roster, commits, three channels opened and confirmed"

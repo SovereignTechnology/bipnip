@@ -960,3 +960,59 @@ async fn ring_messages_travel_sealed_and_only_the_instance_is_heard() {
     .expect("seal");
     assert_eq!(sealed.pubkey, member.trade.public_key());
 }
+
+#[tokio::test]
+async fn ring_runs_are_stored_owner_only_and_refused_when_opened_up() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    use crate::lease::store::StoreError;
+    use crate::ring::store::RingStore;
+    use crate::secretfile::SecretFileError;
+
+    let dir = std::env::temp_dir().join(format!("bipnip-rings-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let store = RingStore::open(&dir).expect("store");
+    assert_eq!(std::fs::metadata(&dir).expect("meta").mode() & 0o777, 0o700);
+
+    let table = Table::new(3);
+    let (runs, _) = table.committed(&[1, 2, 0]).await;
+    for run in &runs {
+        store.save(run).expect("save");
+        store.save(run).expect("saving again replaces the file");
+    }
+    let loaded = store.load().expect("load");
+    assert!(loaded.problems.is_empty(), "{:?}", loaded.problems);
+    assert_eq!(loaded.runs.len(), 3);
+    let mut keys: Vec<String> = loaded.runs.iter().map(RingRun::store_key).collect();
+    let mut expected: Vec<String> = runs.iter().map(RingRun::store_key).collect();
+    keys.sort();
+    expected.sort();
+    assert_eq!(keys, expected, "one file per run, each under its own key");
+    for run in &loaded.runs {
+        assert_eq!(run.state(), RingState::Committed);
+    }
+
+    // A file others can read is refused; the other runs still load.
+    let file = dir.join(format!("ring-{}.json", runs[0].store_key()));
+    assert_eq!(
+        std::fs::metadata(&file).expect("meta").mode() & 0o777,
+        0o600
+    );
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+    let loaded = store.load().expect("load");
+    assert_eq!(loaded.runs.len(), 2);
+    assert_eq!(
+        loaded.problems,
+        vec![(
+            format!("ring-{}.json", runs[0].store_key()),
+            StoreError::File(SecretFileError::TooOpen(0o644))
+        )]
+    );
+    // A record with a field added, or whose state needs a roster it lacks.
+    let good = runs[0].to_json().expect("json");
+    assert!(RingRun::from_json(&good).is_ok());
+    assert!(RingRun::from_json(&good.replacen('{', "{\"extra\":1,", 1)).is_err());
+    let mut value: serde_json::Value = serde_json::from_str(&good).expect("json");
+    value["roster"] = serde_json::Value::Null;
+    assert!(RingRun::from_json(&value.to_string()).is_err());
+}

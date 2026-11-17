@@ -23,12 +23,14 @@
 use std::collections::HashSet;
 
 use bipnip_ln::LightningBackend;
-use nostr_sdk::prelude::{Client, EventId, Filter, Keys, Kind, PublicKey, Timestamp};
+use mostro_core::prelude::Message;
+use nostr_sdk::prelude::{Client, Event, EventId, Filter, Keys, Kind, PublicKey, Timestamp};
 
 use super::run::{BuyerRun, Outgoing, RunError, SellerRun};
 use super::store::{LeaseStore, StoreError};
 use crate::lease_wire::{self, Incoming};
 use crate::relay::{RELAY_TIMEOUT, connected};
+use crate::ring_wire::{self, RingIncoming};
 
 /// A message a poll found, not handled yet.
 #[derive(Debug)]
@@ -81,13 +83,13 @@ impl Link {
         })
     }
 
-    /// Wraps a message for its receiver and sends it. `Ok` means at least one relay took it.
-    /// The error names relays and their reasons, never the message.
-    pub async fn send(&self, outgoing: &Outgoing) -> Result<(), String> {
-        let event = outgoing
-            .seal(&self.identity, &self.trade, self.instance, self.pow)
-            .map_err(|e| e.to_string())?;
-        match tokio::time::timeout(RELAY_TIMEOUT, self.client.send_event(&event)).await {
+    /// Our liquidity identity, the key our node is bound to.
+    pub fn identity(&self) -> &Keys {
+        &self.identity
+    }
+
+    async fn publish(&self, event: &Event) -> Result<(), String> {
+        match tokio::time::timeout(RELAY_TIMEOUT, self.client.send_event(event)).await {
             Err(_) => Err("no relay answered in time".into()),
             Ok(Err(e)) => Err(format!("publish: {e}")),
             Ok(Ok(output)) if output.success.is_empty() => {
@@ -97,10 +99,31 @@ impl Link {
         }
     }
 
-    /// The messages the relays hold for our trade key that are not marked done, oldest first.
-    /// Events that are not for us, or do not open as a lease message, are marked done and
-    /// skipped.
-    pub async fn poll(&mut self) -> Result<Vec<Received>, String> {
+    /// Wraps a message for its receiver and sends it. `Ok` means at least one relay took it.
+    /// The error names relays and their reasons, never the message.
+    pub async fn send(&self, outgoing: &Outgoing) -> Result<(), String> {
+        let event = outgoing
+            .seal(&self.identity, &self.trade, self.instance, self.pow)
+            .map_err(|e| e.to_string())?;
+        self.publish(&event).await
+    }
+
+    /// Wraps a message for the instance and sends it. For runs whose every message goes to the
+    /// instance (rings). A lease preimage is refused here as everywhere.
+    pub async fn send_to_instance(&self, message: &Message) -> Result<(), String> {
+        let event = lease_wire::seal_for_instance(
+            message,
+            &self.identity,
+            &self.trade,
+            self.instance,
+            self.pow,
+        )
+        .map_err(|e| e.to_string())?;
+        self.publish(&event).await
+    }
+
+    /// The events the relays hold for our trade key that are not marked done, oldest first.
+    async fn fresh(&self) -> Result<Vec<Event>, String> {
         let filter = Filter::new()
             .kind(Kind::PrivateDirectMessage)
             .pubkey(self.trade.public_key())
@@ -111,19 +134,42 @@ impl Link {
             .timeout(RELAY_TIMEOUT)
             .await
             .map_err(|e| format!("fetch: {e}"))?;
-        let mut fresh: Vec<_> = events
+        let mut fresh: Vec<Event> = events
             .iter()
             .filter(|event| !self.done.contains(&event.id))
+            .cloned()
             .collect();
         fresh.sort_by_key(|event| (event.created_at, event.id));
+        Ok(fresh)
+    }
+
+    /// The messages the relays hold for our trade key that are not marked done, oldest first.
+    /// Events that are not for us, or do not open as a lease message, are marked done and
+    /// skipped.
+    pub async fn poll(&mut self) -> Result<Vec<Received>, String> {
         let mut received = Vec::new();
-        for event in fresh {
-            match lease_wire::open(event, &self.trade) {
+        for event in self.fresh().await? {
+            match lease_wire::open(&event, &self.trade) {
                 Ok(Some((incoming, sender))) => received.push(Received {
                     id: event.id,
                     incoming,
                     sender,
                 }),
+                Ok(None) | Err(_) => {
+                    self.done.insert(event.id);
+                }
+            }
+        }
+        Ok(received)
+    }
+
+    /// As [`Link::poll`], for a ring run: the ring messages waiting for our trade key, each with
+    /// its event id and the key that authored it.
+    pub async fn poll_ring(&mut self) -> Result<Vec<(EventId, RingIncoming, PublicKey)>, String> {
+        let mut received = Vec::new();
+        for event in self.fresh().await? {
+            match ring_wire::open(&event, &self.trade) {
+                Ok(Some((incoming, sender))) => received.push((event.id, incoming, sender)),
                 Ok(None) | Err(_) => {
                     self.done.insert(event.id);
                 }

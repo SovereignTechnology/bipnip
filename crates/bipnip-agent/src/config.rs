@@ -26,6 +26,8 @@ use serde::Deserialize;
 pub const MNEMONIC_FILE: &str = "mnemonic";
 /// Name of the directory inside `data_dir` that holds lease runs.
 pub const LEASES_DIR: &str = "leases";
+/// Name of the directory inside `data_dir` that holds ring runs.
+pub const RINGS_DIR: &str = "rings";
 /// Most proof of work an instance may ask for: above this a message would take hours to make.
 pub const MAX_POW_BITS: u8 = 32;
 
@@ -142,6 +144,11 @@ impl Config {
     /// Where lease runs are stored.
     pub fn leases_dir(&self) -> PathBuf {
         self.data_dir.join(LEASES_DIR)
+    }
+
+    /// Where ring runs are stored.
+    pub fn rings_dir(&self) -> PathBuf {
+        self.data_dir.join(RINGS_DIR)
     }
 
     /// Where the mnemonic lives.

@@ -19,7 +19,18 @@
 //! bipnip-agent --config FILE lease resume [--poll SECS]
 //!                                              carry on with stored leases after a restart
 //! bipnip-agent --config FILE lease list        show the stored leases
+//! bipnip-agent --config FILE ring create --capacity SAT --slots N --feerate SAT_PER_VB
+//!         [--window SECS] [--expires-in SECS] [--private] [--node-address HOST:PORT] [--poll SECS]
+//!                                              propose a ring, take its first slot, see it through
+//! bipnip-agent --config FILE ring join ORDER_ID --feerate SAT_PER_VB [--node-address HOST:PORT]
+//!         [--poll SECS]                        take a slot of a ring and see it through
+//! bipnip-agent --config FILE ring resume [--poll SECS]
+//!                                              carry on with stored rings after a restart
+//! bipnip-agent --config FILE ring list         show the stored rings
 //! ```
+//!
+//! The `lease` and `ring` commands need an `[instance]` section and a node. A ring command runs
+//! until the ring is over: every channel confirmed, or its window ended.
 //!
 //! The `lease` commands need an `[instance]` section and a node. They run until the lease is
 //! finished: active when all of the fee was upfront (the default), otherwise until the rest is
@@ -38,6 +49,7 @@ use bipnip_agent::keys::Wallet;
 use bipnip_agent::lease::cmd::{self, OfferParams, Session, TakeParams};
 use bipnip_agent::lease::run::{BuyerConfig, SellerConfig};
 use bipnip_agent::lease::{DEFAULT_MAX_CLTV_DELTA, DEFAULT_SELLER_CLTV_DELTA};
+use bipnip_agent::ring::cmd::{self as ring_cmd, CreateParams, JoinParams};
 use bipnip_agent::{relay, secretfile};
 use bipnip_ln::LightningBackend;
 use mostro_core::node_binding::{Action, latest_for_node};
@@ -45,7 +57,8 @@ use nostr_sdk::prelude::ToBech32;
 
 fn usage() -> String {
     "usage: bipnip-agent --config FILE <init | whoami | bind [--revoke] [--publish] | \
-     verify-binding NODE_PUBKEY | lease <offer | take ORDER_ID | resume | list> [options]> \
+     verify-binding NODE_PUBKEY | lease <offer | take ORDER_ID | resume | list> [options] | \
+     ring <create | join ORDER_ID | resume | list> [options]> \
      (the options are listed at the top of the agent's source and in the README)"
         .to_string()
 }
@@ -342,6 +355,74 @@ async fn lease(config: &Config, args: &[String]) -> Result<(), String> {
     }
 }
 
+async fn ring(config: &Config, args: &[String]) -> Result<(), String> {
+    let Some((command, rest)) = args.split_first() else {
+        return Err(usage());
+    };
+    if command == "list" && rest.is_empty() {
+        for line in ring_cmd::list(config)? {
+            println!("{line}");
+        }
+        return Ok(());
+    }
+    let mut options = Options::parse(rest, &["private"])?;
+    let poll = Duration::from_secs(options.or("poll", 5u64)?.max(1));
+    let wallet = load_wallet(config)?;
+    let node = backend(config).await?;
+    let session = Session {
+        config,
+        wallet: &wallet,
+        backend: node.as_ref(),
+    };
+    match command.as_str() {
+        "create" => {
+            let params = CreateParams {
+                capacity_sat: options.required("capacity")?,
+                slots: options.required("slots")?,
+                announce: !options.switch("private"),
+                // Two days to open, as LN+ rings give; a day to fill.
+                open_window_secs: options.or("window", 172_800u64)?,
+                expires_in_secs: options.or("expires-in", 86_400u64)?,
+                node_address: options.take("node-address")?,
+                feerate_sat_vb: options.required("feerate")?,
+            };
+            if !options.done()?.is_empty() {
+                return Err(usage());
+            }
+            let (mut ring, mut link) = ring_cmd::create(&session, params).await?;
+            let result = ring_cmd::run(&session, &mut ring, &mut link, poll, &mut say).await;
+            link.close().await;
+            result
+        }
+        "join" => {
+            let node_address = options.take("node-address")?;
+            let feerate_sat_vb = options.required("feerate")?;
+            let words = options.done()?;
+            let [order_id] = words.as_slice() else {
+                return Err(usage());
+            };
+            let params = JoinParams {
+                order_id: order_id
+                    .parse()
+                    .map_err(|_| format!("{order_id:?} is not an order id"))?,
+                node_address,
+                feerate_sat_vb,
+            };
+            let (mut ring, mut link) = ring_cmd::join(&session, params).await?;
+            let result = ring_cmd::run(&session, &mut ring, &mut link, poll, &mut say).await;
+            link.close().await;
+            result
+        }
+        "resume" => {
+            if !options.done()?.is_empty() {
+                return Err(usage());
+            }
+            ring_cmd::resume(&session, poll, &mut say).await
+        }
+        _ => Err(usage()),
+    }
+}
+
 async fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (config_path, rest) = match args.as_slice() {
@@ -361,6 +442,7 @@ async fn run() -> Result<(), String> {
         }
         [cmd, node] if cmd == "verify-binding" => verify_binding(&config, node).await,
         [cmd, rest @ ..] if cmd == "lease" => lease(&config, rest).await,
+        [cmd, rest @ ..] if cmd == "ring" => ring(&config, rest).await,
         _ => Err(usage()),
     }
 }

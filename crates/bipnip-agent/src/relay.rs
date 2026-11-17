@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use mostro_core::lease_order::{KIND_LEASE_ORDER, LeaseOrder};
 use mostro_core::node_binding::{KIND_NODE_BINDING, SignedStatement};
+use mostro_core::ring_order::RingOrder;
 use nostr_sdk::prelude::{Client, Event, Filter, Kind, PublicKey};
 use uuid::Uuid;
 
@@ -109,6 +110,33 @@ pub async fn fetch_lease_order(
         .filter(|event| event.pubkey == *instance)
         .filter_map(|event| {
             let order = LeaseOrder::from_event(event).ok()?;
+            (order.id == order_id).then_some((event.created_at, order))
+        })
+        .max_by_key(|(created_at, _)| *created_at)
+        .map(|(_, order)| order))
+}
+
+/// The newest ring order `instance` published under `order_id`, if the relays hold one. As
+/// [`fetch_lease_order`]: only events that verify, are signed by `instance` and name that order
+/// count.
+pub async fn fetch_ring_order(
+    order_id: Uuid,
+    instance: &PublicKey,
+    relays: &[String],
+) -> Result<Option<RingOrder>, String> {
+    let client = connected(relays).await?;
+    let filter = Filter::new()
+        .kind(Kind::Custom(KIND_LEASE_ORDER))
+        .author(*instance)
+        .identifier(order_id.to_string());
+    let fetched = client.fetch_events(filter).timeout(RELAY_TIMEOUT).await;
+    client.shutdown().await;
+    let events = fetched.map_err(|e| format!("fetch: {e}"))?;
+    Ok(events
+        .iter()
+        .filter(|event| event.pubkey == *instance)
+        .filter_map(|event| {
+            let order = RingOrder::from_event(event).ok()?;
             (order.id == order_id).then_some((event.created_at, order))
         })
         .max_by_key(|(created_at, _)| *created_at)
