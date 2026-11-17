@@ -107,6 +107,71 @@ impl Node {
     }
 }
 
+/// A node of a kind that cannot hold a payment (as an LDK Server cannot): everything else is
+/// the node inside.
+pub(crate) struct NoHold(pub(crate) Node);
+
+#[async_trait]
+impl LightningBackend for NoHold {
+    async fn node_info(&self) -> Result<NodeInfo, BackendError> {
+        self.0.node_info().await
+    }
+    async fn sign_message(&self, msg: &[u8]) -> Result<String, BackendError> {
+        self.0.sign_message(msg).await
+    }
+    async fn add_hold_invoice(&self, _: &HoldInvoiceRequest) -> Result<String, BackendError> {
+        Err(BackendError::Unsupported("this node holds no payments"))
+    }
+    async fn hold_invoice_state(&self, _: &str) -> Result<HoldState, BackendError> {
+        Err(BackendError::Unsupported("this node holds no payments"))
+    }
+    async fn settle_hold_invoice(&self, _: &str) -> Result<(), BackendError> {
+        Err(BackendError::Unsupported("this node holds no payments"))
+    }
+    async fn cancel_hold_invoice(&self, _: &str) -> Result<(), BackendError> {
+        Err(BackendError::Unsupported("this node holds no payments"))
+    }
+    async fn pay_invoice(
+        &self,
+        bolt11: &str,
+        max_fee_msat: u64,
+        wait_secs: u32,
+    ) -> Result<PaymentState, BackendError> {
+        self.0.pay_invoice(bolt11, max_fee_msat, wait_secs).await
+    }
+    async fn payment_state(&self, hash: &str) -> Result<PaymentState, BackendError> {
+        self.0.payment_state(hash).await
+    }
+    async fn add_invoice(
+        &self,
+        amount_msat: u64,
+        expiry_secs: u32,
+        description: &str,
+    ) -> Result<String, BackendError> {
+        self.0
+            .add_invoice(amount_msat, expiry_secs, description)
+            .await
+    }
+    async fn connect(&self, pubkey: &str, addr: &str) -> Result<(), BackendError> {
+        self.0.connect(pubkey, addr).await
+    }
+    async fn open_channel(&self, req: &OpenRequest) -> Result<String, BackendError> {
+        self.0.open_channel(req).await
+    }
+    async fn channels_with(&self, remote: &str) -> Result<Vec<ChannelView>, BackendError> {
+        self.0.channels_with(remote).await
+    }
+    async fn graph_node(&self, node: &str) -> Result<Option<(u32, u64)>, BackendError> {
+        self.0.graph_node(node).await
+    }
+    async fn graph_channels(
+        &self,
+        node: &str,
+    ) -> Result<Vec<bipnip_ln::GraphChannel>, BackendError> {
+        self.0.graph_channels(node).await
+    }
+}
+
 fn unsupported<T>() -> Result<T, BackendError> {
     Err(BackendError::Unsupported("not simulated"))
 }

@@ -4,7 +4,8 @@
 //! preimage) with what bipnip's liquidity trades need: hold invoices **on a hash someone else
 //! chose** (the lease buyer keeps the preimage), channel opens and inspection, graph lookups,
 //! and the node's `signmessage` for node ↔ Nostr key bindings. The LND implementation is `lnd::LndBackend`
-//! (feature `lnd`; building it needs `protoc`); Core Lightning and LDK follow.
+//! (feature `lnd`; building it needs `protoc`); the LDK one is `ldk::LdkBackend` (feature `ldk`, an
+//! LDK Server over gRPC, with the limits its module states); Core Lightning follows.
 //!
 //! Keys and identifiers cross this boundary as hex strings, so the trait does not tie callers to
 //! one secp256k1 version (rust-bitcoin 0.32 and rust-nostr 0.45 carry two).
@@ -12,6 +13,8 @@
 use async_trait::async_trait;
 
 pub mod hexutil;
+#[cfg(feature = "ldk")]
+pub mod ldk;
 #[cfg(feature = "lnd")]
 pub mod lnd;
 

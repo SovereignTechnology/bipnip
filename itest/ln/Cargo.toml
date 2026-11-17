@@ -7,7 +7,7 @@ rust-version = "1.94"
 license = "MIT OR Apache-2.0"
 publish = false
 
-# Its own workspace root: it needs the network (a git dependency) and protoc, which the main
+# Its own workspace root: it needs the network (git dependencies) and protoc, which the main
 # workspace's offline builds must not.
 [workspace]
 
@@ -20,6 +20,10 @@ name = "lease-e2e"
 path = "src/lease.rs"
 
 [[bin]]
+name = "ldk-wallet"
+path = "src/ldk_wallet.rs"
+
+[[bin]]
 name = "test-relay"
 path = "src/relay.rs"
 
@@ -29,8 +33,11 @@ path = "src/key.rs"
 
 [dependencies]
 nostr-sdk = { version = "0.45.1", features = ["local-relay"] }
-bipnip-ln = { path = "../../crates/bipnip-ln", features = ["lnd"] }
-bipnip-agent = { path = "../../crates/bipnip-agent", features = ["lnd"] }
+bipnip-ln = { path = "../../crates/bipnip-ln", features = ["lnd", "ldk"] }
+bipnip-agent = { path = "../../crates/bipnip-agent", features = ["lnd", "ldk"] }
 # bipnip-core main (#3): the same revision the agent uses.
 mostro-core = { git = "https://github.com/SovereignTechnology/bipnip-core", rev = "752279d811753ce95dec1fdf8cceb5e217d08f33" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
+# For `ldk-wallet` only: the harness asks an LDK Server for an address to fund. The same revision
+# bipnip-ln's `ldk` feature uses.
+ldk-server-client = { git = "https://github.com/lightningdevkit/ldk-server", rev = "d7e7a2e708664af922c53c786ad6a5df622f5dd8" }

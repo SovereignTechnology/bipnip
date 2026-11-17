@@ -89,11 +89,9 @@ fn load_wallet(config: &Config) -> Result<Wallet, String> {
 }
 
 #[cfg(feature = "lnd")]
-async fn backend(config: &Config) -> Result<Box<dyn LightningBackend>, String> {
-    let lnd = config
-        .lnd
-        .as_ref()
-        .ok_or("no Lightning node configured (add an [lnd] section)")?;
+async fn lnd_backend(
+    lnd: &bipnip_agent::config::LndConfig,
+) -> Result<Box<dyn LightningBackend>, String> {
     let node = bipnip_ln::lnd::LndBackend::connect(&lnd.address, &lnd.tls_cert, &lnd.macaroon)
         .await
         .map_err(|e| e.to_string())?;
@@ -101,10 +99,32 @@ async fn backend(config: &Config) -> Result<Box<dyn LightningBackend>, String> {
 }
 
 #[cfg(not(feature = "lnd"))]
+async fn lnd_backend(
+    _: &bipnip_agent::config::LndConfig,
+) -> Result<Box<dyn LightningBackend>, String> {
+    Err("this build has no LND support (build with --features lnd)".into())
+}
+
+#[cfg(feature = "ldk")]
+fn ldk_backend(ldk: &bipnip_agent::config::LdkConfig) -> Result<Box<dyn LightningBackend>, String> {
+    let node = bipnip_ln::ldk::LdkBackend::connect(&ldk.address, &ldk.tls_cert, &ldk.macaroon)
+        .map_err(|e| e.to_string())?;
+    Ok(Box::new(node))
+}
+
+#[cfg(not(feature = "ldk"))]
+fn ldk_backend(_: &bipnip_agent::config::LdkConfig) -> Result<Box<dyn LightningBackend>, String> {
+    Err("this build has no LDK Server support (build with --features ldk)".into())
+}
+
+/// The agent's node: the one the configuration names.
 async fn backend(config: &Config) -> Result<Box<dyn LightningBackend>, String> {
-    match config.lnd {
-        Some(_) => Err("this build has no LND support (build with --features lnd)".into()),
-        None => Err("no Lightning node configured (add an [lnd] section)".into()),
+    match (&config.lnd, &config.ldk) {
+        (Some(lnd), _) => lnd_backend(lnd).await,
+        (None, Some(ldk)) => ldk_backend(ldk),
+        (None, None) => {
+            Err("no Lightning node configured (add an [lnd] or an [ldk] section)".into())
+        }
     }
 }
 
@@ -139,7 +159,7 @@ fn whoami_keys(wallet: &Wallet) -> Result<(), String> {
 
 async fn whoami(config: &Config) -> Result<(), String> {
     whoami_keys(&load_wallet(config)?)?;
-    if config.lnd.is_some() {
+    if config.lnd.is_some() || config.ldk.is_some() {
         let info = backend(config)
             .await?
             .node_info()

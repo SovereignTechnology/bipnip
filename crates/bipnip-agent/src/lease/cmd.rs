@@ -216,6 +216,20 @@ pub async fn offer(
     Ok((run, link))
 }
 
+/// Whether our node can sell a lease at all: a seller's payment is held on its node until the
+/// buyer releases the preimage, and not every kind of node can hold one (an LDK Server cannot
+/// yet; see `bipnip_ln::ldk`). Asked before anything is offered, so that an offer nobody could
+/// honour is never published.
+pub(crate) async fn can_hold(backend: &dyn LightningBackend) -> Result<(), String> {
+    // A hash no invoice was made for: a node that can hold answers that it knows none.
+    match backend.hold_invoice_state(&"00".repeat(32)).await {
+        Err(bipnip_ln::BackendError::Unsupported(why)) => Err(format!(
+            "this node cannot sell a lease: {why}. It can still take one, or join a ring"
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// Everything [`offer`] does short of storing the run and sending the offer: the run, its first
 /// message and its link. Our node's binding is published here already; nothing is committed.
 pub async fn prepare_offer(
@@ -224,6 +238,7 @@ pub async fn prepare_offer(
     seller: SellerConfig,
 ) -> Result<(SellerRun, Outgoing, Link), String> {
     let config = session.config;
+    can_hold(session.backend).await?;
     let instance = &session.instance().await?;
     let now = unix_now();
     let info = session
@@ -560,6 +575,22 @@ mod tests {
         // A file that is not a number is refused, not restarted from 1.
         secretfile::replace_private(&file, "many").expect("write");
         assert!(next_trade_index(&config).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_node_that_cannot_hold_a_payment_offers_no_lease() {
+        use std::sync::{Arc, Mutex};
+
+        use crate::lease::tests::{NoHold, Node, World, secret};
+
+        let node = Node {
+            world: Arc::new(Mutex::new(World::default())),
+            secret: secret(1),
+            network: "regtest",
+        };
+        assert_eq!(can_hold(&node).await, Ok(()));
+        let refused = can_hold(&NoHold(node)).await.expect_err("cannot hold");
+        assert!(refused.contains("cannot sell a lease"), "{refused}");
     }
 
     #[test]
