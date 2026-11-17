@@ -18,8 +18,8 @@ tests, and record it below.
 | implementation | version | used for |
 |---|---|---|
 | LND | 0.21.x (booty's signet lab runs 0.21.5-beta) | hold invoices by hash, opens, `signmessage`, the instance's escrow |
-| Core Lightning | 26.06.x (eltor-lab regtest) | same, hold invoices through a plugin (M0 spike picks it) |
-| LDK | ldk-node 0.7.x / ldk-server (LDK 0.3.0-rc3 in booty's lab) | same, `receive_for_hash` |
+| Core Lightning | v26.06.10 (the Ubuntu 22.04 build), with the `hold` plugin v0.3.3 (BoltzExchange/hold, MIT) | the same except the instance's escrow, over the node's JSON-RPC socket (`cln-rpc` 0.7); hold invoices through the plugin, 80 blocks of lock time |
+| LDK | LDK Server (`lightningdevkit/ldk-server`) at `d7e7a2e708664af922c53c786ad6a5df622f5dd8` (2026-11-12), the revision `ldk-server-client` is taken from | paying, opens, `signmessage`; no hold invoices yet (ADR 0006) |
 | Eclair | 0.14.x | later; `signmessage` returns hex |
 
 ## Toolchain
@@ -29,3 +29,4 @@ Rust 1.94.0 (`rust-toolchain.toml`), upstream Mostro's pin, in all three repos.
 ## History
 
 - 2026-11-10: initial pins (M0).
+- 2026-11-17: Core Lightning and LDK Server pinned for the two new backends (Phase 3 spikes).

@@ -27,7 +27,9 @@ when a channel is missing. A lease offer can ask its buyer for a bond the same w
 if the buyer walks away from an opened channel. (The instance side of bonds is still in review.) The
 agent also runs as a daemon (`bipnip-agent run`) that carries every lease and ring on across restarts,
 answers the `bipnip` command line on a unix socket, and holds each request to spending limits you set.
-Not written yet: the Core Lightning and LDK backends. Nothing here is ready for real funds.
+Three kinds of node are supported: **LND** (everything), **Core Lightning** with the `hold` plugin
+(everything an agent does), and **LDK Server** (buying leases and joining rings; it cannot sell a lease yet,
+`docs/decisions/0006-lightning-backend.md` says why). Nothing here is ready for real funds.
 
 ## Try the agent (regtest or signet only)
 
@@ -52,6 +54,23 @@ bipnip-agent --config agent.toml verify-binding <node pubkey>
 ```
 
 Publishing a binding links your node's public key to a Nostr key for everyone to see.
+
+The node is one of three sections of the config, and a build feature each (`--features lnd`, `cln`, `ldk`):
+
+```toml
+[lnd]                               # LND: gRPC, its TLS certificate, a macaroon
+address = "https://127.0.0.1:10009"
+tls_cert = "/home/me/.lnd/tls.cert"
+macaroon = "/home/me/.lnd/bipnip.macaroon"
+
+[cln]                               # Core Lightning: its JSON-RPC socket (the whole node; no narrower key)
+rpc_socket = "/home/me/.lightning/bitcoin/lightning-rpc"   # selling needs the `hold` plugin
+
+[ldk]                               # LDK Server: gRPC, its TLS certificate, a macaroon file
+address = "127.0.0.1:3536"
+tls_cert = "/home/me/.ldk-server/tls.crt"
+macaroon = "/home/me/.ldk-server/bitcoin/macaroons/bipnip.macaroon"
+```
 
 ### Leases
 
