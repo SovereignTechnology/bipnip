@@ -54,7 +54,9 @@ const RESOLVE_EVERY_TICKS: u32 = 12;
 /// engine never waits for a client.
 pub type Lines = mpsc::Sender<String>;
 
-/// One run of any kind.
+/// One run of any kind. A handful of these live in a list; boxing the larger kinds would buy
+/// nothing.
+#[allow(clippy::large_enum_variant)]
 enum Run {
     Seller(SellerRun),
     Buyer(BuyerRun),

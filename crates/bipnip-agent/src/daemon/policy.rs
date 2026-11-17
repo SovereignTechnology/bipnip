@@ -194,7 +194,7 @@ pub struct Parked {
 
 /// Why the policy's files could not be used.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PolicyError(pub String);
+pub struct PolicyError(String);
 
 impl std::fmt::Display for PolicyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
