@@ -132,7 +132,7 @@ done
 log "fund alice (payer of run 1), frank (payer of run 2), bob and carol (the two sellers)"
 $BCLI -rpcwallet=miner sendtoaddress "$(lnc alice newaddress p2wkh | jget address)" 5 >/dev/null
 $BCLI -rpcwallet=miner sendtoaddress "$(lnc bob newaddress p2wkh | jget address)" 5 >/dev/null
-for n in carol frank; do $BCLI -rpcwallet=miner sendtoaddress "$(clc "$n" newaddr | jget bech32)" 5 >/dev/null; done
+for n in carol frank; do $BCLI -rpcwallet=miner sendtoaddress "$(clc "$n" newaddr p2tr | jget p2tr)" 5 >/dev/null; done
 $BCLI generatetoaddress 6 "$MADDR" >/dev/null
 lnd_funded() { [ "$(lnc "$1" walletbalance | jget confirmed_balance)" -gt 0 ]; }
 cln_funded() { [ "$(clc "$1" listfunds | python3 -c 'import json,sys; print(sum(1 for o in json.load(sys.stdin)["outputs"] if o["status"] == "confirmed"))')" -gt 0 ]; }
