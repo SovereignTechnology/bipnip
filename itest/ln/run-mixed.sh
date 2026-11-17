@@ -156,7 +156,7 @@ wait_until 120 erin_up || { tail -40 "$W/erin/server.log" | cut -c1-300; fail "e
 ALICE=$(lnc alice getinfo | jget identity_pubkey); CHRIS=$(clc getinfo | jget id); ERIN=$(ldkw id)
 log "fund the three agents' nodes"
 $BCLI -rpcwallet=miner sendtoaddress "$(lnc alice newaddress p2wkh | jget address)" 5 >/dev/null
-$BCLI -rpcwallet=miner sendtoaddress "$(clc newaddr | jget bech32)" 5 >/dev/null
+$BCLI -rpcwallet=miner sendtoaddress "$(clc newaddr p2tr | jget p2tr)" 5 >/dev/null
 $BCLI -rpcwallet=miner sendtoaddress "$(ldkw address)" 5 >/dev/null
 "$W/mine.sh" 6
 alice_funded() { [ "$(lnc alice walletbalance | jget confirmed_balance)" -gt 0 ]; }
