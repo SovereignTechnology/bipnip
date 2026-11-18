@@ -259,6 +259,9 @@ pub struct OrdersParams {
     /// Leases whose whole fee is at most this, in satoshi.
     #[serde(default)]
     pub max_fee_sat: Option<u64>,
+    /// Each lease also carries its seller's record, from one more relay request.
+    #[serde(default)]
+    pub records: bool,
 }
 
 #[derive(Debug, Deserialize)]

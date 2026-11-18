@@ -41,7 +41,7 @@ response names runs, orders, states, amounts, public node keys and outpoints.
 | method | params | result |
 |---|---|---|
 | `status` | none | agent version, network, node key and sync state, instances, counts of runs by state, today's use of each limit |
-| `orders` | `kind`?: `lease` \| `ring`; `instance`?; `capacity_sat`?; `max_fee_sat`? | one book over the configured instances (see below) |
+| `orders` | `kind`?: `lease` \| `ring`; `instance`?; `capacity_sat`?; `max_fee_sat`?; `records`? | one book over the configured instances (see below) |
 | `lease.offer` | `min_capacity_sat`, `max_capacity_sat`, `duration_blocks`, `fee_base_sat`, `fee_ppm`, `feerate_sat_vb`, `upfront_percent`?, `min_confirmations`?, `announce`?, `expires_in_secs`?, `bond_sat`?, `instance`? | `run`, `state` |
 | `lease.take` | `order_id`, `capacity_sat`, `node_address`?, `instance`? | `run`, `state` |
 | `lease.cancel` | `run` | `state` |
@@ -72,12 +72,22 @@ given, else at the largest capacity the order offers), then rings, largest chann
 leases that offer it and rings at least that large; `max_fee_sat` keeps leases whose whole fee at that
 capacity is at most it. Each lease also gives `priced_capacity_sat`, `fee_sat` and `seller_listings` (how
 many open leases its seller's node has on the book). The answer names `instances_silent` (no order event
-from them at all) and `relays_down` (relays the agent is not connected to) instead of failing.
+from them at all) and `relays_down` (relays the agent is not connected to) instead of failing. With
+`records: true` each lease also carries `seller_record`, its seller's record counted as `record` counts it,
+from one more relay request for all the book's sellers at once; if that request fails, the book is still
+answered, with `records_failed` saying why.
+
+`orders` and `record` only read the relays, so the agent answers them beside its runs rather than between
+them: a relay that is slow to answer holds up no run and no other request.
 
 A run is described the same way everywhere (`lease.list`, `ring.list`, `watch`, the answer to a request
 that starts one): `run`, `role` (`seller`, `buyer` or `member`), `order_id`, `state`, `finished`,
 `watching`, and `line`, the one-line summary the one-shot commands print; then, by role, `lease`, `ring`,
-`channel`, `bond`, `owed_bond`, `waiting_on`. The lists add `under_way` and, for a run the agent had to
+`channel`, `bond`, `owed_bond`, `waiting_on`, and the numbers: a seller's `offered` (the capacities,
+length, fee, upfront share, bond and rules it offered), a lease's `terms` once there is a contract
+(`capacity_sat`, `fee_sat`, `upfront_sat`, `duration_blocks`, `announce`, `peer`: the other party's node,
+and `ends_at_height` once the channel is confirmed), a ring member's `terms` (`capacity_sat`, `bond_sat`,
+`announce`, `open_window_secs`, and `members` once the roster is fixed). The lists add `under_way` and, for a run the agent had to
 stop because it could not be saved, `halted`.
 
 A lease that is active is `watching` until it ends: the agent looks at the leased channel on its own node

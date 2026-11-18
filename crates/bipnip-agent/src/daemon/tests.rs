@@ -351,6 +351,9 @@ async fn a_lease_is_asked_for_approved_and_carried_through_a_restart_by_the_sock
         // Approved: the offer goes out as it was shown.
         let started = ok(&seller.socket(), "approve", json!({"approval": first})).await;
         assert_eq!(started["role"], json!("seller"));
+        // A run is told in numbers too: what the seller offered.
+        assert_eq!(started["offered"]["max_capacity_sat"], json!(1_000_000));
+        assert_eq!(started["offered"]["fee_ppm"], json!(2500));
         let published = bindings(&url).await;
         assert_eq!(
             published.len(),
@@ -377,6 +380,24 @@ async fn a_lease_is_asked_for_approved_and_carried_through_a_restart_by_the_sock
         assert_eq!(orders["orders"].as_array().map(Vec::len), Some(1));
         let rings = ok(&buyer.socket(), "orders", json!({"kind": "ring"})).await;
         assert_eq!(rings["orders"], json!([]));
+        // With the sellers' records: this seller has none yet, and says so in numbers.
+        let recorded = ok(
+            &buyer.socket(),
+            "orders",
+            json!({"kind": "lease", "records": true}),
+        )
+        .await;
+        assert_eq!(recorded["orders"][0]["seller_record"]["kept"], json!(0));
+        assert_eq!(recorded["orders"][0]["seller_record"]["subjects"], json!(0));
+        assert!(recorded.get("records_failed").is_none(), "{recorded}");
+        // A named instance that is not configured is refused before anything is read.
+        let elsewhere = error(
+            &buyer.socket(),
+            "orders",
+            json!({"instance": Keys::generate().public_key().to_hex()}),
+        )
+        .await;
+        assert_eq!(elsewhere["code"], json!("not-found"));
         // A million sat would cost 3500 in fees: over the buyer's limit, so parked, and denied.
         let dear = error(
             &buyer.socket(),
@@ -415,6 +436,12 @@ async fn a_lease_is_asked_for_approved_and_carried_through_a_restart_by_the_sock
         let taken = lines.last().expect("final");
         assert_eq!(taken["ok"], json!(true), "{taken}");
         assert_eq!(taken["result"]["role"], json!("buyer"));
+        // The lease in numbers: what it buys, what it costs, and from whom.
+        let terms = &taken["result"]["terms"];
+        assert_eq!(terms["capacity_sat"], json!(600_000));
+        assert_eq!(terms["fee_sat"], json!(2_500));
+        assert_eq!(terms["duration_blocks"], json!(4320));
+        assert_eq!(terms["peer"], orders["orders"][0]["seller_node"], "{taken}");
         // What is not a request does nothing.
         let bad = error(&buyer.socket(), "wallet.dump", Value::Null).await;
         assert_eq!(bad["code"], json!("bad-request"));

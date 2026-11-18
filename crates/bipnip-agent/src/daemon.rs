@@ -6,11 +6,13 @@
 //! - [`policy`]: the limits, the record of what was granted and parked, and the guard between
 //!   a run and the node.
 //! - [`engine`]: the one worker that steps the runs and answers the requests.
+//! - [`reads`]: the requests that only read the relays, answered beside the engine.
 //! - [`server`]: the socket, and the loop that feeds the engine.
 
 pub mod api;
 pub mod engine;
 pub mod policy;
+pub mod reads;
 pub mod server;
 
 #[cfg(test)]
