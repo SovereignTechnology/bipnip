@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use mostro_core::lease_message::LeasePayload;
 use mostro_core::lease_order::{LeaseOrder, LeaseOrderStatus};
+use mostro_core::node_binding::KIND_NODE_BINDING;
 use mostro_core::prelude::{Action, Message, Payload, Peer, unwrap_message_nip44};
 use nostr_sdk::local_relay::MockRelay;
 use nostr_sdk::prelude::{Client, EventId, Filter, FinalizeEvent, Keys, Kind, PublicKey};
@@ -225,6 +226,18 @@ async fn error(socket: &Path, method: &str, params: Value) -> Value {
     last["error"].clone()
 }
 
+/// The node binding events (kind 31735) the relay holds, by id.
+async fn bindings(url: &str) -> Vec<EventId> {
+    let client = connected(&[url.to_string()]).await.expect("connect");
+    let events = client
+        .fetch_events(Filter::new().kind(Kind::Custom(KIND_NODE_BINDING)))
+        .timeout(Duration::from_secs(5))
+        .await
+        .expect("fetch");
+    client.shutdown().await;
+    events.iter().map(|event| event.id).collect()
+}
+
 /// The state of the one lease run an agent has stored.
 async fn lease_state(socket: &Path) -> Option<String> {
     let listed = ok(socket, "lease.list", Value::Null).await;
@@ -320,6 +333,9 @@ async fn a_lease_is_asked_for_approved_and_carried_through_a_restart_by_the_sock
         );
         let first = parked["approval"].as_str().expect("its name").to_string();
         assert_eq!(lease_state(&seller.socket()).await, None);
+        // Nor published: the node's binding links it to the agent's identity in public, so it
+        // waits until the offer is allowed.
+        assert_eq!(bindings(&url).await, Vec::new());
         // Asked twice, parked twice; one is denied.
         let again = error(&seller.socket(), "lease.offer", offer.clone()).await;
         let second = again["approval"].as_str().expect("its name").to_string();
@@ -335,6 +351,12 @@ async fn a_lease_is_asked_for_approved_and_carried_through_a_restart_by_the_sock
         // Approved: the offer goes out as it was shown.
         let started = ok(&seller.socket(), "approve", json!({"approval": first})).await;
         assert_eq!(started["role"], json!("seller"));
+        let published = bindings(&url).await;
+        assert_eq!(
+            published.len(),
+            1,
+            "the binding goes out with the approved offer"
+        );
         let waiting = ok(&seller.socket(), "approvals", Value::Null).await;
         assert_eq!(waiting["approvals"], json!([]));
         wait_for_state(&seller.socket(), "open", &world).await;
@@ -346,6 +368,8 @@ async fn a_lease_is_asked_for_approved_and_carried_through_a_restart_by_the_sock
                 .is_some_and(|m| m.contains("max_runs")),
             "{full}"
         );
+        // Parked again, so its binding is not published again either.
+        assert_eq!(bindings(&url).await, published);
 
         // The buyer sees the order and what taking it costs.
         let orders = ok(&buyer.socket(), "orders", json!({"kind": "lease"})).await;

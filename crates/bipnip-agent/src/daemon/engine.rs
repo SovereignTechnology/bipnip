@@ -869,8 +869,13 @@ impl Engine {
             hub: Some(&self.client),
             caller_checks_limits: true,
         };
-        // Nothing is stored or sent by the preparation.
-        let (mut run, first, link) = match &request.call {
+        // Nothing is published, stored or sent by the preparation.
+        let Prepared {
+            mut run,
+            first,
+            link,
+            binding,
+        } = match &request.call {
             Call::LeaseOffer(params) => prepare_offer(&session, params).await?,
             Call::LeaseTake(params) => prepare_take(&session, params).await?,
             Call::RingCreate(params) => prepare_create(&session, params).await?,
@@ -911,6 +916,14 @@ impl Engine {
                 ));
             }
             Some(_) => {}
+        }
+        // Only now, with the request allowed, does an offer's node binding go out: it links the
+        // node to our liquidity identity in public, which a parked request must not have done.
+        // If no relay takes it, nothing is stored and the request can be asked again.
+        if let Some(binding) = &binding {
+            relay::publish(binding, &self.config.relays)
+                .await
+                .map_err(|e| ApiError::new(Code::Relay, e))?;
         }
         // The grant is on disk before the run exists, so a run of the daemon's is never
         // without one.
@@ -1114,6 +1127,26 @@ enum First {
     Ring(Message),
 }
 
+/// A run made ready to start: nothing of it is published, stored or sent yet.
+struct Prepared {
+    run: Run,
+    first: First,
+    link: Link,
+    /// An offer's node binding, published only once the request is allowed.
+    binding: Option<Event>,
+}
+
+impl Prepared {
+    fn new(run: Run, first: First, link: Link) -> Self {
+        Prepared {
+            run,
+            first,
+            link,
+            binding: None,
+        }
+    }
+}
+
 fn refused(error: String) -> ApiError {
     ApiError::refused(error)
 }
@@ -1121,7 +1154,7 @@ fn refused(error: String) -> ApiError {
 async fn prepare_offer(
     session: &Session<'_>,
     params: &LeaseOfferParams,
-) -> Result<(Run, First, Link), ApiError> {
+) -> Result<Prepared, ApiError> {
     let offer = OfferParams {
         min_capacity_sat: params.min_capacity_sat,
         max_capacity_sat: params.max_capacity_sat,
@@ -1142,16 +1175,19 @@ async fn prepare_offer(
         cltv_delta: DEFAULT_SELLER_CLTV_DELTA,
         feerate_sat_vb: params.feerate_sat_vb,
     };
-    let (run, first, link) = lease_cmd::prepare_offer(session, offer, seller)
+    let (run, first, link, binding) = lease_cmd::prepare_offer(session, offer, seller)
         .await
         .map_err(refused)?;
-    Ok((Run::Seller(run), First::Lease(first), link))
+    Ok(Prepared {
+        binding: Some(binding),
+        ..Prepared::new(Run::Seller(run), First::Lease(first), link)
+    })
 }
 
 async fn prepare_take(
     session: &Session<'_>,
     params: &LeaseTakeParams,
-) -> Result<(Run, First, Link), ApiError> {
+) -> Result<Prepared, ApiError> {
     let take = TakeParams {
         order_id: params.order_id,
         capacity_sat: params.capacity_sat,
@@ -1164,13 +1200,13 @@ async fn prepare_take(
     let (run, first, link) = lease_cmd::prepare_take(session, take, buyer)
         .await
         .map_err(refused)?;
-    Ok((Run::Buyer(run), First::Lease(first), link))
+    Ok(Prepared::new(Run::Buyer(run), First::Lease(first), link))
 }
 
 async fn prepare_create(
     session: &Session<'_>,
     params: &RingCreateParams,
-) -> Result<(Run, First, Link), ApiError> {
+) -> Result<Prepared, ApiError> {
     let create = CreateParams {
         capacity_sat: params.capacity_sat,
         slots: params.slots,
@@ -1188,13 +1224,13 @@ async fn prepare_create(
     let (run, first, link) = ring_cmd::prepare_create(session, create)
         .await
         .map_err(refused)?;
-    Ok((Run::Ring(run), First::Ring(first), link))
+    Ok(Prepared::new(Run::Ring(run), First::Ring(first), link))
 }
 
 async fn prepare_join(
     session: &Session<'_>,
     params: &RingJoinParams,
-) -> Result<(Run, First, Link), ApiError> {
+) -> Result<Prepared, ApiError> {
     let join = JoinParams {
         order_id: params.order_id,
         node_address: params.node_address.clone(),
@@ -1203,5 +1239,5 @@ async fn prepare_join(
     let (run, first, link) = ring_cmd::prepare_join(session, join)
         .await
         .map_err(refused)?;
-    Ok((Run::Ring(run), First::Ring(first), link))
+    Ok(Prepared::new(Run::Ring(run), First::Ring(first), link))
 }

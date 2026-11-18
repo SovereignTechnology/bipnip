@@ -209,7 +209,9 @@ pub async fn offer(
     params: OfferParams,
     seller: SellerConfig,
 ) -> Result<(SellerRun, Link), String> {
-    let (mut run, first, link) = prepare_offer(session, params, seller).await?;
+    let (mut run, first, link, binding) = prepare_offer(session, params, seller).await?;
+    // Buyers look the binding up on the relays before they take the offer.
+    relay::publish(&binding, &session.config.relays).await?;
     let store = store(session.config)?;
     let report = launch_seller(&mut run, &first, &link, &store)
         .await
@@ -258,13 +260,15 @@ pub(crate) fn fit_lock_time(
     })
 }
 
-/// Everything [`offer`] does short of storing the run and sending the offer: the run, its first
-/// message and its link. Our node's binding is published here already; nothing is committed.
+/// Everything [`offer`] does short of publishing, storing and sending: the run, its first
+/// message, its link and our node's binding. The binding is made but not published: publishing
+/// it links our node to our liquidity identity in public, so it waits until the offer is
+/// allowed (the daemon parks an offer over its limits). Nothing is committed here.
 pub async fn prepare_offer(
     session: &Session<'_>,
     params: OfferParams,
     seller: SellerConfig,
-) -> Result<(SellerRun, Outgoing, Link), String> {
+) -> Result<(SellerRun, Outgoing, Link, nostr_sdk::prelude::Event), String> {
     let config = session.config;
     can_hold(session.backend).await?;
     let seller = fit_lock_time(session.backend, seller, params.min_confirmations)?;
@@ -293,8 +297,6 @@ pub async fn prepare_offer(
         rules: params.rules,
     };
     offer.validate().map_err(|e| e.to_string())?;
-    // Buyers look the binding up on the relays before they take the offer.
-    relay::publish(&binding, &config.relays).await?;
 
     let trade_index = next_trade_index(config)?;
     let (run, first) = SellerRun::offer(instance.pubkey, offer, now, trade_index, seller);
@@ -305,7 +307,7 @@ pub async fn prepare_offer(
         now.saturating_sub(NEW_RUN_LOOKBACK_SECS),
     )
     .await?;
-    Ok((run, first, link))
+    Ok((run, first, link, binding))
 }
 
 /// Takes an order on the configured instance. The order is read from the relays and must be
