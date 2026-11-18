@@ -4,6 +4,7 @@
 //!
 //! ```text
 //! bipnip [--socket PATH] status
+//! bipnip [--socket PATH] record NODE_KEY
 //! bipnip [--socket PATH] orders [--kind lease|ring] [--instance KEY] [--capacity SAT]
 //!         [--max-fee SAT]
 //! bipnip [--socket PATH] lease offer --min-capacity SAT --max-capacity SAT --duration BLOCKS
@@ -46,7 +47,7 @@ use std::process::ExitCode;
 
 use serde_json::{Map, Value, json};
 
-const USAGE: &str = "usage: bipnip [--socket PATH] <status | orders | lease <offer|take|cancel|list> | \
+const USAGE: &str = "usage: bipnip [--socket PATH] <status | orders | record NODE | lease <offer|take|cancel|list> | \
 ring <create|join|cancel|list> | bind | approvals | approve APPROVAL | deny APPROVAL | \
 watch [RUN]> [options] (the options are listed in the README and at the top of the source)";
 
@@ -154,6 +155,10 @@ fn request(args: &[String]) -> Result<(String, Value), String> {
         ("status", []) => "status",
         ("bind", []) => "binding.publish",
         ("approvals", []) => "approvals",
+        ("record", [node]) => {
+            params.insert("node".into(), json!(node));
+            "record"
+        }
         ("approve", [approval]) => {
             params.insert("approval".into(), json!(approval));
             "approve"
@@ -400,6 +405,7 @@ mod tests {
             ("status", "status", json!({})),
             ("bind", "binding.publish", json!({})),
             ("approvals", "approvals", json!({})),
+            ("record 02ab", "record", json!({"node": "02ab"})),
             ("approve ab12", "approve", json!({"approval": "ab12"})),
             ("deny ab12", "deny", json!({"approval": "ab12"})),
             ("watch", "watch", json!({})),

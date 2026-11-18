@@ -714,7 +714,7 @@ async fn the_completion_share_is_billed_once_the_lease_has_run_and_paid_while_th
     assert_eq!(stored.completion(), Some(&kept));
     buyer.tick(&stage.buyer_node, NOW).await.expect("tick");
     assert_eq!(buyer.state(), BuyerState::Complete);
-    assert!(buyer.finished());
+    assert!(buyer.ended());
     assert_eq!(stage.payments(), paid_before + 1);
 
     assert!(
@@ -725,7 +725,7 @@ async fn the_completion_share_is_billed_once_the_lease_has_run_and_paid_while_th
             .is_empty()
     );
     assert_eq!(seller.state(), SellerState::Complete);
-    assert!(seller.finished());
+    assert!(seller.ended());
 
     // A buyer that stopped after paying and before it was saved does not pay again: its node
     // is asked first.
@@ -828,10 +828,10 @@ async fn a_channel_that_closes_early_ends_the_lease_unbilled_and_unpaid() {
             .is_empty()
     );
     assert_eq!(seller.state(), SellerState::Closed);
-    assert!(seller.finished());
+    assert!(seller.ended());
     buyer.tick(&stage.buyer_node, NOW).await.expect("tick");
     assert_eq!(buyer.state(), BuyerState::Closed);
-    assert!(buyer.finished());
+    assert!(buyer.ended());
     let gone = buyer.watch().gone.expect("gone");
     assert_eq!(gone.ending, Ending::Early);
     assert_eq!(gone.close_height, Some(250));
@@ -959,7 +959,7 @@ async fn an_expired_completion_invoice_is_billed_again_until_the_seller_gives_up
         assert!(bills.len() <= 8, "more invoices than the limit");
     }
     assert_eq!(seller.state(), SellerState::Unpaid);
-    assert!(seller.finished());
+    assert!(seller.ended());
     assert!(bills.len() > 1, "an expired invoice is replaced");
     let stored = SellerRun::from_json(&seller.to_json().expect("json")).expect("stored");
     assert_eq!(stored.state(), SellerState::Unpaid);
@@ -983,7 +983,7 @@ async fn a_buyer_never_billed_ends_unbilled() {
         .await
         .expect("tick");
     assert_eq!(buyer.state(), BuyerState::Unbilled);
-    assert!(buyer.finished());
+    assert!(buyer.ended());
 }
 
 #[tokio::test]
@@ -1015,7 +1015,7 @@ async fn a_lease_paid_all_upfront_is_watched_to_its_end() {
     assert_eq!(seller.state(), SellerState::Complete);
     buyer.tick(&stage.buyer_node, NOW).await.expect("tick");
     assert_eq!(buyer.state(), BuyerState::Complete);
-    assert!(seller.finished() && buyer.finished());
+    assert!(seller.ended() && buyer.ended());
 }
 
 /// A seller checks its offer's rules on its own node's graph when a take arrives: the instance
@@ -1051,6 +1051,75 @@ async fn a_seller_checks_its_offers_rules_on_its_own_graph() {
     let invoice = stage.to_seller(&mut seller, &take).await.expect("take");
     assert_eq!(invoice.len(), 1);
     assert_eq!(seller.state(), SellerState::Invoiced);
+}
+
+#[tokio::test]
+async fn a_finished_lease_owes_a_signed_outcome_its_author_can_be_checked_against() {
+    use mostro_core::outcome::{ClosedBy as Closer, Outcome, OutcomeResult, Role};
+    let stage = Stage::with_upfront(100);
+    let (mut seller, mut buyer) = stage.active().await;
+    let contract = buyer.contract().clone();
+    // Nothing is owed while the lease runs.
+    assert!(seller.outcome().is_none() && !seller.outcome_owed());
+    stage.age(&seller, 4_320);
+    seller.tick(&stage.seller_node, NOW).await.expect("tick");
+    buyer.tick(&stage.buyer_node, NOW).await.expect("tick");
+    for (outcome, event_of, keys, role) in [
+        (
+            seller.outcome(),
+            seller.outcome_event(),
+            &stage.seller.identity,
+            Role::Seller,
+        ),
+        (
+            buyer.outcome(),
+            buyer.outcome_event(),
+            &stage.buyer.identity,
+            Role::Buyer,
+        ),
+    ] {
+        let outcome = outcome.expect("an outcome");
+        assert_eq!(outcome.result, OutcomeResult::Kept);
+        assert_eq!(outcome.subject, contract.id());
+        assert_eq!(outcome.nodes, [contract.seller_node, contract.buyer_node]);
+        assert!(
+            outcome.outpoint.is_some(),
+            "an announced channel names its outpoint"
+        );
+        let event = event_of
+            .expect("owed")
+            .expect("valid")
+            .finalize(keys)
+            .expect("signs");
+        let read = Outcome::from_event(&event).expect("reads");
+        assert_eq!(read, outcome);
+        assert_eq!(read.author_node(&event, NOW), Ok(role));
+    }
+    // Owed until published; then finished, and still so when read back.
+    assert!(seller.outcome_owed() && !seller.finished() && seller.ended());
+    assert!(
+        seller.watching(),
+        "a run that owes its outcome takes no slot"
+    );
+    seller.set_outcome_sent();
+    assert!(seller.finished());
+    let stored = SellerRun::from_json(&seller.to_json().expect("json")).expect("stored");
+    assert!(stored.finished());
+
+    // A lease the seller closed early: closed-early, and the seller as the closer.
+    let stage = Stage::new();
+    let (mut seller, _buyer) = stage.active().await;
+    stage.age(&seller, 100);
+    seller.tick(&stage.seller_node, NOW).await.expect("tick");
+    stage.close(&seller, bipnip_ln::Closer::Local, Some(250));
+    seller.tick(&stage.seller_node, NOW).await.expect("tick");
+    let outcome = seller.outcome().expect("an outcome");
+    assert_eq!(outcome.result, OutcomeResult::ClosedEarly);
+    assert_eq!(outcome.closer, Some(Closer::Party(Role::Seller)));
+    assert_eq!(
+        (outcome.funding_height, outcome.close_height),
+        (Some(101), Some(250))
+    );
 }
 
 #[tokio::test]
@@ -1709,7 +1778,7 @@ async fn a_seller_owed_the_buyers_bond_claims_it_and_then_gives_the_upfront_paym
     // Paid the bond: the upfront payment goes back, and the lease is over.
     assert_eq!(locked(&stage.world), Some(HoldState::Canceled));
     assert_eq!(seller.state(), SellerState::Canceled);
-    assert!(seller.finished());
+    assert!(seller.ended());
     let again = SellerRun::from_json(&seller.to_json().expect("json")).expect("stored");
     assert_eq!(again.bond_status(), "paid");
 }

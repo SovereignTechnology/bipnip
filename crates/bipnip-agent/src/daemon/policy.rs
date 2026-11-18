@@ -617,6 +617,7 @@ mod tests {
             allowed_peers: Vec::new(),
             min_seller_channels: 0,
             min_seller_capacity_sat: 0,
+            publish_outcomes: Default::default(),
         }
     }
 

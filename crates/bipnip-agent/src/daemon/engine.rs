@@ -40,6 +40,7 @@ use crate::lease::link::{Link, StepReport, launch_buyer, launch_seller, step_buy
 use crate::lease::run::{BuyerConfig, BuyerRun, Outgoing, SellerConfig, SellerRun};
 use crate::lease::store::{LeaseStore, StoreError};
 use crate::lease::{DEFAULT_MAX_CLTV_DELTA, DEFAULT_SELLER_CLTV_DELTA};
+use crate::record;
 use crate::relay::{self, OpenOrder, RELAY_TIMEOUT};
 use crate::ring::cmd::{self as ring_cmd, CreateParams, JoinParams};
 use crate::ring::link as ring_link;
@@ -99,7 +100,7 @@ impl Run {
         match self {
             Run::Seller(run) => run.watching(),
             Run::Buyer(run) => run.watching(),
-            Run::Ring(_) => false,
+            Run::Ring(run) => run.outcome_owed(),
         }
     }
 
@@ -461,7 +462,8 @@ impl Engine {
             trade,
             instance.pubkey,
             instance.pow,
-        ))
+        )
+        .with_outcomes(self.config.policy.publish_outcomes))
     }
 
     fn tell(&mut self, run: &str, status: &str, fields: Value) {
@@ -645,6 +647,7 @@ impl Engine {
             Call::LeaseList => self.list(true),
             Call::RingList => self.list(false),
             Call::BindingPublish => self.publish_binding().await,
+            Call::Record(node) => self.record(node).await,
             Call::Approvals => {
                 let parked = self.policy.all_parked().map_err(internal)?;
                 Ok(json!({"approvals": parked}))
@@ -777,6 +780,29 @@ impl Engine {
                 )),
             },
         }
+    }
+
+    /// `node`'s record: the outcomes about it on the relays, read by [`record::read`] (the
+    /// configured instances are the trusted ones) and counted by [`record::summarize`].
+    async fn record(&mut self, node: &str) -> Result<Value, ApiError> {
+        let key: secp256k1::PublicKey = node
+            .parse()
+            .map_err(|_| ApiError::new(Code::BadRequest, "not a node key".to_string()))?;
+        let events = relay::fetch_outcomes(&self.client, node)
+            .await
+            .map_err(|e| ApiError::new(Code::Relay, e))?;
+        let trusted: Vec<PublicKey> = self
+            .instances
+            .iter()
+            .map(|instance| instance.pubkey)
+            .collect();
+        let stated = record::read(&events, &trusted, unix_now());
+        let summary = record::summarize(&key, &stated);
+        Ok(json!({
+            "node": node,
+            "record": summary,
+            "outcomes_read": stated.len(),
+        }))
     }
 
     /// One book over the instances asked for: a single request through the shared relay

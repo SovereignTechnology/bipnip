@@ -273,6 +273,12 @@ struct ApprovalParams {
     approval: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecordParams {
+    node: String,
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WatchParams {
@@ -305,6 +311,8 @@ pub enum Call {
     RingList,
     /// Publish our node's binding.
     BindingPublish,
+    /// A node's record from signed outcomes; the node key, 66 lower-case hex.
+    Record(String),
     /// The parked requests.
     Approvals,
     /// Let a parked request go ahead.
@@ -407,6 +415,20 @@ pub fn understand(method: &str, params: &Value) -> Result<Call, ApiError> {
         "ring.list" => none(method, params).map(|()| Call::RingList)?,
         "binding.publish" => none(method, params).map(|()| Call::BindingPublish)?,
         "approvals" => none(method, params).map(|()| Call::Approvals)?,
+        "record" => {
+            let p: RecordParams = typed(method, params)?;
+            let node = p.node.to_ascii_lowercase();
+            if node.len() != 66
+                || !node.bytes().all(|b| b.is_ascii_hexdigit())
+                || node.parse::<secp256k1::PublicKey>().is_err()
+            {
+                return Err(ApiError::new(
+                    Code::BadRequest,
+                    "record: `node` must be a node key (66 hex)".to_string(),
+                ));
+            }
+            Call::Record(node)
+        }
         "approve" => {
             let p: ApprovalParams = typed(method, params)?;
             Call::Approve(name(method, "an approval", p.approval)?)
