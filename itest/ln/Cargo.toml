@@ -35,8 +35,8 @@ path = "src/key.rs"
 nostr-sdk = { version = "0.45.1", features = ["local-relay"] }
 bipnip-ln = { path = "../../crates/bipnip-ln", features = ["lnd", "ldk", "cln"] }
 bipnip-agent = { path = "../../crates/bipnip-agent", features = ["lnd", "ldk", "cln"] }
-# bipnip-core main (#3): the same revision the agent uses.
-mostro-core = { git = "https://github.com/SovereignTechnology/bipnip-core", rev = "752279d811753ce95dec1fdf8cceb5e217d08f33" }
+# bipnip-core main (#9): the same revision the agent uses.
+mostro-core = { git = "https://github.com/SovereignTechnology/bipnip-core", rev = "ef08e969502892499e922a988f84e2168b744ac4" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
 # For `ldk-wallet` only: the harness asks an LDK Server for an address to fund. The same revision
 # bipnip-ln's `ldk` feature uses.

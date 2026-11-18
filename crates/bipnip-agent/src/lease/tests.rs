@@ -37,8 +37,11 @@ pub(crate) struct World {
     /// When the nodes' invoices are dated, unix seconds; [`NOW`] unless a test sets it (one
     /// that runs on the real clock).
     pub(crate) clock: Option<u64>,
-    /// Channels that closed, by funding outpoint (taken out of `channels` by [`close`]).
+    /// Channels that closed, by funding outpoint.
     pub(crate) closed: HashMap<String, bipnip_ln::ClosedChannel>,
+    /// What the public graph shows of a node, by node key: public channels and capacity. A
+    /// node not here is not in the graph.
+    pub(crate) graph: HashMap<String, (u32, u64)>,
 }
 
 pub(crate) struct Node {
@@ -188,10 +191,6 @@ impl LightningBackend for NoHold {
     ) -> Result<Vec<bipnip_ln::GraphChannel>, BackendError> {
         self.0.graph_channels(node).await
     }
-}
-
-fn unsupported<T>() -> Result<T, BackendError> {
-    Err(BackendError::Unsupported("not simulated"))
 }
 
 #[async_trait]
@@ -373,8 +372,9 @@ impl LightningBackend for Node {
             })
             .collect())
     }
-    async fn graph_node(&self, _: &str) -> Result<Option<(u32, u64)>, BackendError> {
-        unsupported()
+    async fn graph_node(&self, node: &str) -> Result<Option<(u32, u64)>, BackendError> {
+        let w = self.world.lock().expect("world");
+        Ok(w.graph.get(node).copied())
     }
     /// The simulated graph: every announced channel with six confirmations, as gossip would
     /// carry it.

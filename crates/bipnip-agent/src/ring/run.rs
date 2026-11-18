@@ -38,6 +38,7 @@ use mostro_core::bond::{BOND_CLAIM_WINDOW_SECS, payout_sat};
 use mostro_core::prelude::{CantDoReason, Message};
 use mostro_core::ring::{Ring, RingTerms};
 use mostro_core::ring_message::{RingOffer, RingRoster, RingSeat};
+use mostro_core::rules::Rules;
 use nostr_sdk::prelude::{Keys, PublicKey};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -221,6 +222,8 @@ struct RingRecord {
     verified: Vec<u8>,
     #[serde(default)]
     bond_sat: u64,
+    #[serde(default, skip_serializing_if = "Rules::is_none")]
+    rules: Rules,
     #[serde(default)]
     instance_node: Option<String>,
     #[serde(default)]
@@ -499,6 +502,7 @@ impl RingRun {
             in_confirmed: self.in_confirmed,
             verified: self.verified.clone(),
             bond_sat: self.terms.bond_sat,
+            rules: self.terms.rules,
             instance_node: self.instance_node.clone(),
             bond: self.bond.clone(),
             slashed: self.slashed.clone(),
@@ -529,6 +533,7 @@ impl RingRun {
             announce: record.announce,
             open_window_secs: record.open_window_secs,
             bond_sat: record.bond_sat,
+            rules: record.rules,
         };
         terms.validate().map_err(|_| corrupt("the terms"))?;
         if (record.bond.is_some() || record.owed) && terms.bond_sat == 0 {
@@ -700,6 +705,22 @@ impl RingRun {
                 else {
                     return Err(RingRunError::NotOurRing("our node is not in the roster"));
                 };
+                // The ring's rules, on our own node's graph: the instance checked them on its
+                // graph, which we do not take on its word. A miss may be gossip that has not
+                // reached our node yet, so the roster is looked at again later.
+                if !ring.terms.rules.is_none() {
+                    for member in ring.members.iter().filter(|member| **member != own) {
+                        let graph = backend
+                            .graph_node(&member.to_string())
+                            .await
+                            .map_err(|e| RingRunError::Node(e.to_string()))?;
+                        if !ring.terms.rules.met_by(graph) {
+                            return Err(RingRunError::OutOfOrder(
+                                "a member's node does not meet the ring's rules in our graph yet",
+                            ));
+                        }
+                    }
+                }
                 // The bond is in the terms just compared. Without the instance's node there
                 // would be nothing to check its invoice against: no commit.
                 if ring.terms.bond_sat > 0 && self.instance_node.is_none() {

@@ -74,6 +74,30 @@ pub struct Usage {
     pub runs: u32,
 }
 
+/// Why a take from a seller whose node our graph shows as `graph` (public channels, their
+/// capacity; `None` for a node not in it) is over the policy's seller minimums; empty when it
+/// is not, or when the policy sets none.
+pub fn seller_reasons(policy: &PolicyConfig, graph: Option<(u32, u64)>) -> Vec<String> {
+    let least = mostro_core::rules::Rules {
+        min_channels: policy.min_seller_channels,
+        min_capacity_sat: policy.min_seller_capacity_sat,
+    };
+    if least.met_by(graph) {
+        return Vec::new();
+    }
+    let shown = match graph {
+        Some((channels, capacity_sat)) => {
+            format!("{channels} public channels and {capacity_sat} sat")
+        }
+        None => "no public channel".to_string(),
+    };
+    vec![format!(
+        "the seller's node shows {shown} in our graph; min_seller_channels is {}, \
+         min_seller_capacity_sat is {}",
+        policy.min_seller_channels, policy.min_seller_capacity_sat
+    )]
+}
+
 /// The limits `ask` is over, each named by its key in `[policy]`; empty when it is within all
 /// of them.
 pub fn over(policy: &PolicyConfig, ask: &Ask, usage: &Usage) -> Vec<String> {
@@ -591,6 +615,8 @@ mod tests {
             max_bond_sat: 20_000,
             max_runs: 2,
             allowed_peers: Vec::new(),
+            min_seller_channels: 0,
+            min_seller_capacity_sat: 0,
         }
     }
 
@@ -607,6 +633,23 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("bipnip-policy-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         PolicyStore::open(&dir).expect("store")
+    }
+
+    #[test]
+    fn a_seller_below_the_minimums_in_our_graph_is_a_reason_to_park() {
+        let none = policy();
+        assert!(seller_reasons(&none, None).is_empty());
+        let strict = PolicyConfig {
+            min_seller_channels: 3,
+            min_seller_capacity_sat: 10_000_000,
+            ..policy()
+        };
+        assert_eq!(seller_reasons(&strict, None).len(), 1);
+        assert_eq!(seller_reasons(&strict, Some((2, 50_000_000))).len(), 1);
+        assert_eq!(seller_reasons(&strict, Some((9, 9_999_999))).len(), 1);
+        assert!(seller_reasons(&strict, Some((3, 10_000_000))).is_empty());
+        let reason = &seller_reasons(&strict, Some((1, 5))).pop().expect("reason");
+        assert!(reason.contains("min_seller_channels"), "{reason}");
     }
 
     #[test]

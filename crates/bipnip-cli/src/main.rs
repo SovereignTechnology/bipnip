@@ -8,13 +8,15 @@
 //!         [--max-fee SAT]
 //! bipnip [--socket PATH] lease offer --min-capacity SAT --max-capacity SAT --duration BLOCKS
 //!         --fee-base SAT --fee-ppm PPM --feerate SAT_PER_VB [--upfront PERCENT] [--confs N]
-//!         [--private] [--expires-in SECS] [--bond SAT] [--instance KEY]
+//!         [--private] [--expires-in SECS] [--bond SAT] [--min-buyer-channels N]
+//!         [--min-buyer-capacity SAT] [--instance KEY]
 //! bipnip [--socket PATH] lease take ORDER_ID --capacity SAT [--node-address HOST:PORT]
 //!         [--instance KEY]
 //! bipnip [--socket PATH] lease cancel RUN
 //! bipnip [--socket PATH] lease list
 //! bipnip [--socket PATH] ring create --capacity SAT --slots N --feerate SAT_PER_VB
-//!         [--window SECS] [--expires-in SECS] [--bond SAT] [--private]
+//!         [--window SECS] [--expires-in SECS] [--bond SAT] [--min-channels N]
+//!         [--min-capacity SAT] [--private]
 //!         [--node-address HOST:PORT] [--instance KEY]
 //! bipnip [--socket PATH] ring join ORDER_ID --feerate SAT_PER_VB [--node-address HOST:PORT]
 //!         [--instance KEY]
@@ -193,6 +195,18 @@ fn request(args: &[String]) -> Result<(String, Value), String> {
                 options.number(&mut params, "confs", "min_confirmations", false)?;
                 options.number(&mut params, "expires-in", "expires_in_secs", false)?;
                 options.number(&mut params, "bond", "bond_sat", false)?;
+                options.number(
+                    &mut params,
+                    "min-buyer-channels",
+                    "min_buyer_channels",
+                    false,
+                )?;
+                options.number(
+                    &mut params,
+                    "min-buyer-capacity",
+                    "min_buyer_capacity_sat",
+                    false,
+                )?;
                 options.text(&mut params, "instance", "instance");
                 if options.switch("private") {
                     params.insert("announce".into(), json!(false));
@@ -226,6 +240,8 @@ fn request(args: &[String]) -> Result<(String, Value), String> {
                 options.number(&mut params, "window", "open_window_secs", false)?;
                 options.number(&mut params, "expires-in", "expires_in_secs", false)?;
                 options.number(&mut params, "bond", "bond_sat", false)?;
+                options.number(&mut params, "min-channels", "min_channels", false)?;
+                options.number(&mut params, "min-capacity", "min_capacity_sat", false)?;
                 options.text(&mut params, "node-address", "node_address");
                 options.text(&mut params, "instance", "instance");
                 if options.switch("private") {

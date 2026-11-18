@@ -15,6 +15,7 @@
 //! bipnip-agent --config FILE lease offer --min-capacity SAT --max-capacity SAT --duration BLOCKS
 //!         --fee-base SAT --fee-ppm PPM --feerate SAT_PER_VB [--upfront PERCENT] [--confs N]
 //!         [--private] [--expires-in SECS] [--bond SAT] [--cltv-delta BLOCKS] [--poll SECS]
+//!         [--min-buyer-channels N] [--min-buyer-capacity SAT]
 //!                                              offer liquidity and see the lease through
 //! bipnip-agent --config FILE lease take ORDER_ID --capacity SAT [--node-address HOST:PORT]
 //!         [--max-fee-msat MSAT] [--max-cltv-delta BLOCKS] [--poll SECS]
@@ -23,7 +24,8 @@
 //!                                              carry on with stored leases after a restart
 //! bipnip-agent --config FILE lease list        show the stored leases
 //! bipnip-agent --config FILE ring create --capacity SAT --slots N --feerate SAT_PER_VB
-//!         [--window SECS] [--expires-in SECS] [--bond SAT] [--private]
+//!         [--window SECS] [--expires-in SECS] [--bond SAT] [--min-channels N]
+//!         [--min-capacity SAT] [--private]
 //!         [--node-address HOST:PORT] [--poll SECS]
 //!                                              propose a ring, take its first slot, see it through
 //! bipnip-agent --config FILE ring join ORDER_ID --feerate SAT_PER_VB [--node-address HOST:PORT]
@@ -58,6 +60,7 @@ use bipnip_agent::ring::cmd::{self as ring_cmd, CreateParams, JoinParams};
 use bipnip_agent::{relay, secretfile};
 use bipnip_ln::LightningBackend;
 use mostro_core::node_binding::{Action, latest_for_node};
+use mostro_core::rules::Rules;
 use nostr_sdk::prelude::ToBech32;
 
 fn usage() -> String {
@@ -363,6 +366,10 @@ async fn lease(config: &Config, args: &[String]) -> Result<(), String> {
                 announce: !options.switch("private"),
                 expires_in_secs: options.or("expires-in", 86_400u64)?,
                 bond_sat: options.or("bond", 0u64)?,
+                rules: Rules {
+                    min_channels: options.or("min-buyer-channels", 0u32)?,
+                    min_capacity_sat: options.or("min-buyer-capacity", 0u64)?,
+                },
             };
             let seller = SellerConfig {
                 cltv_delta: options.or("cltv-delta", DEFAULT_SELLER_CLTV_DELTA)?,
@@ -451,6 +458,10 @@ async fn ring(config: &Config, args: &[String]) -> Result<(), String> {
                 expires_in_secs: options.or("expires-in", 86_400u64)?,
                 node_address: options.take("node-address")?,
                 feerate_sat_vb: options.required("feerate")?,
+                rules: Rules {
+                    min_channels: options.or("min-channels", 0u32)?,
+                    min_capacity_sat: options.or("min-capacity", 0u64)?,
+                },
             };
             if !options.done()?.is_empty() {
                 return Err(usage());

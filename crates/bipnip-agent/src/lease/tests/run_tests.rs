@@ -114,6 +114,7 @@ impl Stage {
             announce: true,
             expires_at: NOW + 86_400,
             bond_sat: 0,
+            rules: Default::default(),
         };
         Stage {
             seller_node,
@@ -1015,6 +1016,41 @@ async fn a_lease_paid_all_upfront_is_watched_to_its_end() {
     buyer.tick(&stage.buyer_node, NOW).await.expect("tick");
     assert_eq!(buyer.state(), BuyerState::Complete);
     assert!(seller.finished() && buyer.finished());
+}
+
+/// A seller checks its offer's rules on its own node's graph when a take arrives: the instance
+/// checked them on its graph, which the seller does not take on its word.
+#[tokio::test]
+async fn a_seller_checks_its_offers_rules_on_its_own_graph() {
+    let mut stage = Stage::new();
+    stage.offer.rules = mostro_core::rules::Rules {
+        min_channels: 1,
+        min_capacity_sat: 500_000,
+    };
+    let mut seller = stage.offered().await;
+    let (_buyer, take) = stage.take(stage.take_request()).await;
+    // The buyer's node is not in the seller's graph yet: no invoice, looked at again later.
+    let result = stage.to_seller(&mut seller, &take).await;
+    assert!(matches!(result, Err(RunError::OutOfOrder(_))), "{result:?}");
+    assert_eq!(seller.state(), SellerState::Open);
+    let buyer_node = stage.buyer_node.id();
+    stage
+        .world
+        .lock()
+        .expect("world")
+        .graph
+        .insert(buyer_node.clone(), (1, 499_999));
+    let result = stage.to_seller(&mut seller, &take).await;
+    assert!(matches!(result, Err(RunError::OutOfOrder(_))), "{result:?}");
+    stage
+        .world
+        .lock()
+        .expect("world")
+        .graph
+        .insert(buyer_node, (1, 500_000));
+    let invoice = stage.to_seller(&mut seller, &take).await.expect("take");
+    assert_eq!(invoice.len(), 1);
+    assert_eq!(seller.state(), SellerState::Invoiced);
 }
 
 #[tokio::test]

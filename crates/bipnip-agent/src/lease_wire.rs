@@ -590,6 +590,7 @@ mod tests {
                 announce: true,
                 expires_at: NOW + 86_400,
                 bond_sat: 0,
+                rules: Default::default(),
             }
         }
 
