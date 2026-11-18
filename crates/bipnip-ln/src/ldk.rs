@@ -160,10 +160,10 @@ impl LdkBackend {
     /// payment list.
     async fn inbound(&self, payment_hash: &str) -> Result<Option<Payment>, BackendError> {
         let inbound = |payment: &Payment| payment.direction == PaymentDirection::Inbound as i32;
-        if let Some(payment) = self.payment(payment_hash).await? {
-            if inbound(&payment) {
-                return Ok(Some(payment));
-            }
+        if let Some(payment) = self.payment(payment_hash).await?
+            && inbound(&payment)
+        {
+            return Ok(Some(payment));
         }
         let mut page_token = None;
         for _ in 0..MAX_PAYMENT_PAGES {
