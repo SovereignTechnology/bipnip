@@ -151,7 +151,8 @@ exec "$(command -v lncli)" --lnddir="$W/alice" --network=regtest --rpcserver=127
 CLOSE
 chmod +x "$W/close-alice.sh"
 # A close command for the conformance run: closes, from frank's side, the channel whose funding
-# outpoint is $1 (Core Lightning closes by channel id when a peer has two channels).
+# outpoint is $1 (Core Lightning closes by channel id when a peer has two channels). A mutual close
+# not done within 60 seconds becomes a unilateral one: `close` otherwise waits 48 hours.
 cat > "$W/close-frank.sh" <<CLOSE
 #!/usr/bin/env bash
 set -euo pipefail
@@ -160,7 +161,7 @@ cid=\$(lc listpeerchannels | python3 -c 'import json,sys
 txid, out = sys.argv[1].split(":")
 print(next(c["channel_id"] for c in json.load(sys.stdin)["channels"]
            if c.get("funding_txid") == txid and c.get("funding_outnum") == int(out)))' "\$1")
-lc close "\$cid" >/dev/null
+lc close "\$cid" 60 >/dev/null
 CLOSE
 chmod +x "$W/close-frank.sh"
 A_BACKEND=lnd A_ADDR=https://127.0.0.1:${RPC[alice]} A_CERT=$W/alice/tls.cert A_MAC=$(mac alice) \
