@@ -34,7 +34,11 @@ Published and signed by the instance after a creator's `ring-offer`, `d` = order
 | `bond` | what every member locks at the instance, in sat; `0` for none |
 | `expiration` | NIP-40, for filling the slots |
 
-Not in this version: `rules` (member requirements checked against the instance's graph).
+| `rules` | optional: `min_channels=<n>`, `min_capacity_sat=<sat>`, one value per rule set, in that order. What every member's node must show in the public graph; absent when none is set |
+
+A ring with rules writes them into its roster text (`bipnip-ring:v2:…`), so every member's commit covers
+them. The instance checks every member's node against the rules in its own graph when a slot is taken, and
+each member's agent checks the roster against its own node's graph before it commits.
 
 ## The roster
 
