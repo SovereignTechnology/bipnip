@@ -70,14 +70,14 @@ pub fn nonce() -> String {
 
 /// The Content-Security-Policy for an HTML page served with `nonce`.
 ///
-/// `style-src 'unsafe-inline'` is a W0 concession: the RoboSats UI (MUI/emotion) injects `<style>`
-/// elements at run time; W1 passes the nonce to emotion and drops it. Scripts never run inline
-/// without the nonce, connections go only to this origin, and nothing may frame the page.
+/// Neither scripts nor styles run inline without the nonce: the UI reads it off its script tag
+/// and hands it to the styles it injects at run time (emotion's cache, webpack's style loader).
+/// Connections go only to this origin, and nothing may frame the page.
 pub fn csp(nonce: &str) -> String {
     [
         "default-src 'none'".to_string(),
         format!("script-src 'self' 'nonce-{nonce}' 'wasm-unsafe-eval'"),
-        "style-src 'self' 'unsafe-inline'".to_string(),
+        format!("style-src 'self' 'nonce-{nonce}'"),
         "img-src 'self' data: blob:".to_string(),
         "font-src 'self'".to_string(),
         "media-src 'self'".to_string(),
