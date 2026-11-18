@@ -83,6 +83,8 @@ struct Table {
     house: Node,
     /// Whether the members were given the instance's node when they joined.
     know_house: bool,
+    /// What every member's node must show in the public graph.
+    rules: mostro_core::rules::Rules,
 }
 
 impl Table {
@@ -112,6 +114,7 @@ impl Table {
             bond_sat: 0,
             house,
             know_house: true,
+            rules: Default::default(),
         }
     }
 
@@ -135,6 +138,7 @@ impl Table {
             announce: true,
             open_window_secs: 48 * 3_600,
             bond_sat: self.bond_sat,
+            rules: self.rules,
         }
     }
 
@@ -178,6 +182,7 @@ impl Table {
             bond_sat: self.bond_sat,
             expires_at: NOW + 86_400,
             seat: self.members[0].seat(),
+            rules: self.rules,
         }
     }
 
@@ -1443,6 +1448,51 @@ async fn a_bond_claim_is_seen_paid_on_a_node_that_keeps_no_hold_invoices() {
     assert!(run.tick(&node, NOW + 60).await.expect("tick").is_empty());
     assert_eq!(run.owed_status(), "paid");
     assert!(run.finished());
+}
+
+/// A member checks the ring's rules on its own node's graph before it commits: the instance
+/// checked them on its own graph, which a member does not take on its word.
+#[tokio::test]
+async fn a_member_checks_the_rings_rules_on_its_own_graph_before_it_commits() {
+    let table = Table {
+        rules: mostro_core::rules::Rules {
+            min_channels: 2,
+            ..Default::default()
+        },
+        ..Table::new(3)
+    };
+    let mut runs = table.seated().await;
+    let roster = table.roster(&[0, 1, 2]);
+    let ring = roster.validate().expect("ring");
+    assert!(ring.text().starts_with("bipnip-ring:v2:"));
+    let incoming = || RingIncoming::Roster {
+        order_id: table.order_id,
+        roster: roster.clone(),
+    };
+    // Member 0's node does not see the others with two channels yet: no commit, looked at again.
+    let result = table.deliver(&mut runs[0], 0, incoming()).await;
+    assert!(
+        matches!(result, Err(RingRunError::OutOfOrder(_))),
+        "{result:?}"
+    );
+    assert_eq!(runs[0].state(), RingState::Seated);
+    {
+        let mut world = table.world.lock().expect("world");
+        for member in &table.members[1..] {
+            world
+                .graph
+                .insert(member.node_key().to_string(), (2, 2_000_000));
+        }
+    }
+    let out = table
+        .deliver(&mut runs[0], 0, incoming())
+        .await
+        .expect("roster");
+    assert_eq!(out.len(), 1, "our commit");
+    assert_eq!(runs[0].state(), RingState::Committed);
+    // The rules are kept with the run.
+    let stored = RingRun::from_json(&runs[0].to_json().expect("json")).expect("stored");
+    assert_eq!(stored.terms().rules, table.rules);
 }
 
 #[tokio::test]

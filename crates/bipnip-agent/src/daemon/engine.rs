@@ -19,6 +19,7 @@ use std::collections::BTreeMap;
 use bipnip_ln::LightningBackend;
 use mostro_core::node_binding::Action as BindingAction;
 use mostro_core::prelude::Message;
+use mostro_core::rules::Rules;
 use nostr_sdk::prelude::{Client, Event, Filter, Kind, PublicKey, Timestamp, ToBech32};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -27,7 +28,7 @@ use super::api::{
     self, ApiError, Call, Code, LeaseOfferParams, LeaseTakeParams, OrderKind, OrdersParams,
     Request, RingCreateParams, RingJoinParams,
 };
-use super::policy::{Ask, Grant, Guard, Parked, PolicyStore, Usage, over};
+use super::policy::{Ask, Grant, Guard, Parked, PolicyStore, Usage, over, seller_reasons};
 use crate::binding::make_binding_event;
 use crate::book;
 use crate::config::{Config, InstanceConfig, InstanceEntry};
@@ -858,7 +859,19 @@ impl Engine {
         let now = unix_now();
         match approved {
             None => {
-                let reasons = over(&self.config.policy, &ask, &self.usage(now)?);
+                let mut reasons = over(&self.config.policy, &ask, &self.usage(now)?);
+                if let Run::Buyer(buyer) = &run {
+                    let policy = &self.config.policy;
+                    if policy.min_seller_channels > 0 || policy.min_seller_capacity_sat > 0 {
+                        let seller = buyer.contract().seller_node.to_string();
+                        let graph = self
+                            .backend
+                            .graph_node(&seller)
+                            .await
+                            .map_err(|e| ApiError::new(Code::Node, e.to_string()))?;
+                        reasons.extend(seller_reasons(policy, graph));
+                    }
+                }
                 if !reasons.is_empty() {
                     return Err(self.park(request, ask, reasons, now));
                 }
@@ -1094,6 +1107,10 @@ async fn prepare_offer(
         announce: params.announce,
         expires_in_secs: params.expires_in_secs,
         bond_sat: params.bond_sat,
+        rules: Rules {
+            min_channels: params.min_buyer_channels,
+            min_capacity_sat: params.min_buyer_capacity_sat,
+        },
     };
     let seller = SellerConfig {
         cltv_delta: DEFAULT_SELLER_CLTV_DELTA,
@@ -1137,6 +1154,10 @@ async fn prepare_create(
         expires_in_secs: params.expires_in_secs,
         node_address: params.node_address.clone(),
         feerate_sat_vb: params.feerate_sat_vb,
+        rules: Rules {
+            min_channels: params.min_channels,
+            min_capacity_sat: params.min_capacity_sat,
+        },
     };
     let (run, first, link) = ring_cmd::prepare_create(session, create)
         .await

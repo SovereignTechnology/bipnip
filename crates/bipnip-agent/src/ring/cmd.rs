@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use mostro_core::prelude::Message;
 use mostro_core::ring_message::{RingOffer, RingSeat};
+use mostro_core::rules::Rules;
 use uuid::Uuid;
 
 use super::link::{launch, step};
@@ -38,6 +39,8 @@ pub struct CreateParams {
     pub node_address: Option<String>,
     /// Fee rate of our funding transaction, in sat/vB.
     pub feerate_sat_vb: u64,
+    /// What every member's node must show in the public graph; none by default.
+    pub rules: Rules,
 }
 
 /// A ring to join.
@@ -145,6 +148,7 @@ pub async fn prepare_create(
         bond_sat: params.bond_sat,
         expires_at: now.saturating_add(params.expires_in_secs),
         seat: own_seat(session, params.node_address, now).await?,
+        rules: params.rules,
     };
     offer.validate().map_err(|e| e.to_string())?;
     let instance_node = instance_node_for(session, instance, params.bond_sat).await?;

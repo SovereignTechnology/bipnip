@@ -30,6 +30,8 @@
 //! max_bond_sat = 0
 //! max_runs = 0
 //! allowed_peers = []                  # node keys (66 hex); empty means any
+//! min_seller_channels = 0             # a take from a seller with fewer public channels parks
+//! min_seller_capacity_sat = 0         # likewise for less public capacity, in satoshi
 //! ```
 //!
 //! A single `[instance]` table is read as one `[[instance]]`.
@@ -150,6 +152,14 @@ pub struct PolicyConfig {
     /// any node.
     #[serde(default)]
     pub allowed_peers: Vec<String>,
+    /// Fewest public channels a seller's node must show in our node's graph for a take to go
+    /// ahead without approval; 0 for no such limit.
+    #[serde(default)]
+    pub min_seller_channels: u32,
+    /// Least public capacity a seller's node must show in our node's graph, in satoshi; 0 for
+    /// no such limit.
+    #[serde(default)]
+    pub min_seller_capacity_sat: u64,
 }
 
 #[derive(Debug, Deserialize)]

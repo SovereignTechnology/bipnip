@@ -475,6 +475,7 @@ mod tests {
             announce: true,
             expires_at: 2_000_000_000,
             bond_sat: 0,
+            rules: Default::default(),
         };
         let id = Uuid::new_v4();
         let order = |status, at: u64, keys: &Keys| {

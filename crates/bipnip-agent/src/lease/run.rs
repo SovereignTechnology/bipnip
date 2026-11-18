@@ -684,6 +684,20 @@ impl SellerRun {
         match (incoming, self.state) {
             (Incoming::Take { take, .. }, SellerState::Open) => {
                 let (contract, _vouched_for) = lease_wire::check_take(&self.offer, &take, now)?;
+                // The offer's rules, on our own node's graph: the instance checked them on its
+                // graph, which we do not take on its word. A miss may be gossip that has not
+                // reached our node yet; the take is looked at again until its contract is stale.
+                if !self.offer.rules.is_none() {
+                    let graph = backend
+                        .graph_node(&contract.buyer_node.to_string())
+                        .await
+                        .map_err(LeaseStepError::from)?;
+                    if !self.offer.rules.met_by(graph) {
+                        return Err(RunError::OutOfOrder(
+                            "the buyer's node does not meet the offer's rules in our graph yet",
+                        ));
+                    }
+                }
                 let lease = SellerLease::accept(backend, &take.contract).await?;
                 let bolt11 = lease
                     .upfront_invoice(backend, self.config.cltv_delta)

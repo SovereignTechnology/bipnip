@@ -100,6 +100,8 @@ max_capacity_per_day_sat = 0     # channels this agent opens in a day: leases so
 max_bond_sat = 0                 # the largest bond locked at an instance
 max_runs = 0                     # runs under way at once (not finished, not only watched)
 allowed_peers = []               # node keys; empty means any
+min_seller_channels = 0          # a take parks when the seller's node shows fewer public channels
+min_seller_capacity_sat = 0      # in our node's graph, or less public capacity (0: no minimum)
 ```
 
 Every limit defaults to 0. With the defaults every request that starts a run is parked as

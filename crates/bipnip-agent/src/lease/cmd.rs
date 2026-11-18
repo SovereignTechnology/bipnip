@@ -7,6 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use bipnip_ln::LightningBackend;
 use mostro_core::lease_message::LeaseOffer;
 use mostro_core::node_binding::{Action, latest_for_node};
+use mostro_core::rules::Rules;
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -80,6 +81,8 @@ pub struct OfferParams {
     pub expires_in_secs: u64,
     /// What the buyer locks at the instance while the lease is set up, in satoshi; 0 for none.
     pub bond_sat: u64,
+    /// What the buyer's node must show in the public graph; none by default.
+    pub rules: Rules,
 }
 
 /// What a buyer takes.
@@ -288,6 +291,7 @@ pub async fn prepare_offer(
         announce: params.announce,
         expires_at: now.saturating_add(params.expires_in_secs),
         bond_sat: params.bond_sat,
+        rules: params.rules,
     };
     offer.validate().map_err(|e| e.to_string())?;
     // Buyers look the binding up on the relays before they take the offer.

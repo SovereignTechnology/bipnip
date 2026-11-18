@@ -153,6 +153,12 @@ pub struct LeaseOfferParams {
     /// What the buyer locks at the instance, in satoshi; 0 for none.
     #[serde(default)]
     pub bond_sat: u64,
+    /// Fewest public channels the buyer's node must have; 0 for no such rule.
+    #[serde(default)]
+    pub min_buyer_channels: u32,
+    /// Least public capacity the buyer's node must have, in satoshi; 0 for no such rule.
+    #[serde(default)]
+    pub min_buyer_capacity_sat: u64,
     /// The instance to offer on (npub or hex), when several are configured.
     #[serde(default)]
     pub instance: Option<String>,
@@ -196,6 +202,12 @@ pub struct RingCreateParams {
     /// What every member locks at the instance, in satoshi; 0 for none.
     #[serde(default)]
     pub bond_sat: u64,
+    /// Fewest public channels every member's node must have; 0 for no such rule.
+    #[serde(default)]
+    pub min_channels: u32,
+    /// Least public capacity every member's node must have, in satoshi; 0 for no such rule.
+    #[serde(default)]
+    pub min_capacity_sat: u64,
     /// Where the member that opens to us can reach our node (`host:port`).
     #[serde(default)]
     pub node_address: Option<String>,
