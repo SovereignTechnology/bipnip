@@ -38,7 +38,7 @@ HOLD_V=v0.3.3
 HOLD_SHA=f9d916430fb70a3d75089f2d1b88d5d71d4987ef79933035978c1f44aab84be5
 LDK_SERVER_REV=d7e7a2e708664af922c53c786ad6a5df622f5dd8
 # The instance: the same revision run-lnd.sh uses.
-BIPNIPD_REV=46fa73a07b6d9e8e529aa4663054c618adab1c36
+BIPNIPD_REV=c801879600f4a75f3d9e26c0c81d47e0badab404
 fetch() { curl -fsSL --retry 3 -o "$3" "$1"; echo "$2  $3" | sha256sum -c --quiet; }
 
 log "tools"

@@ -13,7 +13,8 @@ Nostr-native peer-to-peer Lightning exchange) that keeps all of Mostro and adds:
 Everything travels over Nostr relays. Anyone who runs a node can run an instance; instances coordinate
 leases and rings but never hold lease money.
 
-Status: **M1 and M2 in progress**. M0 (forks, specs, spikes) is done. The LND backend passes its
+Status: **M2 done on regtest; the trust layer (watching leases, rules, outcomes) in progress**. M0 (forks,
+specs, spikes) is done. The LND backend passes its
 conformance run against real nodes; `bipnip-agent` can create a mnemonic, bind a node and publish the
 binding. A whole lease now runs end to end on regtest: a seller's agent offers liquidity on an instance,
 a buyer's agent takes the order, pays the seller's hold invoice, checks the channel on its own node and
@@ -24,7 +25,8 @@ the same way: a creator proposes a ring, others take its slots, every member che
 it, and each opens one channel to the next and confirms the one opened to it. A ring can ask every member
 for a bond, locked at the instance's node before anyone opens and paid on to the member that was let down
 when a channel is missing. A lease offer can ask its buyer for a bond the same way, paid on to the seller
-if the buyer walks away from an opened channel. (The instance side of bonds is still in review.) The
+if the buyer walks away from an opened channel. Bonds are refused on mainnet until their code is read
+(`bipnipd` #9). The
 agent also runs as a daemon (`bipnip-agent run`) that carries every lease and ring on across restarts,
 answers the `bipnip` command line on a unix socket, and holds each request to spending limits you set.
 Three kinds of node are supported: **LND** (everything), **Core Lightning** with the `hold` plugin
