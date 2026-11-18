@@ -24,7 +24,8 @@ and closes.
 A failure ends the connection with `{"ok": false, "error": {"code": "…", "message": "…"}}`. Codes:
 `bad-request` (not JSON, unknown method, a missing or malformed parameter), `not-found`, `refused` (a
 check failed: the message says which), `needs-approval` (parked; `error.approval` names it), `busy` (too
-many connections), `node` (the Lightning node could not be asked), `relay`, `internal`.
+many connections, or a page asking too often), `node` (the Lightning node could not be asked), `relay`,
+`internal`, and at the web door `unpaired` and `stale` (below).
 
 A client has ten seconds to send its request line. At most 16 connections are served at once. A client
 that reads slower than the agent writes loses lines; the agent never waits for a client.
@@ -150,5 +151,48 @@ on as that command would have; the person who typed it gave it its limits. Of th
 
 ## Who may connect
 
-Anyone who can open the socket: by its mode, the user that runs the agent. There is no pairing and no
-per-client scope yet; those come with the web client (ADR 0009), and this API will then sit behind them.
+On `agent.sock`: anyone who can open the socket, by its mode the user that runs the agent. That is the
+operator, and the operator may ask for everything here.
+
+## The web door
+
+With a `[web]` section the agent opens a second socket for web pages (ADR 0011):
+
+```toml
+[web]
+socket = "/run/bipnip-web/web.sock"  # default <data_dir>/web.sock
+socket_mode = 0o660                  # default 0o600
+allow_uids = [1001]                  # the web host's user, besides the agent's own
+```
+
+Its directory must belong to the agent's user (or root) and be writable by nobody else, or the agent does
+not start. In the data directory it works, with a warning: only a web host of the agent's own user can
+reach it there, and that user can read the agent's files.
+
+The same framing, but each line is a Nostr event of kind 24735, signed with the page's session key and
+never published: `content` is a request line as above, a `p` tag names the agent's liquidity identity, a
+`nonce` tag keeps equal requests apart. A request must be dated within 120 s before and 5 s after the
+agent's clock (and after its start), must not have been seen before, and must come from a key with a live
+session whose scope covers it. New codes: `unpaired` (no live session: pair again) and `stale` (the
+answer's `error.now` is the agent's time).
+
+| method | who | params | result |
+|---|---|---|---|
+| `pair.open` | operator | `secs`? (default 180, at most 600) | `open_until` |
+| `pair.list` | operator | none | `open`, `open_until`, `waiting`: labels and times (never codes) |
+| `pair.approve` | operator | `code`, `scope`?: `read` \| `trade`, `expires_days`? (default 7), `label`? | the session |
+| `pair.deny` | operator | `code` | none |
+| `sessions` | operator | none | every session: key, label, scope, times, `live` |
+| `revoke` | operator | `session` (the key, 64 hex) | `ended`, `dropped` (its parked requests) |
+| `pair.request` | page | `label`? | `code` to show, `agent` (whom to name in `p`) |
+| `pair.status` | page | none | `paired` (with scope, label, expiry), or `pending` with its `code` |
+| `pair.end` | page | none | ends its own session |
+
+A `read` session may ask `status`, `orders`, `lease.list`, `ring.list`, `approvals` (its own) and `watch`
+(two at once); a `trade` session also `lease.offer`, `lease.take`, `ring.create`, `ring.join` and the
+cancel of runs it asked for. Never: `approve`, `deny`, pairing, `sessions`, `revoke`, `binding.publish`,
+`record`. Every run a page asks for is parked, whatever the policy; `bipnip approve` shows what it would do
+and asks. A page may have 3 waiting, asks for a run at most every 10 s, and its waiting requests lapse
+after a day or when its session ends. A page is shown `status` without the policy and the day's use, lists
+without file names, and runs without `line` and without the outpoint of an unannounced channel; `mine`
+marks the runs it asked for. A run approved from a parked request names it in `approval`.

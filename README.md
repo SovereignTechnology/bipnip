@@ -173,9 +173,15 @@ allowed_peers = []               # node keys; empty means any
 
 ```sh
 bipnip approvals                 # what is parked, and which limit it is over
-bipnip approve <approval>        # let it go ahead as it was shown
+bipnip approve <approval>        # shows what it would do and asks; --yes in scripts
 bipnip deny <approval>
 ```
+
+A web page (the `bipnip-web` client through `bipnip-webhost`) reaches the daemon through a second socket,
+opened by a `[web]` section, once paired: `bipnip pair open`, then `bipnip pair approve <code the page
+shows> [--scope trade]`; `bipnip sessions` and `bipnip revoke <session>` manage them. Every run a page asks
+for is parked until `bipnip approve`. `docs/decisions/0011-key-roles-pairing-and-session-keys.md` says what
+a page can and cannot do.
 
 A run the daemon starts can pay and open only what it was granted: a payment or a channel beyond that is
 refused before it reaches the node. While the daemon runs, the one-shot `lease` and `ring` commands are
@@ -197,7 +203,8 @@ Upstream Mostro apps keep working against a `bipnipd` instance for fiat trades.
 ## Docs
 
 - Decisions: `docs/decisions/` (fork and licenses, roles, lease payment, node binding, event kinds,
-  Lightning backends, rings, reputation, web-client security, the agent daemon and its local API)
+  Lightning backends, rings, reputation, web-client security, the agent daemon and its local API, key
+  roles and pairing web pages)
 - `docs/agent-api.md`: the daemon's unix-socket protocol, which `bipnip` speaks
 - Specs (drafts): `docs/nips/node-binding.md`, `docs/nips/liquidity-leases.md`,
   `docs/nips/liquidity-rings.md`

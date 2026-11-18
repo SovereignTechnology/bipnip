@@ -174,6 +174,12 @@ pub struct Grant {
     pub paid: Vec<Paid>,
     /// The capacity of the channels the run opened, in satoshi.
     pub opened_sat: u64,
+    /// The paired page that asked for the run (its session key), if a page did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    /// The parked request the run was approved from, if it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<String>,
 }
 
 impl Grant {
@@ -186,6 +192,8 @@ impl Grant {
             approved,
             paid: Vec::new(),
             opened_sat: 0,
+            session: None,
+            approval: None,
         }
     }
 
@@ -214,6 +222,9 @@ pub struct Parked {
     pub ask: Ask,
     /// The limits it is over.
     pub over: Vec<String>,
+    /// The paired page that asked (its session key), if a page did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
 }
 
 /// Why the policy's files could not be used.
@@ -860,6 +871,7 @@ mod tests {
             params: serde_json::json!({"capacity_sat": 600_000}),
             ask: ask(3_000, 0, 0),
             over: vec!["max_runs".into()],
+            session: None,
         };
         store.park(&parked("bb", 20)).expect("park");
         store.park(&parked("aa", 30)).expect("park");
@@ -874,6 +886,50 @@ mod tests {
         store.unpark("aa").expect("twice is fine");
         assert_eq!(store.parked("aa"), Ok(None));
         assert_eq!(store.all_parked().expect("list").len(), 1);
+    }
+
+    #[test]
+    fn files_from_before_pages_load_and_a_page_s_files_name_it() {
+        let store = store("pages");
+        // A grant and a parked request as the agent wrote them before pages were paired: no
+        // `session`, no `approval`.
+        std::fs::create_dir_all(&store.dir).expect("dir");
+        for (name, json) in [
+            (
+                "grant-buyer-01.json",
+                r#"{"run":"buyer-01","at":5,"ask":{"fee_sat":3000,"capacity_sat":0,"bond_sat":0,"peer":null},"approved":false,"paid":[],"opened_sat":0}"#,
+            ),
+            (
+                "approval-aa.json",
+                r#"{"approval":"aa","at":5,"method":"lease.take","params":{},"ask":{"fee_sat":3000,"capacity_sat":0,"bond_sat":0,"peer":null},"over":["max_runs"]}"#,
+            ),
+        ] {
+            let path = store.dir.join(name);
+            std::fs::write(&path, json).expect("write");
+            std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+                .expect("chmod");
+        }
+        let old = store.grant("buyer-01").expect("read").expect("there");
+        assert_eq!((old.session, old.approval), (None, None));
+        assert_eq!(
+            store.parked("aa").expect("read").expect("there").session,
+            None
+        );
+        // Written again without a page, a file is as before: nothing new in it.
+        store
+            .save_grant(&Grant::new("buyer-02".into(), 5, ask(1, 0, 0), false))
+            .expect("save");
+        let text = std::fs::read_to_string(store.dir.join("grant-buyer-02.json")).expect("read");
+        assert!(
+            !text.contains("session") && !text.contains("approval"),
+            "{text}"
+        );
+        // A page's run names the page and the approval it came from.
+        let mut grant = Grant::new("buyer-03".into(), 5, ask(1, 0, 0), true);
+        grant.session = Some("ab".repeat(32));
+        grant.approval = Some("aa".into());
+        store.save_grant(&grant).expect("save");
+        assert_eq!(store.grant("buyer-03"), Ok(Some(grant)));
     }
 
     fn nodes() -> (Node, Node) {

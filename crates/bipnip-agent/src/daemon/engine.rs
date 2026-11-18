@@ -21,16 +21,17 @@ use mostro_core::lease::LeaseContract;
 use mostro_core::node_binding::Action as BindingAction;
 use mostro_core::prelude::Message;
 use mostro_core::rules::Rules;
-use nostr_sdk::prelude::{Client, Event, Filter, Kind, PublicKey, Timestamp, ToBech32};
+use nostr_sdk::prelude::{Client, Event, EventId, Filter, Kind, PublicKey, Timestamp, ToBech32};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use super::api::{
-    self, ApiError, Call, Code, LeaseOfferParams, LeaseTakeParams, Request, RingCreateParams,
-    RingJoinParams,
+    self, ApiError, Call, Code, LeaseOfferParams, LeaseTakeParams, PairApprove, Request,
+    RingCreateParams, RingJoinParams,
 };
 use super::policy::{Ask, Grant, Guard, Parked, PolicyStore, Usage, over, seller_reasons};
 use super::reads::Reader;
+use super::session::{self, SessionStore, Signed};
 use crate::binding::make_binding_event;
 use crate::config::{Config, InstanceConfig, InstanceEntry};
 use crate::keys::Wallet;
@@ -276,12 +277,64 @@ struct Entry {
 struct Watcher {
     run: Option<String>,
     lines: Lines,
+    /// The paired page that watches (its session key), or `None` for the operator.
+    page: Option<String>,
 }
+
+/// Who asked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Caller {
+    /// The operator, on the agent's own socket.
+    Owner,
+    /// A paired page through the web door, by its session key (64 hex). Until the engine has
+    /// admitted the request ([`Engine::handle`]), the key may be one nobody paired.
+    Page(String),
+}
+
+impl Caller {
+    fn page(&self) -> Option<&str> {
+        match self {
+            Caller::Owner => None,
+            Caller::Page(key) => Some(key),
+        }
+    }
+}
+
+/// A request as a socket hands it over.
+#[derive(Debug, Clone)]
+pub enum Incoming {
+    /// From the agent's own socket.
+    Owner(Request),
+    /// From the web door: the checked event and the request it carries.
+    Page(Signed, Request),
+}
+
+/// A page's pairing request, waiting for the operator.
+struct Pending {
+    code: String,
+    key: String,
+    label: String,
+    at: u64,
+}
+
+/// What the engine remembers of a key that asked through the web door, paired or not: the ids
+/// of its recent requests (a second one with the same id is a replay) and when it asked.
+#[derive(Default)]
+struct PageMemory {
+    seen: Vec<(EventId, u64)>,
+    asked: Vec<u64>,
+    last_start: u64,
+}
+
+/// The most keys the engine remembers at once; a new one beyond that is told to wait.
+const MAX_PAGE_MEMORIES: usize = 4096;
 
 /// The daemon's state. See the module's text.
 pub struct Engine {
     config: Config,
     wallet: Wallet,
+    /// The liquidity identity's public key: whom a page's request must name.
+    identity: PublicKey,
     backend: Box<dyn LightningBackend>,
     client: Client,
     instances: Vec<InstanceConfig>,
@@ -289,14 +342,46 @@ pub struct Engine {
     leases: LeaseStore,
     rings: RingStore,
     policy: PolicyStore,
+    sessions: SessionStore,
     entries: Vec<Entry>,
     watchers: Vec<Watcher>,
     ticks: u32,
+    /// When this engine started, unix seconds: a page's request dated before it is refused.
+    started: u64,
+    /// Until when pages may ask to be paired, unix seconds.
+    pairing_until: u64,
+    pending: Vec<Pending>,
+    pages: BTreeMap<String, PageMemory>,
     log: Box<dyn FnMut(String)>,
 }
 
 fn internal(error: impl std::fmt::Display) -> ApiError {
     ApiError::internal(error.to_string())
+}
+
+/// A run as a page is shown it: without the one-line summary (it names the channel's outpoint)
+/// and without the outpoint of a channel that is not announced, which the graph does not show
+/// either. Anything that is not a run passes as it is.
+fn page_view(fields: &Value) -> Value {
+    let mut fields = fields.clone();
+    if let Some(map) = fields.as_object_mut()
+        && map.contains_key("role")
+    {
+        map.remove("line");
+        let announced = map
+            .get("terms")
+            .and_then(|terms| terms.get("announce"))
+            .or_else(|| {
+                map.get("offered")
+                    .and_then(|offered| offered.get("announce"))
+            })
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !announced && map.contains_key("channel") {
+            map.insert("channel".into(), Value::Null);
+        }
+    }
+    fields
 }
 
 fn send_line(lines: &Lines, line: String) {
@@ -341,20 +426,28 @@ impl Engine {
         let leases = lease_cmd::store(&config)?;
         let rings = ring_cmd::store(&config)?;
         let policy = PolicyStore::open(&config.policy_dir()).map_err(|e| e.to_string())?;
+        let sessions = SessionStore::open(&config.sessions_dir()).map_err(|e| e.to_string())?;
+        let identity = wallet.liquidity().map_err(|e| e.to_string())?.public_key();
         let client = relay::connected(&config.relays).await?;
         let mut engine = Engine {
             unresolved: config.instances.clone(),
             config,
             wallet,
+            identity,
             backend,
             client,
             instances: Vec::new(),
             leases,
             rings,
             policy,
+            sessions,
             entries: Vec::new(),
             watchers: Vec::new(),
             ticks: 0,
+            started: unix_now(),
+            pairing_until: 0,
+            pending: Vec::new(),
+            pages: BTreeMap::new(),
             log,
         };
         engine.resolve_instances().await;
@@ -480,11 +573,17 @@ impl Engine {
     }
 
     fn tell(&mut self, run: &str, status: &str, fields: Value) {
+        let page_line = api::status_line(status, page_view(&fields));
         let line = api::status_line(status, fields);
         self.watchers.retain(|watcher| {
             if watcher.run.as_deref().is_some_and(|wanted| wanted != run) {
                 return !watcher.lines.is_closed();
             }
+            let line = if watcher.page.is_some() {
+                &page_line
+            } else {
+                &line
+            };
             watcher.lines.try_send(line.clone()).is_ok()
         });
     }
@@ -624,11 +723,44 @@ impl Engine {
     }
 
     /// Answers one request. Every line it has to say goes to `lines`; the last one is the
-    /// final line, except for `watch`, which has none.
-    pub async fn handle(&mut self, request: Request, lines: Lines) {
+    /// final line, except for `watch`, which has none. A page's request is admitted first
+    /// ([`Self::admit`]); the operator's is not, except that it cannot ask what only a page asks.
+    pub async fn handle(&mut self, incoming: Incoming, lines: Lines) {
+        let now = unix_now();
+        let admitted = match incoming {
+            Incoming::Owner(request) => {
+                session::owner_may(&request.call).map(|()| (Caller::Owner, request))
+            }
+            Incoming::Page(signed, request) => self
+                .admit(&signed, &request, now)
+                .map(|()| (Caller::Page(signed.key.to_hex()), request)),
+        };
+        let (caller, request) = match admitted {
+            Ok(admitted) => admitted,
+            Err(error) => {
+                send_line(&lines, api::error_line(&error));
+                return;
+            }
+        };
         match &request.call {
             Call::Watch(run) => {
-                self.watch(run.clone(), lines);
+                if let Some(key) = caller.page() {
+                    self.watchers.retain(|watcher| !watcher.lines.is_closed());
+                    let open = self
+                        .watchers
+                        .iter()
+                        .filter(|watcher| watcher.page.as_deref() == Some(key))
+                        .count();
+                    if open >= session::MAX_PAGE_WATCHES {
+                        let busy = ApiError::new(
+                            Code::Busy,
+                            "this page already watches as much as it may; close a watch first",
+                        );
+                        send_line(&lines, api::error_line(&busy));
+                        return;
+                    }
+                }
+                self.watch(run.clone(), lines, caller.page().map(str::to_string));
                 return;
             }
             Call::Orders(_) | Call::Record(_) => {
@@ -637,11 +769,69 @@ impl Engine {
             }
             _ => {}
         }
-        let line = match self.call(&request, &lines).await {
+        let line = match self.call(&caller, &request, &lines, now).await {
             Ok(result) => api::ok_line(result),
             Err(error) => api::error_line(&error),
         };
         send_line(&lines, line);
+    }
+
+    /// Whether a page's request may be taken up: fresh, never seen before, within the page's
+    /// rate, addressed to this agent, from a key the operator paired whose session is live, and
+    /// within that session's scope. Only `pair.request` and `pair.status` are answered for a key
+    /// nobody paired (and may leave out whom they are for, since a page learns that by pairing).
+    fn admit(&mut self, signed: &Signed, request: &Request, now: u64) -> Result<(), ApiError> {
+        session::fresh(signed.created_at, now, self.started)?;
+        let key = signed.key.to_hex();
+        let forget_before = now.saturating_sub(session::MAX_AGE_SECS + session::MAX_AHEAD_SECS);
+        let rate_since = now.saturating_sub(session::RATE_WINDOW_SECS);
+        self.pages.retain(|_, memory| {
+            memory.seen.retain(|(_, at)| *at >= forget_before);
+            memory.asked.retain(|at| *at >= rate_since);
+            !memory.seen.is_empty() || !memory.asked.is_empty() || memory.last_start > rate_since
+        });
+        if !self.pages.contains_key(&key) && self.pages.len() >= MAX_PAGE_MEMORIES {
+            return Err(ApiError::new(
+                Code::Busy,
+                "too many pages are asking at once; try again in a minute",
+            ));
+        }
+        let memory = self.pages.entry(key.clone()).or_default();
+        if memory.seen.iter().any(|(id, _)| *id == signed.id) {
+            return Err(ApiError::refused(
+                "this request was seen before; a page signs every request anew",
+            ));
+        }
+        if memory.asked.len() >= session::RATE_REQUESTS {
+            return Err(ApiError::new(
+                Code::Busy,
+                "this page asks too often; try again in a minute",
+            ));
+        }
+        memory.seen.push((signed.id, now));
+        memory.asked.push(now);
+        let pairing = matches!(request.call, Call::PairRequest(_) | Call::PairStatus);
+        let addressed = signed.to.contains(&self.identity) || (pairing && signed.to.is_empty());
+        if !addressed {
+            return Err(ApiError::refused(
+                "the request is not addressed to this agent",
+            ));
+        }
+        if pairing {
+            return Ok(());
+        }
+        let live = self
+            .sessions
+            .get(&key)
+            .map_err(internal)?
+            .filter(|live| live.live(now))
+            .ok_or_else(|| {
+                ApiError::new(
+                    Code::Unpaired,
+                    "this page is not paired with the agent, or no longer is: pair it again",
+                )
+            })?;
+        session::page_may(&request.call, live.scope)
     }
 
     /// What a request that only reads the relays needs, copied out (see [`super::reads`]).
@@ -688,38 +878,59 @@ impl Engine {
         });
     }
 
-    fn watch(&mut self, run: Option<String>, lines: Lines) {
+    fn watch(&mut self, run: Option<String>, lines: Lines, page: Option<String>) {
         // What is under way now, then every change.
         for entry in &self.entries {
             if run.as_deref().is_none_or(|wanted| wanted == entry.name) {
-                send_line(&lines, api::status_line("run", entry.run.json()));
+                let mut fields = entry.run.json();
+                if page.is_some() {
+                    fields = page_view(&fields);
+                }
+                send_line(&lines, api::status_line("run", fields));
             }
         }
         send_line(&lines, api::status_line("watching", Value::Null));
-        self.watchers.push(Watcher { run, lines });
+        self.watchers.push(Watcher { run, lines, page });
     }
 
-    async fn call(&mut self, request: &Request, lines: &Lines) -> Result<Value, ApiError> {
+    async fn call(
+        &mut self,
+        caller: &Caller,
+        request: &Request,
+        lines: &Lines,
+        now: u64,
+    ) -> Result<Value, ApiError> {
         match &request.call {
-            Call::Status => self.status().await,
+            Call::Status => self.status(caller).await,
             Call::LeaseOffer(_) | Call::LeaseTake(_) | Call::RingCreate(_) | Call::RingJoin(_) => {
-                self.start_run(request, None, lines).await
+                if let Some(key) = caller.page() {
+                    self.page_may_start(key, now)?;
+                }
+                self.start_run(request, None, lines, caller).await
             }
-            Call::LeaseCancel(run) => self.cancel(run, true).await,
-            Call::RingCancel(run) => self.cancel(run, false).await,
-            Call::LeaseList => self.list(true),
-            Call::RingList => self.list(false),
+            Call::LeaseCancel(run) => self.cancel(run, true, caller).await,
+            Call::RingCancel(run) => self.cancel(run, false, caller).await,
+            Call::LeaseList => self.list(true, caller),
+            Call::RingList => self.list(false, caller),
             Call::BindingPublish => self.publish_binding().await,
             Call::Approvals => {
-                let parked = self.policy.all_parked().map_err(internal)?;
-                Ok(json!({"approvals": parked}))
+                let parked = self.live_parked(now)?;
+                let shown: Vec<Value> = parked
+                    .iter()
+                    .filter(|parked| match caller {
+                        Caller::Owner => true,
+                        Caller::Page(key) => parked.session.as_deref() == Some(key.as_str()),
+                    })
+                    .map(|parked| self.parked_json(parked))
+                    .collect();
+                Ok(json!({"approvals": shown}))
             }
             Call::Approve(approval) => {
                 let parked = self
-                    .policy
-                    .parked(approval)
-                    .map_err(internal)?
-                    .ok_or_else(|| ApiError::not_found("no such approval"))?;
+                    .live_parked(now)?
+                    .into_iter()
+                    .find(|parked| parked.approval == *approval)
+                    .ok_or_else(|| ApiError::not_found("no such approval, or it lapsed"))?;
                 // The words are read again exactly as they were parked.
                 let call = api::understand(&parked.method, &parked.params)?;
                 let again = Request {
@@ -727,7 +938,9 @@ impl Engine {
                     params: parked.params.clone(),
                     call,
                 };
-                let result = self.start_run(&again, Some(&parked), lines).await?;
+                let result = self
+                    .start_run(&again, Some(&parked), lines, &Caller::Owner)
+                    .await?;
                 self.policy.unpark(approval).map_err(internal)?;
                 Ok(result)
             }
@@ -739,12 +952,289 @@ impl Engine {
                 self.policy.unpark(approval).map_err(internal)?;
                 Ok(json!({"denied": approval}))
             }
+            Call::PairOpen(secs) => {
+                self.pairing_until = now.saturating_add(*secs);
+                (self.log)(format!("pairing is open for {secs} s"));
+                Ok(json!({"open_until": self.pairing_until}))
+            }
+            Call::PairList => {
+                self.pending
+                    .retain(|pending| pending.at + session::PENDING_SECS > now);
+                // Never the codes: the operator types the one the page shows, which is the
+                // comparison. A code picked from a list here could be another page's.
+                Ok(json!({
+                    "open": now < self.pairing_until,
+                    "open_until": self.pairing_until,
+                    "waiting": self.pending.iter().map(|pending| json!({
+                        "label": pending.label,
+                        "at": pending.at,
+                    })).collect::<Vec<_>>(),
+                }))
+            }
+            Call::PairApprove(approve) => self.pair_approve(approve, now),
+            Call::PairDeny(code) => {
+                let before = self.pending.len();
+                self.pending.retain(|pending| pending.code != *code);
+                if self.pending.len() == before {
+                    return Err(ApiError::not_found("no page waits with that code"));
+                }
+                Ok(json!({"denied": true}))
+            }
+            Call::Sessions => {
+                let sessions = self.sessions.all().map_err(internal)?;
+                Ok(json!({
+                    "sessions": sessions.iter().map(|session| json!({
+                        "session": session.key,
+                        "label": session.label,
+                        "scope": session.scope,
+                        "created_at": session.created_at,
+                        "expires_at": session.expires_at,
+                        "ended_at": session.ended_at,
+                        "live": session.live(now),
+                    })).collect::<Vec<_>>(),
+                }))
+            }
+            Call::Revoke(key) => self.end_session(key, now),
+            Call::PairRequest(label) => match caller {
+                Caller::Page(key) => self.pair_request(key, label.as_deref(), now),
+                Caller::Owner => Err(ApiError::internal("only a page asks this")),
+            },
+            Call::PairStatus => match caller {
+                Caller::Page(key) => self.pair_status(key, now),
+                Caller::Owner => Err(ApiError::internal("only a page asks this")),
+            },
+            Call::PairEnd => match caller {
+                Caller::Page(key) => self.end_session(key, now),
+                Caller::Owner => Err(ApiError::internal("only a page asks this")),
+            },
             // Answered in `handle`.
             Call::Watch(_) => Err(ApiError::internal("watch has no answer")),
             Call::Orders(_) | Call::Record(_) => {
                 Err(ApiError::internal("answered beside the engine"))
             }
         }
+    }
+
+    /// Whether a page may ask for one more run now: not while it has as many waiting for
+    /// approval as it may, and not twice within [`session::START_EVERY_SECS`]. Asked before
+    /// anything is read or sent for the run.
+    fn page_may_start(&mut self, key: &str, now: u64) -> Result<(), ApiError> {
+        let waiting = self
+            .live_parked(now)?
+            .iter()
+            .filter(|parked| parked.session.as_deref() == Some(key))
+            .count();
+        if waiting >= session::MAX_PARKED_PER_SESSION {
+            return Err(ApiError::refused(format!(
+                "this page has {waiting} requests waiting for approval already; they are \
+                 approved or denied where the agent runs"
+            )));
+        }
+        let memory = self.pages.entry(key.to_string()).or_default();
+        if memory.last_start.saturating_add(session::START_EVERY_SECS) > now {
+            return Err(ApiError::new(
+                Code::Busy,
+                "this page asked for a run a moment ago; wait a few seconds",
+            ));
+        }
+        memory.last_start = now;
+        Ok(())
+    }
+
+    /// The parked requests that still wait. A page's request lapses after
+    /// [`session::PAGE_PARKED_SECS`], or when its session ended; those are dropped here.
+    fn live_parked(&mut self, now: u64) -> Result<Vec<Parked>, ApiError> {
+        let mut live = Vec::new();
+        for parked in self.policy.all_parked().map_err(internal)? {
+            let lapsed = match &parked.session {
+                None => false,
+                Some(key) => {
+                    let session_live = self
+                        .sessions
+                        .get(key)
+                        .map_err(internal)?
+                        .is_some_and(|session| session.live(now));
+                    !session_live || parked.at.saturating_add(session::PAGE_PARKED_SECS) <= now
+                }
+            };
+            if lapsed {
+                self.policy.unpark(&parked.approval).map_err(internal)?;
+                (self.log)(format!(
+                    "a page's parked request {} lapsed",
+                    parked.approval
+                ));
+            } else {
+                live.push(parked);
+            }
+        }
+        Ok(live)
+    }
+
+    /// A parked request as it is listed: as stored, and, for one a page asked, the page's label.
+    fn parked_json(&self, parked: &Parked) -> Value {
+        let mut value = json!(parked);
+        if let Some(key) = &parked.session {
+            let label = self
+                .sessions
+                .get(key)
+                .ok()
+                .flatten()
+                .map(|session| session.label);
+            value["asked_by"] = json!({"session": key, "label": label});
+        }
+        value
+    }
+
+    /// A page asks to be paired. Only while the operator holds the window open; a page that
+    /// already waits is given its code again; none is ever pushed out by a newer one.
+    fn pair_request(
+        &mut self,
+        key: &str,
+        label: Option<&str>,
+        now: u64,
+    ) -> Result<Value, ApiError> {
+        if self
+            .sessions
+            .get(key)
+            .map_err(internal)?
+            .is_some_and(|session| session.live(now))
+        {
+            return self.pair_status(key, now);
+        }
+        self.pending
+            .retain(|pending| pending.at + session::PENDING_SECS > now);
+        if let Some(pending) = self.pending.iter().find(|pending| pending.key == key) {
+            return Ok(json!({
+                "paired": false,
+                "pending": true,
+                "code": pending.code,
+                "agent": self.identity.to_hex(),
+            }));
+        }
+        if now >= self.pairing_until {
+            return Err(ApiError::refused(
+                "pairing is not open: run `bipnip pair open` where the agent runs, then ask again",
+            ));
+        }
+        if self.pending.len() >= session::MAX_PENDING {
+            return Err(ApiError::new(
+                Code::Busy,
+                "as many pages as may wait to be paired are waiting; try again later",
+            ));
+        }
+        let code = loop {
+            let code = session::pairing_code()?;
+            if self.pending.iter().all(|pending| pending.code != code) {
+                break code;
+            }
+        };
+        let label = label.unwrap_or_default().to_string();
+        (self.log)(format!("a page asks to be paired ({label:?})"));
+        self.pending.push(Pending {
+            code: code.clone(),
+            key: key.to_string(),
+            label,
+            at: now,
+        });
+        Ok(json!({
+            "paired": false,
+            "pending": true,
+            "code": code,
+            "agent": self.identity.to_hex(),
+        }))
+    }
+
+    /// Where a page stands: paired (and how), waiting (with its code), or neither.
+    fn pair_status(&self, key: &str, now: u64) -> Result<Value, ApiError> {
+        if let Some(session) = self
+            .sessions
+            .get(key)
+            .map_err(internal)?
+            .filter(|session| session.live(now))
+        {
+            return Ok(json!({
+                "paired": true,
+                "label": session.label,
+                "scope": session.scope,
+                "expires_at": session.expires_at,
+                "agent": self.identity.to_hex(),
+            }));
+        }
+        let pending = self
+            .pending
+            .iter()
+            .find(|pending| pending.key == key && pending.at + session::PENDING_SECS > now);
+        Ok(json!({
+            "paired": false,
+            "pending": pending.is_some(),
+            "code": pending.map(|pending| pending.code.clone()),
+            "open": now < self.pairing_until,
+            "agent": self.identity.to_hex(),
+        }))
+    }
+
+    /// The operator pairs the page that shows `code`.
+    fn pair_approve(&mut self, approve: &PairApprove, now: u64) -> Result<Value, ApiError> {
+        self.pending
+            .retain(|pending| pending.at + session::PENDING_SECS > now);
+        let Some(index) = self
+            .pending
+            .iter()
+            .position(|pending| pending.code == approve.code)
+        else {
+            return Err(ApiError::not_found(
+                "no page waits with that code: type it as the page shows it, while it waits",
+            ));
+        };
+        let pending = self.pending.remove(index);
+        let session = session::Session {
+            key: pending.key,
+            label: approve.label.clone().unwrap_or(pending.label),
+            scope: approve.scope,
+            created_at: now,
+            expires_at: now.saturating_add(approve.expires_days.saturating_mul(86_400)),
+            ended_at: None,
+        };
+        self.sessions.save(&session).map_err(internal)?;
+        (self.log)(format!(
+            "paired a page ({:?}, {:?}) until {}",
+            session.label, session.scope, session.expires_at
+        ));
+        Ok(json!({
+            "session": session.key,
+            "label": session.label,
+            "scope": session.scope,
+            "expires_at": session.expires_at,
+        }))
+    }
+
+    /// Ends a page's session (the operator revoked it, or the page ended it): its watches close,
+    /// what it asked for that still waits is dropped. Runs it asked for that were approved go on.
+    fn end_session(&mut self, key: &str, now: u64) -> Result<Value, ApiError> {
+        let mut session = self
+            .sessions
+            .get(key)
+            .map_err(internal)?
+            .ok_or_else(|| ApiError::not_found("no such session"))?;
+        if session.ended_at.is_none() {
+            session.ended_at = Some(now);
+            self.sessions.save(&session).map_err(internal)?;
+        }
+        self.watchers
+            .retain(|watcher| watcher.page.as_deref() != Some(key));
+        self.pending.retain(|pending| pending.key != key);
+        let mut dropped = 0;
+        for parked in self.policy.all_parked().map_err(internal)? {
+            if parked.session.as_deref() == Some(key) {
+                self.policy.unpark(&parked.approval).map_err(internal)?;
+                dropped += 1;
+            }
+        }
+        (self.log)(format!(
+            "ended the session of the page {:?}; {dropped} of its requests no longer wait",
+            session.label
+        ));
+        Ok(json!({"ended": key, "dropped": dropped}))
     }
 
     fn under_way(&self) -> u32 {
@@ -765,7 +1255,7 @@ impl Engine {
         })
     }
 
-    async fn status(&mut self) -> Result<Value, ApiError> {
+    async fn status(&mut self, caller: &Caller) -> Result<Value, ApiError> {
         let node = match self.backend.node_info().await {
             Ok(info) => json!({
                 "pubkey": info.node_pubkey,
@@ -789,7 +1279,7 @@ impl Engine {
         }
         let usage = self.usage(unix_now())?;
         let policy = &self.config.policy;
-        Ok(json!({
+        let mut status = json!({
             "version": env!("CARGO_PKG_VERSION"),
             "network": self.config.network.as_str(),
             "identity": identity.to_bech32().unwrap_or_else(|_| identity.to_hex()),
@@ -819,7 +1309,24 @@ impl Engine {
                 "max_runs": policy.max_runs,
                 "allowed_peers": policy.allowed_peers,
             },
-        }))
+        });
+        // A page is not told the limits, what is left of them today, or how many requests
+        // others are waiting with: only its own.
+        if let Caller::Page(key) = caller
+            && let Some(map) = status.as_object_mut()
+        {
+            map.remove("policy");
+            map.remove("last_day");
+            let own = self
+                .policy
+                .all_parked()
+                .map_err(internal)?
+                .iter()
+                .filter(|parked| parked.session.as_deref() == Some(key.as_str()))
+                .count();
+            map.insert("approvals".into(), json!(own));
+        }
+        Ok(status)
     }
 
     /// The instance a request names, or the only one there is.
@@ -849,12 +1356,15 @@ impl Engine {
 
     /// Starts the run a request asks for: prepares it with every check the one-shot command
     /// makes, weighs it against the policy, and only then stores it and sends its first
-    /// message. `approved` is the parked request this is the approval of, if it is one.
+    /// message. `approved` is the parked request this is the approval of, if it is one. What a
+    /// page asks for is always parked: it goes ahead only when the operator approves it where the
+    /// agent runs, which shows what it would really do.
     async fn start_run(
         &mut self,
         request: &Request,
         approved: Option<&Parked>,
         lines: &Lines,
+        caller: &Caller,
     ) -> Result<Value, ApiError> {
         let named = match &request.call {
             Call::LeaseOffer(params) => params.instance.as_deref(),
@@ -906,8 +1416,17 @@ impl Engine {
                         reasons.extend(seller_reasons(policy, graph));
                     }
                 }
+                if caller.page().is_some() {
+                    reasons.insert(
+                        0,
+                        "asked from a paired web page: what a page asks for waits for `bipnip \
+                         approve` where the agent runs"
+                            .to_string(),
+                    );
+                }
                 if !reasons.is_empty() {
-                    return Err(self.park(request, ask, reasons, now));
+                    let session = caller.page().map(str::to_string);
+                    return Err(self.park(request, ask, reasons, now, session));
                 }
             }
             // An approval is for the request as it was shown. If the order now asks for more,
@@ -930,7 +1449,9 @@ impl Engine {
         }
         // The grant is on disk before the run exists, so a run of the daemon's is never
         // without one.
-        let grant = Grant::new(name.clone(), now, ask, approved.is_some());
+        let mut grant = Grant::new(name.clone(), now, ask, approved.is_some());
+        grant.session = approved.and_then(|parked| parked.session.clone());
+        grant.approval = approved.map(|parked| parked.approval.clone());
         self.policy.save_grant(&grant).map_err(internal)?;
         let report = match (&mut run, &first) {
             (Run::Seller(run), First::Lease(first)) => {
@@ -956,6 +1477,9 @@ impl Engine {
         }
         let mut result = run.json();
         result["sent"] = json!(report.sent > 0);
+        if let Some(approval) = &grant.approval {
+            result["approval"] = json!(approval);
+        }
         send_line(lines, api::status_line("started", json!({"run": name})));
         self.tell(&name, "run", result.clone());
         self.entries.push(Entry {
@@ -970,8 +1494,16 @@ impl Engine {
         Ok(result)
     }
 
-    /// Stores a request that is over a limit and makes the answer that names it.
-    fn park(&mut self, request: &Request, ask: Ask, reasons: Vec<String>, now: u64) -> ApiError {
+    /// Stores a request that is over a limit, or that a page asked for, and makes the answer that
+    /// names it. `session` is the page's, if a page asked.
+    fn park(
+        &mut self,
+        request: &Request,
+        ask: Ask,
+        reasons: Vec<String>,
+        now: u64,
+        session: Option<String>,
+    ) -> ApiError {
         let mut bytes = [0u8; 8];
         if getrandom::fill(&mut bytes).is_err() {
             return ApiError::internal("no randomness for a name");
@@ -984,6 +1516,7 @@ impl Engine {
             params: request.params.clone(),
             ask,
             over: reasons.clone(),
+            session,
         };
         if let Err(e) = self.policy.park(&parked) {
             return internal(e);
@@ -996,8 +1529,7 @@ impl Engine {
         let mut error = ApiError::new(
             Code::NeedsApproval,
             format!(
-                "over the policy: {}. Parked as {approval}; `bipnip approve {approval}` lets \
-                 it go ahead",
+                "parked: {}. Parked as {approval}; `bipnip approve {approval}` lets it go ahead",
                 reasons.join("; ")
             ),
         );
@@ -1005,7 +1537,12 @@ impl Engine {
         error
     }
 
-    async fn cancel(&mut self, name: &str, lease: bool) -> Result<Value, ApiError> {
+    async fn cancel(
+        &mut self,
+        name: &str,
+        lease: bool,
+        caller: &Caller,
+    ) -> Result<Value, ApiError> {
         let Some(entry) = self
             .entries
             .iter_mut()
@@ -1013,6 +1550,19 @@ impl Engine {
         else {
             return Err(ApiError::not_found("no such run under way"));
         };
+        // A page cancels only what it asked for; the rest is the operator's.
+        if let Caller::Page(key) = caller {
+            let asked = entry
+                .grant
+                .as_ref()
+                .and_then(|grant| grant.session.as_deref())
+                == Some(key.as_str());
+            if !asked {
+                return Err(ApiError::refused(
+                    "this page did not ask for this run; it is canceled where the agent runs",
+                ));
+            }
+        }
         let request_id = unix_now();
         let mut sent = true;
         match &mut entry.run {
@@ -1058,7 +1608,7 @@ impl Engine {
     }
 
     /// The stored runs of one kind, as they are on disk: under way and finished alike.
-    fn list(&self, lease: bool) -> Result<Value, ApiError> {
+    fn list(&self, lease: bool, caller: &Caller) -> Result<Value, ApiError> {
         let (runs, problems): (Vec<Run>, Vec<(String, StoreError)>) = if lease {
             let loaded = self.leases.load().map_err(internal)?;
             (
@@ -1091,13 +1641,32 @@ impl Engine {
                     }
                     None => value["under_way"] = json!(false),
                 }
-                value
+                let grant = match self.entries.iter().find(|entry| entry.name == name) {
+                    Some(entry) => entry.grant.clone(),
+                    None => self.policy.grant(&name).ok().flatten(),
+                };
+                if let Some(grant) = grant {
+                    if let Some(approval) = &grant.approval {
+                        value["approval"] = json!(approval);
+                    }
+                    if let Caller::Page(key) = caller {
+                        value["mine"] = json!(grant.session.as_deref() == Some(key.as_str()));
+                    }
+                }
+                match caller {
+                    Caller::Owner => value,
+                    Caller::Page(_) => page_view(&value),
+                }
             })
             .collect();
-        let refused: Vec<Value> = problems
-            .iter()
-            .map(|(file, why)| json!({"file": file, "why": why.to_string()}))
-            .collect();
+        // File names are the operator's to see, not a page's.
+        let refused: Vec<Value> = match caller {
+            Caller::Owner => problems
+                .iter()
+                .map(|(file, why)| json!({"file": file, "why": why.to_string()}))
+                .collect(),
+            Caller::Page(_) => Vec::new(),
+        };
         Ok(json!({"runs": runs, "refused": refused}))
     }
 

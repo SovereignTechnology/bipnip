@@ -33,6 +33,11 @@
 //! min_seller_channels = 0             # a take from a seller with fewer public channels parks
 //! min_seller_capacity_sat = 0         # likewise for less public capacity, in satoshi
 //! publish_outcomes = "announced"     # signed outcomes: "announced" channels, "all", "none"
+//!
+//! [web]                               # optional: the door a web host passes paired pages through
+//! socket = "/run/bipnip-web/web.sock" # default <data_dir>/web.sock (only the agent's own user)
+//! socket_mode = 0o660                 # default 0o600
+//! allow_uids = [1001]                 # the web host's user id, besides the agent's own
 //! ```
 //!
 //! A single `[instance]` table is read as one `[[instance]]`.
@@ -57,6 +62,10 @@ pub const POLICY_DIR: &str = "policy";
 pub const LOCK_FILE: &str = "agent.lock";
 /// Name of the daemon's socket inside `data_dir`.
 pub const SOCKET_FILE: &str = "agent.sock";
+/// Name of the web door's socket inside `data_dir`, when `[web]` names no other.
+pub const WEB_SOCKET_FILE: &str = "web.sock";
+/// Name of the directory inside `data_dir` that holds the paired pages' sessions.
+pub const SESSIONS_DIR: &str = "sessions";
 /// Most proof of work an instance may ask for: above this a message would take hours to make.
 pub const MAX_POW_BITS: u8 = 32;
 
@@ -152,6 +161,30 @@ impl PublishOutcomes {
     }
 }
 
+fn owner_only() -> u32 {
+    0o600
+}
+
+/// The web door: a second socket through which a web host passes on a paired page's signed
+/// requests (`docs/decisions/0011-key-roles-pairing-and-session-keys.md`). Without a `[web]`
+/// section there is none.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WebConfig {
+    /// The socket. Left out, `<data_dir>/web.sock`: then only a web host running as the agent's
+    /// own user can reach it, and that user can read the agent's files. Elsewhere, in a directory
+    /// that belongs to the agent's user (or root) and that nobody else may write to, a web host of
+    /// another user can be let in with `socket_mode` and `allow_uids`.
+    #[serde(default)]
+    pub socket: Option<PathBuf>,
+    /// The socket's mode: `0o600` (the default) or `0o660` (its group may connect too).
+    #[serde(default = "owner_only")]
+    pub socket_mode: u32,
+    /// User ids, besides the agent's own, that may connect.
+    #[serde(default)]
+    pub allow_uids: Vec<u32>,
+}
+
 /// Limits on what the agent does with the node's money without being asked again.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -204,6 +237,7 @@ struct Raw {
     instance: Option<RawInstances>,
     #[serde(default)]
     policy: PolicyConfig,
+    web: Option<WebConfig>,
 }
 
 /// The parsed, checked configuration.
@@ -225,6 +259,8 @@ pub struct Config {
     pub instances: Vec<InstanceEntry>,
     /// Spending limits.
     pub policy: PolicyConfig,
+    /// The web door, if there is one.
+    pub web: Option<WebConfig>,
 }
 
 impl Config {
@@ -308,6 +344,14 @@ impl Config {
                 );
             }
         }
+        if let Some(web) = &raw.web {
+            if web.socket.as_ref().is_some_and(|path| !path.is_absolute()) {
+                return Err("config: web.socket must be an absolute path".into());
+            }
+            if web.socket_mode != 0o600 && web.socket_mode != 0o660 {
+                return Err("config: web.socket_mode is 0o600 or 0o660".into());
+            }
+        }
         Ok(Config {
             network,
             data_dir: raw.data_dir,
@@ -317,7 +361,22 @@ impl Config {
             cln: raw.cln,
             instances,
             policy,
+            web: raw.web,
         })
+    }
+
+    /// The web door's socket, if there is a web door.
+    pub fn web_socket_path(&self) -> Option<PathBuf> {
+        self.web.as_ref().map(|web| {
+            web.socket
+                .clone()
+                .unwrap_or_else(|| self.data_dir.join(WEB_SOCKET_FILE))
+        })
+    }
+
+    /// Where paired pages' sessions are stored.
+    pub fn sessions_dir(&self) -> PathBuf {
+        self.data_dir.join(SESSIONS_DIR)
     }
 
     /// Where lease runs are stored.
@@ -536,8 +595,44 @@ macaroon = "/tmp/a.macaroon"
             ),
             (GOOD.replace("relays =", "relay ="), "unknown key"),
             (format!("{GOOD}mnemonic = \"words\"\n"), "secret in config"),
+            (
+                format!("{GOOD}\n[web]\nsocket = \"web.sock\"\n"),
+                "relative web socket",
+            ),
+            (
+                format!("{GOOD}\n[web]\nsocket_mode = 0o666\n"),
+                "a web socket anyone may open",
+            ),
+            (format!("{GOOD}\n[web]\nport = 8080\n"), "unknown web key"),
         ] {
             assert!(Config::parse(&bad).is_err(), "{why}");
         }
+    }
+
+    #[test]
+    fn the_web_door_is_closed_unless_configured() {
+        let none = Config::parse(GOOD).expect("parse");
+        assert_eq!(none.web, None);
+        assert_eq!(none.web_socket_path(), None);
+        let inside = Config::parse(&format!("{GOOD}\n[web]\n")).expect("parse");
+        assert_eq!(
+            inside.web_socket_path(),
+            Some(PathBuf::from("/tmp/bipnip/web.sock"))
+        );
+        assert_eq!(inside.web.as_ref().map(|web| web.socket_mode), Some(0o600));
+        let apart = Config::parse(&format!(
+            "{GOOD}\n[web]\nsocket = \"/run/bipnip-web/web.sock\"\nsocket_mode = 0o660\n\
+             allow_uids = [1001]\n"
+        ))
+        .expect("parse");
+        assert_eq!(
+            apart.web_socket_path(),
+            Some(PathBuf::from("/run/bipnip-web/web.sock"))
+        );
+        assert_eq!(
+            apart.web.as_ref().map(|web| web.allow_uids.clone()),
+            Some(vec![1001])
+        );
+        assert_eq!(apart.sessions_dir(), PathBuf::from("/tmp/bipnip/sessions"));
     }
 }

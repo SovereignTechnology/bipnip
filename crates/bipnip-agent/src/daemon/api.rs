@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
+use super::session::{self, Scope};
+
 /// The version of the request format this agent speaks.
 pub const API_VERSION: u32 = 1;
 /// The longest request line read, in bytes.
@@ -34,6 +36,10 @@ pub enum Code {
     Relay,
     /// The agent itself failed (a file it could not write, for one).
     Internal,
+    /// A page whose session is unknown, ended or expired: it must be paired (again).
+    Unpaired,
+    /// A page's request dated too far from the agent's time; the answer says the agent's time.
+    Stale,
 }
 
 impl Code {
@@ -48,6 +54,8 @@ impl Code {
             Code::Node => "node",
             Code::Relay => "relay",
             Code::Internal => "internal",
+            Code::Unpaired => "unpaired",
+            Code::Stale => "stale",
         }
     }
 }
@@ -61,6 +69,8 @@ pub struct ApiError {
     pub message: String,
     /// For [`Code::NeedsApproval`]: the name of the parked request.
     pub approval: Option<String>,
+    /// For [`Code::Stale`]: the agent's time, unix seconds.
+    pub now: Option<u64>,
 }
 
 impl ApiError {
@@ -70,6 +80,7 @@ impl ApiError {
             code,
             message: message.into(),
             approval: None,
+            now: None,
         }
     }
 
@@ -289,6 +300,65 @@ struct WatchParams {
     run: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PairOpenParams {
+    #[serde(default)]
+    secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PairApproveRaw {
+    code: String,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    expires_days: Option<u64>,
+    #[serde(default)]
+    label: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PairCodeParams {
+    code: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionParams {
+    session: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PairRequestParams {
+    #[serde(default)]
+    label: Option<String>,
+}
+
+/// `pair.approve`: a page to pair, by the code it shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairApprove {
+    /// The code, as [`session::pairing_code`] writes it.
+    pub code: String,
+    /// What the session may do.
+    pub scope: Scope,
+    /// How many days it lasts.
+    pub expires_days: u64,
+    /// A name for it where the agent runs, instead of what the page called itself.
+    pub label: Option<String>,
+}
+
+fn code(method: &str, typed: &str) -> Result<String, ApiError> {
+    session::normal_code(typed).ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "{method}: a code is twelve digits, as the page shows it"
+        ))
+    })
+}
+
 /// A request, understood.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Call {
@@ -324,6 +394,24 @@ pub enum Call {
     Deny(String),
     /// Follow one run, or all of them.
     Watch(Option<String>),
+    /// Open the pairing window for this many seconds (the operator's).
+    PairOpen(u64),
+    /// Whether the window is open and how many pages wait, never their codes (the operator's).
+    PairList,
+    /// Pair the page that shows this code (the operator's).
+    PairApprove(PairApprove),
+    /// Turn away the page that shows this code (the operator's).
+    PairDeny(String),
+    /// The paired pages (the operator's).
+    Sessions,
+    /// End a page's session, by its key (the operator's).
+    Revoke(String),
+    /// Ask to be paired, under this label (a page's, while the window is open).
+    PairRequest(Option<String>),
+    /// Whether this page is paired, or what code it waits with (a page's).
+    PairStatus,
+    /// End this page's own session (a page's).
+    PairEnd,
 }
 
 impl Call {
@@ -447,6 +535,61 @@ pub fn understand(method: &str, params: &Value) -> Result<Call, ApiError> {
                 Some(run) => Some(name(method, "a run", run)?),
             })
         }
+        "pair.open" => {
+            let p: PairOpenParams = typed(method, params)?;
+            let secs = p.secs.unwrap_or(session::PAIR_WINDOW_SECS);
+            if secs == 0 || secs > session::MAX_PAIR_WINDOW_SECS {
+                return Err(ApiError::bad_request(format!(
+                    "pair.open: `secs` is 1 to {}",
+                    session::MAX_PAIR_WINDOW_SECS
+                )));
+            }
+            Call::PairOpen(secs)
+        }
+        "pair.list" => none(method, params).map(|()| Call::PairList)?,
+        "pair.approve" => {
+            let p: PairApproveRaw = typed(method, params)?;
+            let scope = match p.scope.as_deref() {
+                None => Scope::Read,
+                Some(text) => Scope::parse(text).ok_or_else(|| {
+                    ApiError::bad_request("pair.approve: `scope` is read or trade")
+                })?,
+            };
+            let expires_days = p.expires_days.unwrap_or(session::DEFAULT_SESSION_DAYS);
+            if expires_days == 0 || expires_days > session::MAX_SESSION_DAYS {
+                return Err(ApiError::bad_request(format!(
+                    "pair.approve: `expires_days` is 1 to {}",
+                    session::MAX_SESSION_DAYS
+                )));
+            }
+            Call::PairApprove(PairApprove {
+                code: code(method, &p.code)?,
+                scope,
+                expires_days,
+                label: p.label.map(|label| session::clean_label(&label)),
+            })
+        }
+        "pair.deny" => {
+            let p: PairCodeParams = typed(method, params)?;
+            Call::PairDeny(code(method, &p.code)?)
+        }
+        "sessions" => none(method, params).map(|()| Call::Sessions)?,
+        "revoke" => {
+            let p: SessionParams = typed(method, params)?;
+            let key = p.session.to_ascii_lowercase();
+            if !session::is_session_name(&key) {
+                return Err(ApiError::bad_request(
+                    "revoke: `session` is a session key, 64 hex, as `sessions` lists it",
+                ));
+            }
+            Call::Revoke(key)
+        }
+        "pair.request" => {
+            let p: PairRequestParams = typed(method, params)?;
+            Call::PairRequest(p.label.map(|label| session::clean_label(&label)))
+        }
+        "pair.status" => none(method, params).map(|()| Call::PairStatus)?,
+        "pair.end" => none(method, params).map(|()| Call::PairEnd)?,
         other => {
             return Err(ApiError::bad_request(format!("unknown method {other:?}")));
         }
@@ -506,6 +649,9 @@ pub fn error_line(error: &ApiError) -> String {
     body.insert("message".into(), Value::String(error.message.clone()));
     if let Some(approval) = &error.approval {
         body.insert("approval".into(), Value::String(approval.clone()));
+    }
+    if let Some(now) = error.now {
+        body.insert("now".into(), json!(now));
     }
     json!({"ok": false, "error": Value::Object(body)}).to_string()
 }
@@ -567,6 +713,49 @@ mod tests {
                 r#"{"v":1,"method":"watch","params":{"run":"ring-0f"}}"#.to_string(),
                 Call::Watch(Some("ring-0f".into())),
             ),
+            (
+                r#"{"v":1,"method":"pair.open"}"#.to_string(),
+                Call::PairOpen(session::PAIR_WINDOW_SECS),
+            ),
+            (
+                r#"{"v":1,"method":"pair.open","params":{"secs":60}}"#.to_string(),
+                Call::PairOpen(60),
+            ),
+            (r#"{"v":1,"method":"pair.list"}"#.to_string(), Call::PairList),
+            (
+                r#"{"v":1,"method":"pair.approve","params":{"code":"123456789012"}}"#.to_string(),
+                Call::PairApprove(PairApprove {
+                    code: "1234-5678-9012".into(),
+                    scope: Scope::Read,
+                    expires_days: session::DEFAULT_SESSION_DAYS,
+                    label: None,
+                }),
+            ),
+            (
+                r#"{"v":1,"method":"pair.approve","params":{"code":"1234 5678 9012","scope":"trade","expires_days":2,"label":"desk"}}"#.to_string(),
+                Call::PairApprove(PairApprove {
+                    code: "1234-5678-9012".into(),
+                    scope: Scope::Trade,
+                    expires_days: 2,
+                    label: Some("desk".into()),
+                }),
+            ),
+            (
+                r#"{"v":1,"method":"pair.deny","params":{"code":"1234-5678-9012"}}"#.to_string(),
+                Call::PairDeny("1234-5678-9012".into()),
+            ),
+            (r#"{"v":1,"method":"sessions"}"#.to_string(), Call::Sessions),
+            (
+                format!(r#"{{"v":1,"method":"revoke","params":{{"session":"{}"}}}}"#, "AB".repeat(32)),
+                Call::Revoke("ab".repeat(32)),
+            ),
+            (
+                r#"{"v":1,"method":"pair.request","params":{"label":"laptop"}}"#.to_string(),
+                Call::PairRequest(Some("laptop".into())),
+            ),
+            (r#"{"v":1,"method":"pair.request"}"#.to_string(), Call::PairRequest(None)),
+            (r#"{"v":1,"method":"pair.status"}"#.to_string(), Call::PairStatus),
+            (r#"{"v":1,"method":"pair.end"}"#.to_string(), Call::PairEnd),
             (
                 r#"{"v":1,"method":"lease.cancel","params":{"run":"seller-0f"}}"#.to_string(),
                 Call::LeaseCancel("seller-0f".into()),
@@ -670,6 +859,30 @@ mod tests {
             (
                 r#"{"v":1,"method":"approve","params":{"approval":"a/b"}}"#,
                 "a path for an approval",
+            ),
+            (
+                r#"{"v":1,"method":"pair.open","params":{"secs":0}}"#,
+                "no pairing window",
+            ),
+            (
+                r#"{"v":1,"method":"pair.open","params":{"secs":3600}}"#,
+                "a pairing window of an hour",
+            ),
+            (
+                r#"{"v":1,"method":"pair.approve","params":{"code":"1234"}}"#,
+                "a short code",
+            ),
+            (
+                r#"{"v":1,"method":"pair.approve","params":{"code":"123456789012","scope":"admin"}}"#,
+                "an unknown scope",
+            ),
+            (
+                r#"{"v":1,"method":"pair.approve","params":{"code":"123456789012","expires_days":365}}"#,
+                "a session of a year",
+            ),
+            (
+                r#"{"v":1,"method":"revoke","params":{"session":"../sessions"}}"#,
+                "a path for a session",
             ),
             (
                 r#"{"v":1,"method":"watch","params":{"run":"Seller-0F"}}"#,
