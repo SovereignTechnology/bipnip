@@ -240,6 +240,13 @@ pub struct OrdersParams {
     /// Only this instance.
     #[serde(default)]
     pub instance: Option<String>,
+    /// Leases that offer this capacity (priced at it), or rings with channels at least this
+    /// large, in satoshi.
+    #[serde(default)]
+    pub capacity_sat: Option<u64>,
+    /// Leases whose whole fee is at most this, in satoshi.
+    #[serde(default)]
+    pub max_fee_sat: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
