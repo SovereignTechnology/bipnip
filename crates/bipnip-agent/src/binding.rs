@@ -189,7 +189,20 @@ mod tests {
         async fn payment_state(&self, _: &str) -> Result<PaymentState, BackendError> {
             unsupported()
         }
+        async fn payment_lookup(&self, _: &str) -> Result<Option<PaymentState>, BackendError> {
+            unsupported()
+        }
         async fn add_invoice(&self, _: u64, _: u32, _: &str) -> Result<String, BackendError> {
+            unsupported()
+        }
+        async fn invoice_state(&self, _: &str) -> Result<bipnip_ln::InvoiceStatus, BackendError> {
+            unsupported()
+        }
+        async fn closed_channel(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Option<bipnip_ln::ClosedChannel>, BackendError> {
             unsupported()
         }
         async fn connect(&self, _: &str, _: &str) -> Result<(), BackendError> {

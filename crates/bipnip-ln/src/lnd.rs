@@ -23,17 +23,17 @@ use fedimint_tonic_lnd::lnrpc::channel_point::FundingTxid;
 use fedimint_tonic_lnd::lnrpc::invoice::InvoiceState;
 use fedimint_tonic_lnd::lnrpc::payment::PaymentStatus;
 use fedimint_tonic_lnd::lnrpc::{
-    ConnectPeerRequest, GetInfoRequest, Initiator, Invoice, LightningAddress, ListChannelsRequest,
-    NodeInfoRequest, OpenChannelRequest, PayReqString, Payment, PaymentHash,
-    PendingChannelsRequest, SignMessageRequest,
+    ClosedChannelsRequest, ConnectPeerRequest, GetInfoRequest, Initiator, Invoice,
+    LightningAddress, ListChannelsRequest, NodeInfoRequest, OpenChannelRequest, PayReqString,
+    Payment, PaymentHash, PendingChannelsRequest, SignMessageRequest,
 };
 use fedimint_tonic_lnd::routerrpc::{SendPaymentRequest, TrackPaymentRequest};
 use fedimint_tonic_lnd::tonic::{Code, Status};
 
 use crate::hexutil::{self, hash32, node_key};
 use crate::{
-    BackendError, ChannelView, GraphChannel, HoldInvoiceRequest, HoldState, LightningBackend,
-    NodeInfo, OpenRequest, PaymentState,
+    BackendError, ChannelView, ClosedChannel, Closer, GraphChannel, HoldInvoiceRequest, HoldState,
+    InvoiceStatus, LightningBackend, NodeInfo, OpenRequest, PaymentState,
 };
 
 /// Deadline for an ordinary RPC.
@@ -111,6 +111,13 @@ fn outpoint(txid: Option<FundingTxid>, vout: u32) -> Result<String, BackendError
     Ok(format!("{txid}:{vout}"))
 }
 
+/// Unix seconds now, as LND counts invoice times.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
 fn payment_state(p: &Payment) -> PaymentState {
     match PaymentStatus::try_from(p.status) {
         Ok(PaymentStatus::Succeeded) => PaymentState::Succeeded {
@@ -145,6 +152,34 @@ impl LndBackend {
 
     async fn tip(&self) -> Result<u32, BackendError> {
         Ok(self.node_info().await?.block_height)
+    }
+
+    /// The payment for `payment_hash`, or `None` when LND answers that it has none
+    /// (`NotFound`: the payment was never started).
+    async fn track(&self, payment_hash: &str) -> Result<Option<PaymentState>, BackendError> {
+        let payment_hash = hash32(payment_hash, "payment hash")?;
+        let mut c = self.client.clone();
+        let req = TrackPaymentRequest {
+            payment_hash,
+            no_inflight_updates: false,
+        };
+        let late = || BackendError::Unavailable("LND did not answer in time".into());
+        let mut stream =
+            match tokio::time::timeout(RPC_TIMEOUT, c.router().track_payment_v2(req)).await {
+                Ok(Ok(resp)) => resp.into_inner(),
+                Ok(Err(status)) if status.code() == Code::NotFound => return Ok(None),
+                Ok(Err(status)) => return Err(status_error(status)),
+                Err(_) => return Err(late()),
+            };
+        match tokio::time::timeout(RPC_TIMEOUT, stream.message()).await {
+            Ok(Ok(Some(payment))) => Ok(Some(payment_state(&payment))),
+            Ok(Ok(None)) => Err(BackendError::Rejected(
+                "LND ended the payment stream without an answer".into(),
+            )),
+            Ok(Err(status)) if status.code() == Code::NotFound => Ok(None),
+            Ok(Err(status)) => Err(status_error(status)),
+            Err(_) => Err(late()),
+        }
     }
 
     /// What to answer when LND refuses to send a payment. For an invoice it is already paying,
@@ -294,23 +329,16 @@ impl LightningBackend for LndBackend {
     }
 
     async fn payment_state(&self, payment_hash: &str) -> Result<PaymentState, BackendError> {
-        let payment_hash = hash32(payment_hash, "payment hash")?;
-        let mut c = self.client.clone();
-        let req = TrackPaymentRequest {
-            payment_hash,
-            no_inflight_updates: false,
-        };
-        let mut stream = call(RPC_TIMEOUT, c.router().track_payment_v2(req)).await?;
-        match tokio::time::timeout(RPC_TIMEOUT, stream.message()).await {
-            Ok(Ok(Some(payment))) => Ok(payment_state(&payment)),
-            Ok(Ok(None)) => Err(BackendError::Rejected(
-                "LND reported no such payment".into(),
-            )),
-            Ok(Err(status)) => Err(status_error(status)),
-            Err(_) => Err(BackendError::Unavailable(
-                "LND did not answer in time".into(),
-            )),
-        }
+        self.track(payment_hash)
+            .await?
+            .ok_or_else(|| BackendError::Rejected("LND reported no such payment".into()))
+    }
+
+    async fn payment_lookup(
+        &self,
+        payment_hash: &str,
+    ) -> Result<Option<PaymentState>, BackendError> {
+        self.track(payment_hash).await
     }
 
     async fn add_invoice(
@@ -329,6 +357,35 @@ impl LightningBackend for LndBackend {
         Ok(call(RPC_TIMEOUT, c.lightning().add_invoice(invoice))
             .await?
             .payment_request)
+    }
+
+    async fn invoice_state(&self, bolt11: &str) -> Result<InvoiceStatus, BackendError> {
+        let mut c = self.client.clone();
+        let decoded = call(
+            RPC_TIMEOUT,
+            c.lightning().decode_pay_req(PayReqString {
+                pay_req: bolt11.to_string(),
+            }),
+        )
+        .await?;
+        let r_hash = hash32(&decoded.payment_hash, "payment hash")?;
+        let req = PaymentHash {
+            r_hash,
+            ..Default::default()
+        };
+        let invoice = call(RPC_TIMEOUT, c.lightning().lookup_invoice(req)).await?;
+        Ok(match InvoiceState::try_from(invoice.state) {
+            Ok(InvoiceState::Settled) => InvoiceStatus::Paid,
+            // LND cancels an invoice that expired unpaid.
+            Ok(InvoiceState::Canceled) => InvoiceStatus::Expired,
+            Ok(InvoiceState::Open)
+                if unix_now() >= invoice.creation_date.saturating_add(invoice.expiry) =>
+            {
+                InvoiceStatus::Expired
+            }
+            Ok(InvoiceState::Open | InvoiceState::Accepted) => InvoiceStatus::Unpaid,
+            Err(_) => return Err(BackendError::Rejected("unknown invoice state".into())),
+        })
     }
 
     async fn connect(&self, remote_pubkey: &str, remote_addr: &str) -> Result<(), BackendError> {
@@ -414,6 +471,57 @@ impl LightningBackend for LndBackend {
             });
         }
         Ok(out)
+    }
+
+    async fn closed_channel(
+        &self,
+        remote_pubkey: &str,
+        funding_outpoint: &str,
+    ) -> Result<Option<ClosedChannel>, BackendError> {
+        node_key(remote_pubkey)?;
+        let mut c = self.client.clone();
+        let closed = call(
+            RPC_TIMEOUT,
+            c.lightning()
+                .closed_channels(ClosedChannelsRequest::default()),
+        )
+        .await?;
+        if let Some(summary) = closed.channels.iter().find(|summary| {
+            summary.channel_point == funding_outpoint && summary.remote_pubkey == remote_pubkey
+        }) {
+            let closer = match Initiator::try_from(summary.close_initiator) {
+                Ok(Initiator::Local) => Closer::Local,
+                Ok(Initiator::Remote) => Closer::Remote,
+                _ => Closer::Unknown,
+            };
+            return Ok(Some(ClosedChannel {
+                closer,
+                close_height: (summary.close_height > 0).then_some(summary.close_height),
+            }));
+        }
+        // Not closed yet, but closing: its close is waiting to confirm, or a force close is
+        // waiting for its outputs. LND does not say here who closed it.
+        let pending = call(
+            RPC_TIMEOUT,
+            c.lightning()
+                .pending_channels(PendingChannelsRequest::default()),
+        )
+        .await?;
+        let waiting = pending
+            .waiting_close_channels
+            .iter()
+            .filter_map(|channel| channel.channel.as_ref());
+        let forced = pending
+            .pending_force_closing_channels
+            .iter()
+            .filter_map(|channel| channel.channel.as_ref());
+        let closing = waiting.chain(forced).any(|channel| {
+            channel.channel_point == funding_outpoint && channel.remote_node_pub == remote_pubkey
+        });
+        Ok(closing.then_some(ClosedChannel {
+            closer: Closer::Unknown,
+            close_height: None,
+        }))
     }
 
     async fn graph_node(&self, node_pubkey: &str) -> Result<Option<(u32, u64)>, BackendError> {

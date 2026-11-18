@@ -141,17 +141,39 @@ for n in carol frank; do wait_until 120 cln_funded "$n" || { cln_dump; fail "$n'
 pair() { python3 -c 'import os,hashlib; p=os.urandom(32); print(p.hex()+":"+hashlib.sha256(p).hexdigest())'; }
 
 log "conformance 1: LND pays (alice), Core Lightning is paid (carol)"
+# A close command for the conformance run: closes, cooperatively from alice's side, the channel
+# whose funding outpoint is $1.
+cat > "$W/close-alice.sh" <<CLOSE
+#!/usr/bin/env bash
+set -euo pipefail
+exec "$(command -v lncli)" --lnddir="$W/alice" --network=regtest --rpcserver=127.0.0.1:${RPC[alice]} \
+  closechannel --funding_txid "\${1%%:*}" --output_index "\${1##*:}" >/dev/null
+CLOSE
+chmod +x "$W/close-alice.sh"
+# A close command for the conformance run: closes, from frank's side, the channel whose funding
+# outpoint is $1 (Core Lightning closes by channel id when a peer has two channels).
+cat > "$W/close-frank.sh" <<CLOSE
+#!/usr/bin/env bash
+set -euo pipefail
+lc() { "$(command -v lightning-cli)" --network=regtest --lightning-dir="$W/frank" "\$@"; }
+cid=\$(lc listpeerchannels | python3 -c 'import json,sys
+txid, out = sys.argv[1].split(":")
+print(next(c["channel_id"] for c in json.load(sys.stdin)["channels"]
+           if c.get("funding_txid") == txid and c.get("funding_outnum") == int(out)))' "\$1")
+lc close "\$cid" >/dev/null
+CLOSE
+chmod +x "$W/close-frank.sh"
 A_BACKEND=lnd A_ADDR=https://127.0.0.1:${RPC[alice]} A_CERT=$W/alice/tls.cert A_MAC=$(mac alice) \
 B_BACKEND=cln B_ADDR=$(cln_sock carol) \
 B_P2P=127.0.0.1:${CP2P[carol]} HASHES="$(pair),$(pair),$(pair)" \
-MINE="$W/mine.sh" \
+MINE="$W/mine.sh" CLOSE="$W/close-alice.sh" \
   "$W/target/release/ln-conformance" || { cln_dump 60; fail "conformance with a Core Lightning payee"; }
 
 log "conformance 2: Core Lightning pays (frank), LND is paid (bob)"
 A_BACKEND=cln A_ADDR=$(cln_sock frank) \
 B_BACKEND=lnd B_ADDR=https://127.0.0.1:${RPC[bob]} B_CERT=$W/bob/tls.cert B_MAC=$(mac bob) \
 B_P2P=127.0.0.1:${P2P[bob]} HASHES="$(pair),$(pair),$(pair)" \
-MINE="$W/mine.sh" \
+MINE="$W/mine.sh" CLOSE="$W/close-frank.sh" \
   "$W/target/release/ln-conformance" || { cln_dump 60; fail "conformance with a Core Lightning payer"; }
 
 log "lease end to end: an LND buyer (alice), a Core Lightning seller (carol)"

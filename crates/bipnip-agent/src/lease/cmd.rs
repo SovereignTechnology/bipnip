@@ -673,8 +673,24 @@ mod tests {
             async fn payment_state(&self, h: &str) -> Result<PaymentState, BackendError> {
                 self.0.payment_state(h).await
             }
+            async fn payment_lookup(&self, h: &str) -> Result<Option<PaymentState>, BackendError> {
+                self.0.payment_lookup(h).await
+            }
             async fn add_invoice(&self, a: u64, e: u32, d: &str) -> Result<String, BackendError> {
                 self.0.add_invoice(a, e, d).await
+            }
+            async fn invoice_state(
+                &self,
+                b: &str,
+            ) -> Result<bipnip_ln::InvoiceStatus, BackendError> {
+                self.0.invoice_state(b).await
+            }
+            async fn closed_channel(
+                &self,
+                r: &str,
+                o: &str,
+            ) -> Result<Option<bipnip_ln::ClosedChannel>, BackendError> {
+                self.0.closed_channel(r, o).await
             }
             async fn connect(&self, p: &str, a: &str) -> Result<(), BackendError> {
                 self.0.connect(p, a).await

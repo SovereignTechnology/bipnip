@@ -23,8 +23,8 @@ use std::sync::{Mutex, PoisonError};
 
 use async_trait::async_trait;
 use bipnip_ln::{
-    BackendError, ChannelView, GraphChannel, HoldInvoiceRequest, HoldState, LightningBackend,
-    NodeInfo, OpenRequest, PaymentState,
+    BackendError, ChannelView, ClosedChannel, GraphChannel, HoldInvoiceRequest, HoldState,
+    InvoiceStatus, LightningBackend, NodeInfo, OpenRequest, PaymentState,
 };
 use lightning_invoice::Bolt11Invoice;
 use serde::{Deserialize, Serialize};
@@ -465,9 +465,9 @@ impl LightningBackend for Guard<'_> {
         let grant = self.snapshot();
         let mut committed = 0u64;
         for paid in grant.paid.iter().filter(|paid| paid.hash != hash) {
-            match self.inner.payment_state(&paid.hash).await {
-                // Failed, or the node never heard of it: nothing left the wallet.
-                Ok(PaymentState::Failed { .. }) | Err(BackendError::Rejected(_)) => {}
+            match self.inner.payment_lookup(&paid.hash).await {
+                // Failed, or the node says it never had it: nothing left the wallet.
+                Ok(None | Some(PaymentState::Failed { .. })) => {}
                 // Paid, under way, or the node could not say: it counts.
                 _ => committed = committed.saturating_add(paid.msat),
             }
@@ -495,6 +495,13 @@ impl LightningBackend for Guard<'_> {
         self.inner.payment_state(payment_hash).await
     }
 
+    async fn payment_lookup(
+        &self,
+        payment_hash: &str,
+    ) -> Result<Option<PaymentState>, BackendError> {
+        self.inner.payment_lookup(payment_hash).await
+    }
+
     async fn add_invoice(
         &self,
         amount_msat: u64,
@@ -504,6 +511,10 @@ impl LightningBackend for Guard<'_> {
         self.inner
             .add_invoice(amount_msat, expiry_secs, description)
             .await
+    }
+
+    async fn invoice_state(&self, bolt11: &str) -> Result<InvoiceStatus, BackendError> {
+        self.inner.invoice_state(bolt11).await
     }
 
     async fn connect(&self, remote_pubkey: &str, remote_addr: &str) -> Result<(), BackendError> {
@@ -544,6 +555,16 @@ impl LightningBackend for Guard<'_> {
 
     async fn channels_with(&self, remote_pubkey: &str) -> Result<Vec<ChannelView>, BackendError> {
         self.inner.channels_with(remote_pubkey).await
+    }
+
+    async fn closed_channel(
+        &self,
+        remote_pubkey: &str,
+        funding_outpoint: &str,
+    ) -> Result<Option<ClosedChannel>, BackendError> {
+        self.inner
+            .closed_channel(remote_pubkey, funding_outpoint)
+            .await
     }
 
     async fn graph_node(&self, node_pubkey: &str) -> Result<Option<(u32, u64)>, BackendError> {

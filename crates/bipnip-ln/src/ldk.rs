@@ -44,7 +44,7 @@ use ldk_server_client::ldk_server_grpc::api::open_channel_request::Amount;
 use ldk_server_client::ldk_server_grpc::api::{
     Bolt11ReceiveRequest, Bolt11SendRequest, ConnectPeerRequest, DecodeInvoiceRequest,
     GetNodeInfoRequest, GetPaymentDetailsRequest, GraphGetChannelRequest, GraphGetNodeRequest,
-    ListChannelsRequest, OpenChannelRequest, SignMessageRequest,
+    ListChannelsRequest, ListPaymentsRequest, OpenChannelRequest, SignMessageRequest,
 };
 use ldk_server_client::ldk_server_grpc::types::bolt11_invoice_description::Kind as DescriptionKind;
 use ldk_server_client::ldk_server_grpc::types::payment_kind::Kind as PaymentKindOf;
@@ -59,8 +59,8 @@ use ldk_server_client::{
 
 use crate::hexutil::{hash32, node_key};
 use crate::{
-    BackendError, ChannelView, GraphChannel, HoldInvoiceRequest, HoldState, LightningBackend,
-    NodeInfo, OpenRequest, PaymentState,
+    BackendError, ChannelView, ClosedChannel, GraphChannel, HoldInvoiceRequest, HoldState,
+    InvoiceStatus, LightningBackend, NodeInfo, OpenRequest, PaymentState,
 };
 
 /// Deadline for one RPC.
@@ -69,6 +69,8 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const FUNDING_WAIT: Duration = Duration::from_secs(60);
 /// How often a payment or a new channel is looked at while waiting for it.
 const POLL: Duration = Duration::from_millis(500);
+/// Most pages of the payment list read when looking for an inbound payment.
+const MAX_PAYMENT_PAGES: usize = 50;
 
 fn server_error(e: LdkServerError) -> BackendError {
     match e.error_code {
@@ -98,6 +100,20 @@ fn bolt11_preimage(payment: &Payment) -> Option<&str> {
         PaymentKindOf::Bolt11(bolt11) => bolt11.preimage.as_deref(),
         _ => None,
     }
+}
+
+fn bolt11_hash(payment: &Payment) -> Option<&str> {
+    match payment.kind.as_ref()?.kind.as_ref()? {
+        PaymentKindOf::Bolt11(bolt11) => Some(&bolt11.hash),
+        _ => None,
+    }
+}
+
+/// Unix seconds now.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 fn is_status(payment: &Payment, status: PaymentStatus) -> bool {
@@ -137,6 +153,40 @@ impl LdkBackend {
         Ok(call(self.client.get_payment_details(request))
             .await?
             .payment)
+    }
+
+    /// The inbound payment for `payment_hash`, if the server has a record of one: looked up by
+    /// the hash, which is the payment id of an invoice the server made, and else found in the
+    /// payment list.
+    async fn inbound(&self, payment_hash: &str) -> Result<Option<Payment>, BackendError> {
+        let inbound = |payment: &Payment| payment.direction == PaymentDirection::Inbound as i32;
+        if let Some(payment) = self.payment(payment_hash).await? {
+            if inbound(&payment) {
+                return Ok(Some(payment));
+            }
+        }
+        let mut page_token = None;
+        for _ in 0..MAX_PAYMENT_PAGES {
+            let page = call(
+                self.client
+                    .list_payments(ListPaymentsRequest { page_token }),
+            )
+            .await?;
+            if let Some(found) = page
+                .payments
+                .into_iter()
+                .find(|payment| inbound(payment) && bolt11_hash(payment) == Some(payment_hash))
+            {
+                return Ok(Some(found));
+            }
+            match page.next_page_token {
+                Some(next) => page_token = Some(next),
+                None => return Ok(None),
+            }
+        }
+        Err(BackendError::Unavailable(
+            "LDK Server's payment list is longer than this backend reads".into(),
+        ))
     }
 
     /// The state of an outbound payment record.
@@ -274,6 +324,19 @@ impl LightningBackend for LdkBackend {
         }
     }
 
+    async fn payment_lookup(
+        &self,
+        payment_hash: &str,
+    ) -> Result<Option<PaymentState>, BackendError> {
+        hash32(payment_hash, "payment hash")?;
+        // An outbound payment is kept under its hash; a hash never paid has no record.
+        Ok(self
+            .payment(payment_hash)
+            .await?
+            .filter(|payment| payment.direction == PaymentDirection::Outbound as i32)
+            .map(|payment| Self::outbound_state(&payment)))
+    }
+
     async fn add_invoice(
         &self,
         amount_msat: u64,
@@ -288,6 +351,28 @@ impl LightningBackend for LdkBackend {
             expiry_secs,
         };
         Ok(call(self.client.bolt11_receive(request)).await?.invoice)
+    }
+
+    async fn invoice_state(&self, bolt11: &str) -> Result<InvoiceStatus, BackendError> {
+        let decoded = call(self.client.decode_invoice(DecodeInvoiceRequest {
+            invoice: bolt11.to_string(),
+        }))
+        .await?;
+        let payment = self.inbound(&decoded.payment_hash).await?;
+        if let Some(payment) = &payment {
+            if is_status(payment, PaymentStatus::Succeeded) {
+                return Ok(InvoiceStatus::Paid);
+            }
+            if is_status(payment, PaymentStatus::Failed) {
+                return Ok(InvoiceStatus::Expired);
+            }
+        }
+        // Unpaid, or no record yet: the invoice's own expiry decides.
+        if unix_now() >= decoded.timestamp.saturating_add(decoded.expiry) {
+            Ok(InvoiceStatus::Expired)
+        } else {
+            Ok(InvoiceStatus::Unpaid)
+        }
     }
 
     async fn connect(&self, remote_pubkey: &str, remote_addr: &str) -> Result<(), BackendError> {
@@ -363,6 +448,17 @@ impl LightningBackend for LdkBackend {
             .collect())
     }
 
+    async fn closed_channel(
+        &self,
+        remote_pubkey: &str,
+        _funding_outpoint: &str,
+    ) -> Result<Option<ClosedChannel>, BackendError> {
+        node_key(remote_pubkey)?;
+        // The server lists open channels only; a close is told by a best-effort event alone.
+        Err(BackendError::Unsupported(
+            "LDK Server keeps no record of closed channels",
+        ))
+    }
     async fn graph_node(&self, node_pubkey: &str) -> Result<Option<(u32, u64)>, BackendError> {
         node_key(node_pubkey)?;
         let request = GraphGetNodeRequest {

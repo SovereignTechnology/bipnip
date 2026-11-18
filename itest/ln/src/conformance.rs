@@ -7,19 +7,26 @@
 //! command that mines its argument's blocks) and `HASHES` (three "preimage:hash" pairs,
 //! comma-separated).
 //!
-//! What a backend may lack, and the run then says so and goes on: hold invoices as the payee, and
-//! `graph_channels` (both by answering `BackendError::Unsupported`). Everything else is required,
-//! and a backend that does offer hold invoices must pass every hold step.
+//! What a backend may lack, and the run then says so and goes on: hold invoices as the payee,
+//! `graph_channels` and `closed_channel` (each by answering `BackendError::Unsupported`).
+//! Everything else is required, and a backend that does offer hold invoices must pass every hold
+//! step.
+//!
+//! With `CLOSE` set (a command that closes, from A's side, the channel whose funding outpoint is
+//! its first argument; the second is B's node key), the run also opens a second, small channel,
+//! closes it, and checks that both ends know it closed and by whom.
 
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
+use bipnip_agent::ring::bond::payment_hash_of;
 use bipnip_ln::cln::ClnBackend;
 use bipnip_ln::ldk::LdkBackend;
 use bipnip_ln::lnd::LndBackend;
 use bipnip_ln::{
-    BackendError, HoldInvoiceRequest, HoldState, LightningBackend, OpenRequest, PaymentState,
+    BackendError, Closer, HoldInvoiceRequest, HoldState, InvoiceStatus, LightningBackend,
+    OpenRequest, PaymentState,
 };
 use mostro_core::node_binding::recover_ln_signer;
 
@@ -204,6 +211,79 @@ async fn hold_steps(
     assert!(unpaid.is_err(), "settle of an unpaid invoice: {unpaid:?}");
 }
 
+/// Opens a second, small channel from A to B, closes it from A's side with the `close`
+/// command, and checks both ends: it leaves `channels_with`, and `closed_channel` knows it, with
+/// A as the closer (or "unknown"; never the other side).
+async fn close_steps(
+    a: &dyn LightningBackend,
+    b: &dyn LightningBackend,
+    a_key: &str,
+    b_key: &str,
+    close: &str,
+) {
+    step("closed_channel: a second channel, closed by A, is closed at both ends");
+    let second = a
+        .open_channel(&OpenRequest {
+            remote_pubkey: b_key.to_string(),
+            remote_addr: Some(env("B_P2P")),
+            capacity_sat: 200_000,
+            announce: true,
+            feerate_sat_vb: 2,
+        })
+        .await
+        .expect("open the second channel");
+    mine(6);
+    let active = |node: &'static str| {
+        let (n, peer) = if node == "A" { (a, b_key) } else { (b, a_key) };
+        let second = second.clone();
+        async move {
+            n.channels_with(peer)
+                .await
+                .is_ok_and(|c| c.iter().any(|c| c.funding_outpoint == second && c.active))
+        }
+    };
+    until("second channel active on A", 120, || active("A")).await;
+    until("second channel active on B", 120, || active("B")).await;
+    let closed = Command::new("bash")
+        .arg(close)
+        .arg(&second)
+        .arg(b_key)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    assert!(closed, "the close command failed");
+    mine(6);
+    for (side, node, peer, wrong) in [
+        ("A", a, b_key, Closer::Remote),
+        ("B", b, a_key, Closer::Local),
+    ] {
+        if let Err(BackendError::Unsupported(why)) = node.closed_channel(peer, &second).await {
+            println!("  not supported by {side}'s backend ({why}); skipped");
+            continue;
+        }
+        until(&format!("{side} knows the channel closed"), 120, || async {
+            matches!(node.closed_channel(peer, &second).await, Ok(Some(_)))
+        })
+        .await;
+        let seen = node
+            .closed_channel(peer, &second)
+            .await
+            .expect("closed_channel")
+            .expect("closed");
+        println!("  {side} sees: {seen:?}");
+        assert_ne!(seen.closer, wrong, "{side} names the wrong closer");
+        assert!(
+            !node
+                .channels_with(peer)
+                .await
+                .expect("channels")
+                .iter()
+                .any(|c| c.funding_outpoint == second),
+            "{side} still lists the closed channel"
+        );
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let (a, b) = (node("A").await, node("B").await);
@@ -331,6 +411,10 @@ async fn main() {
         .add_invoice(250_000, 600, "bipnip-ln conformance: plain")
         .await
         .expect("invoice");
+    assert_eq!(
+        b.invoice_state(&invoice).await.expect("invoice state"),
+        InvoiceStatus::Unpaid
+    );
     // As for a hold invoice, a brand-new channel can refuse the first tries.
     let mut paid = None;
     for attempt in 1..=6 {
@@ -347,6 +431,41 @@ async fn main() {
         }
     }
     assert_eq!(paid.expect("plain invoice paid").len(), 64);
+
+    step("invoice_state: the paid invoice is paid; one left past its expiry is expired");
+    until("the payee sees its invoice paid", 30, || async {
+        b.invoice_state(&invoice).await == Ok(InvoiceStatus::Paid)
+    })
+    .await;
+    let brief = b
+        .add_invoice(1_000, 1, "bipnip-ln conformance: expires")
+        .await
+        .expect("invoice");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        b.invoice_state(&brief).await.expect("invoice state"),
+        InvoiceStatus::Expired
+    );
+
+    step("payment_lookup: the payer has the payment, the payee and a stranger's hash have none");
+    let hash = payment_hash_of(&invoice).expect("payment hash");
+    assert!(
+        matches!(
+            a.payment_lookup(&hash).await.expect("lookup"),
+            Some(PaymentState::Succeeded { .. })
+        ),
+        "the payer's node has the payment"
+    );
+    // The payee was paid; it sent nothing.
+    assert_eq!(b.payment_lookup(&hash).await.expect("lookup"), None);
+    assert_eq!(
+        a.payment_lookup(&"42".repeat(32)).await.expect("lookup"),
+        None
+    );
+    assert!(matches!(
+        a.payment_lookup("zz").await,
+        Err(BackendError::Rejected(_))
+    ));
 
     step("graph_node sees the announced channel");
     until("B in A's graph with a channel", 120, || async {
@@ -389,6 +508,19 @@ async fn main() {
             a.graph_channels("02abc").await,
             Err(BackendError::Rejected(_))
         ));
+    }
+
+    step("closed_channel: an open channel is not closed");
+    for (side, node, peer) in [("A", a, &ib.node_pubkey), ("B", b, &ia.node_pubkey)] {
+        match node.closed_channel(peer, &outpoint).await {
+            Err(BackendError::Unsupported(why)) => {
+                println!("  not supported by {side}'s backend ({why}); skipped");
+            }
+            answer => assert_eq!(answer.expect("closed_channel"), None, "{side}"),
+        }
+    }
+    if let Ok(close) = std::env::var("CLOSE") {
+        close_steps(a, b, &ia.node_pubkey, &ib.node_pubkey, &close).await;
     }
 
     let named = |prefix: &str| {

@@ -80,3 +80,19 @@ the plan above, which had guessed two things wrong.
 - **Nodes that follow the chain by polling lag a block for a moment** (Core Lightning, LDK Server). Callers
   wait for a count of confirmations; they do not assert it right after a block.
 
+
+### Notes (2026-11-18): three lookups for watching a lease
+
+- **A plain invoice has its own lookup (`invoice_state`)**, given the invoice's text: unpaid, paid, or
+  expired. Before this, a seller and a bond claimant asked about their plain invoices through
+  `hold_invoice_state`, which Core Lightning answers from the `hold` plugin only and LDK does not answer at
+  all, so on those nodes a completion share or a bond claim could never be seen paid.
+- **"No such payment" is an answer only from `payment_lookup`.** `payment_state` keeps refusing an unknown
+  hash, and LND's refusals all look alike to a caller, so code that asks "did money already leave?" (the
+  run's grant, a bond payment, a second completion invoice) asks `payment_lookup`, which says `None` only
+  when the node says plainly it has no payment for that hash.
+- **`closed_channel` tells a closing or closed channel apart from one never seen**, with the closer when
+  the node knows it and the close height where it gives one (LND gives both; Core Lightning gives the
+  closer and no height). LDK Server keeps no record of closed channels and answers `Unsupported`.
+- The three are required of every backend (no default bodies), so a wrapper such as the agent's `Guard`
+  cannot silently miss one.

@@ -89,13 +89,22 @@ funded() { [ "$(lnc alice walletbalance | jget confirmed_balance)" -gt 0 ]; }
 wait_until 60 funded
 
 log "conformance"
+# A close command for the conformance run: closes, cooperatively from alice's side, the channel
+# whose funding outpoint is $1.
+cat > "$W/close-alice.sh" <<CLOSE
+#!/usr/bin/env bash
+set -euo pipefail
+exec "$(command -v lncli)" --lnddir="$W/alice" --network=regtest --rpcserver=127.0.0.1:${RPC[alice]} \
+  closechannel --funding_txid "\${1%%:*}" --output_index "\${1##*:}" >/dev/null
+CLOSE
+chmod +x "$W/close-alice.sh"
 printf '#!/usr/bin/env bash\nexec %s generatetoaddress "$1" %s >/dev/null\n' "$BCLI" "$MADDR" > "$W/mine.sh"; chmod +x "$W/mine.sh"
 pair() { python3 -c 'import os,hashlib; p=os.urandom(32); print(p.hex()+":"+hashlib.sha256(p).hexdigest())'; }
 mac() { echo "$W/$1/data/chain/bitcoin/regtest/admin.macaroon"; }
 A_ADDR=https://127.0.0.1:${RPC[alice]} A_CERT=$W/alice/tls.cert A_MAC=$(mac alice) \
 B_ADDR=https://127.0.0.1:${RPC[bob]} B_CERT=$W/bob/tls.cert B_MAC=$(mac bob) \
 B_P2P=127.0.0.1:${P2P[bob]} HASHES="$(pair),$(pair),$(pair)" \
-MINE="$W/mine.sh" \
+MINE="$W/mine.sh" CLOSE="$W/close-alice.sh" \
   "$W/target/release/ln-conformance"
 
 # --- a whole lease between the two nodes ------------------------------------------------------
