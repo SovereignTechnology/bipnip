@@ -222,7 +222,7 @@ mod tests {
             (b, ring(2_000_000)),
             (a, lease(3, 1_000, 1_000_000, Network::Regtest)),
             // Another network: never listed.
-            (b, lease(4, 1, 1_000_000, Network::Signet)),
+            (b, lease(4, 1_000, 1_000_000, Network::Signet)),
         ];
         let book = merge(orders, Network::Regtest, &Query::default());
         assert_eq!(
