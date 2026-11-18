@@ -13,7 +13,7 @@ Nostr-native peer-to-peer Lightning exchange) that keeps all of Mostro and adds:
 Everything travels over Nostr relays. Anyone who runs a node can run an instance; instances coordinate
 leases and rings but never hold lease money.
 
-Status: **M2 done on regtest; the trust layer (watching leases, rules, outcomes) in progress**. M0 (forks,
+Status: **M2 and the trust layer done on regtest; the web client's Liquidity tab (W1) in progress**. M0 (forks,
 specs, spikes) is done. The LND backend passes its
 conformance run against real nodes; `bipnip-agent` can create a mnemonic, bind a node and publish the
 binding. A whole lease now runs end to end on regtest: a seller's agent offers liquidity on an instance,
@@ -31,7 +31,12 @@ agent also runs as a daemon (`bipnip-agent run`) that carries every lease and ri
 answers the `bipnip` command line on a unix socket, and holds each request to spending limits you set.
 Three kinds of node are supported: **LND** (everything), **Core Lightning** with the `hold` plugin
 (everything an agent does), and **LDK Server** (buying leases and joining rings; it cannot sell a lease yet,
-`docs/decisions/0006-lightning-backend.md` says why). Nothing here is ready for real funds.
+`docs/decisions/0006-lightning-backend.md` says why). Leases are watched to their end, both parties write
+up signed outcomes, and `bipnip record` counts a node's record from them. A web page (the `bipnip-web`
+client's Liquidity tab, served by `bipnip-webhost`) can be paired with the agent and shows the book, the
+sellers' records and the agent's runs; what it asks for waits for `bipnip approve`
+(`itest/ln/run-web.sh` runs it in a real browser against real nodes). Nothing here is ready for real
+funds.
 
 ## Try the agent (regtest or signet only)
 
