@@ -110,12 +110,8 @@ pub async fn pay_bond(
     if bond.sent {
         return Ok(None);
     }
-    let known = match backend.payment_state(&bond.payment_hash).await {
-        Ok(state) => Some(state),
-        // Refused: our node has no payment for this hash.
-        Err(BackendError::Rejected(_)) => None,
-        Err(e) => return Err(e),
-    };
+    // `None` only when our node says plainly it has no payment for this hash.
+    let known = backend.payment_lookup(&bond.payment_hash).await?;
     let state = match known {
         None | Some(PaymentState::Failed { .. }) => {
             let max_fee_msat = routing_reserve_sat(bond_sat).max(10).saturating_mul(1_000);

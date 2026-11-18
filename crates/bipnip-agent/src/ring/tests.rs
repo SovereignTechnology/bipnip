@@ -18,7 +18,7 @@ use mostro_core::ring_message::{
 use nostr_sdk::prelude::{FinalizeEvent, Keys};
 use uuid::Uuid;
 
-use crate::lease::tests::{NOW, Node, World, confirm, secret};
+use crate::lease::tests::{NOW, NoHold, Node, World, confirm, secret};
 use crate::lease_wire;
 use crate::ring::run::{JoinRequest, RingRun, RingRunError, RingState};
 use crate::ring_wire::{self, RingIncoming, RingWireError};
@@ -1403,6 +1403,45 @@ async fn a_member_owed_a_bond_claims_the_exact_payout_and_sees_it_paid_on_its_ow
             .expect("tick")
             .is_empty()
     );
+    assert!(run.finished());
+}
+
+/// On a node that keeps no hold invoices (an LDK Server, or Core Lightning's `hold` plugin, which
+/// knows only its own), a bond claim is still seen paid: it is a plain invoice, asked about as one.
+#[tokio::test]
+async fn a_bond_claim_is_seen_paid_on_a_node_that_keeps_no_hold_invoices() {
+    let table = Table::bonded(3);
+    let (mut runs, ring) = table.opened(&[0, 1, 2]).await;
+    let closed = RingIncoming::Closed {
+        order_id: table.order_id,
+        closed: RingClosed {
+            ring_id: ring.id(),
+            verified: vec![0],
+            slashed: vec![2],
+        },
+    };
+    table
+        .deliver(&mut runs[0], 0, closed)
+        .await
+        .expect("closed");
+    let inner = &table.members[0].node;
+    let node = NoHold(Node {
+        world: inner.world.clone(),
+        secret: inner.secret,
+        network: inner.network,
+    });
+    let mut run = runs.remove(0);
+    let out = run.tick(&node, NOW).await.expect("tick");
+    let invoice = claimed_invoice(&out, &ring);
+    assert!(run.tick(&node, NOW + 30).await.expect("tick").is_empty());
+    assert_eq!(run.owed_status(), "claimed");
+    table
+        .house
+        .pay_invoice(&invoice, 0, 0)
+        .await
+        .expect("the payout");
+    assert!(run.tick(&node, NOW + 60).await.expect("tick").is_empty());
+    assert_eq!(run.owed_status(), "paid");
     assert!(run.finished());
 }
 

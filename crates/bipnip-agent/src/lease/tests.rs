@@ -37,6 +37,8 @@ pub(crate) struct World {
     /// When the nodes' invoices are dated, unix seconds; [`NOW`] unless a test sets it (one
     /// that runs on the real clock).
     pub(crate) clock: Option<u64>,
+    /// Channels that closed, by funding outpoint (taken out of `channels` by [`close`]).
+    pub(crate) closed: HashMap<String, bipnip_ln::ClosedChannel>,
 }
 
 pub(crate) struct Node {
@@ -145,6 +147,9 @@ impl LightningBackend for NoHold {
     async fn payment_state(&self, hash: &str) -> Result<PaymentState, BackendError> {
         self.0.payment_state(hash).await
     }
+    async fn payment_lookup(&self, hash: &str) -> Result<Option<PaymentState>, BackendError> {
+        self.0.payment_lookup(hash).await
+    }
     async fn add_invoice(
         &self,
         amount_msat: u64,
@@ -154,6 +159,16 @@ impl LightningBackend for NoHold {
         self.0
             .add_invoice(amount_msat, expiry_secs, description)
             .await
+    }
+    async fn invoice_state(&self, bolt11: &str) -> Result<bipnip_ln::InvoiceStatus, BackendError> {
+        self.0.invoice_state(bolt11).await
+    }
+    async fn closed_channel(
+        &self,
+        remote: &str,
+        outpoint: &str,
+    ) -> Result<Option<bipnip_ln::ClosedChannel>, BackendError> {
+        self.0.closed_channel(remote, outpoint).await
     }
     async fn connect(&self, pubkey: &str, addr: &str) -> Result<(), BackendError> {
         self.0.connect(pubkey, addr).await
@@ -273,6 +288,35 @@ impl LightningBackend for Node {
             .get(hash)
             .cloned()
             .ok_or(BackendError::Rejected("no such payment".into()))
+    }
+    async fn payment_lookup(&self, hash: &str) -> Result<Option<PaymentState>, BackendError> {
+        let w = self.world.lock().expect("world");
+        Ok(w.payments.get(hash).cloned())
+    }
+    async fn invoice_state(&self, bolt11: &str) -> Result<bipnip_ln::InvoiceStatus, BackendError> {
+        let parsed = Bolt11Invoice::from_str(bolt11)
+            .map_err(|_| BackendError::Rejected("not an invoice".into()))?;
+        let hash = parsed.payment_hash().to_string();
+        let w = self.world.lock().expect("world");
+        if !w.plain.contains(&hash) {
+            return Err(BackendError::Rejected("no such invoice".into()));
+        }
+        let now = w.clock.unwrap_or(NOW);
+        let expires_at = parsed.expires_at().map_or(u64::MAX, |at| at.as_secs());
+        Ok(match w.invoices.get(&hash) {
+            Some(HoldState::Settled) => bipnip_ln::InvoiceStatus::Paid,
+            Some(HoldState::Canceled) => bipnip_ln::InvoiceStatus::Expired,
+            _ if now >= expires_at => bipnip_ln::InvoiceStatus::Expired,
+            _ => bipnip_ln::InvoiceStatus::Unpaid,
+        })
+    }
+    async fn closed_channel(
+        &self,
+        _: &str,
+        outpoint: &str,
+    ) -> Result<Option<bipnip_ln::ClosedChannel>, BackendError> {
+        let w = self.world.lock().expect("world");
+        Ok(w.closed.get(outpoint).copied())
     }
     async fn add_invoice(
         &self,

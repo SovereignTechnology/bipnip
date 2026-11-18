@@ -33,7 +33,7 @@
 //! another. A message no relay took is kept with the run and sent again
 //! ([`crate::ring::link`]).
 
-use bipnip_ln::{HoldState, LightningBackend, OpenRequest};
+use bipnip_ln::{InvoiceStatus, LightningBackend, OpenRequest};
 use mostro_core::bond::{BOND_CLAIM_WINDOW_SECS, payout_sat};
 use mostro_core::prelude::{CantDoReason, Message};
 use mostro_core::ring::{Ring, RingTerms};
@@ -856,10 +856,8 @@ impl RingRun {
             if claim.paid {
                 return Ok(Vec::new());
             }
-            let paid = matches!(
-                backend.hold_invoice_state(&claim.payment_hash).await?,
-                HoldState::Settled
-            );
+            // A plain invoice on our node: asked as one, which every backend can answer.
+            let paid = backend.invoice_state(&claim.invoice).await? == InvoiceStatus::Paid;
             if paid {
                 self.claim = Some(BondClaim {
                     paid: true,

@@ -151,10 +151,19 @@ for n in dave erin; do wait_until 180 ldk_funded "$n" || { ldk_dump; fail "$n's 
 pair() { python3 -c 'import os,hashlib; p=os.urandom(32); print(p.hex()+":"+hashlib.sha256(p).hexdigest())'; }
 
 log "conformance 1: LND pays (alice), LDK is paid (dave)"
+# A close command for the conformance run: closes, cooperatively from alice's side, the channel
+# whose funding outpoint is $1.
+cat > "$W/close-alice.sh" <<CLOSE
+#!/usr/bin/env bash
+set -euo pipefail
+exec "$(command -v lncli)" --lnddir="$W/alice" --network=regtest --rpcserver=127.0.0.1:${RPC[alice]} \
+  closechannel --funding_txid "\${1%%:*}" --output_index "\${1##*:}" >/dev/null
+CLOSE
+chmod +x "$W/close-alice.sh"
 A_BACKEND=lnd A_ADDR=https://127.0.0.1:${RPC[alice]} A_CERT=$W/alice/tls.cert A_MAC=$(mac alice) \
 B_BACKEND=ldk B_ADDR=127.0.0.1:${GRPC[dave]} B_CERT=$(ldk_cert dave) B_MAC=$(ldk_mac dave) \
 B_P2P=127.0.0.1:${LP2P[dave]} HASHES="$(pair),$(pair),$(pair)" \
-MINE="$W/mine.sh" \
+MINE="$W/mine.sh" CLOSE="$W/close-alice.sh" \
   "$W/target/release/ln-conformance" || { ldk_dump 60; fail "conformance with an LDK payee"; }
 
 log "conformance 2: LDK pays (erin), LND is paid (bob)"

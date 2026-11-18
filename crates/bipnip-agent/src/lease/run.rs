@@ -50,7 +50,7 @@
 
 use std::path::Path;
 
-use bipnip_ln::{HoldState, LightningBackend, PaymentState, hexutil};
+use bipnip_ln::{HoldState, InvoiceStatus, LightningBackend, PaymentState, hexutil};
 use mostro_core::bond::payout_sat;
 use mostro_core::lease::{LeaseContract, LeaseTerms};
 use mostro_core::lease_message::{LeaseInvoice, LeaseOffer};
@@ -757,12 +757,12 @@ impl SellerRun {
                 let Some(bolt11) = &self.completion_invoice else {
                     return Ok(Vec::new());
                 };
-                let hash = super::check_completion_invoice(bolt11, lease.contract())?;
+                super::check_completion_invoice(bolt11, lease.contract())?;
                 let paid = backend
-                    .hold_invoice_state(&hash)
+                    .invoice_state(bolt11)
                     .await
                     .map_err(LeaseStepError::from)?
-                    == HoldState::Settled;
+                    == InvoiceStatus::Paid;
                 if paid {
                     self.state = SellerState::Complete;
                 }
@@ -783,12 +783,13 @@ impl SellerRun {
         backend: &dyn LightningBackend,
     ) -> Result<Vec<Outgoing>, RunError> {
         if let Some(claim) = self.bond_claim.clone() {
+            // A plain invoice on our node: asked as one, which every backend can answer.
             let seen = backend
-                .hold_invoice_state(&claim.payment_hash)
+                .invoice_state(&claim.invoice)
                 .await
                 .map_err(LeaseStepError::from)?;
             match seen {
-                HoldState::Settled => {
+                InvoiceStatus::Paid => {
                     lease.cancel(backend).await?;
                     self.bond_claim = Some(BondClaim {
                         paid: true,
@@ -796,8 +797,8 @@ impl SellerRun {
                     });
                     self.state = SellerState::Canceled;
                 }
-                HoldState::Canceled => self.bond_claim = None,
-                _ => {}
+                InvoiceStatus::Expired => self.bond_claim = None,
+                InvoiceStatus::Unpaid => {}
             }
             return Ok(Vec::new());
         }

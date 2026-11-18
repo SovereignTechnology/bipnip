@@ -36,8 +36,8 @@ use serde_json::{Value, json};
 
 use crate::hexutil::{hash32, node_key};
 use crate::{
-    BackendError, ChannelView, GraphChannel, HoldInvoiceRequest, HoldState, LightningBackend,
-    NodeInfo, OpenRequest, PaymentState,
+    BackendError, ChannelView, ClosedChannel, Closer, GraphChannel, HoldInvoiceRequest, HoldState,
+    InvoiceStatus, LightningBackend, NodeInfo, OpenRequest, PaymentState,
 };
 
 /// Deadline for one RPC.
@@ -78,6 +78,41 @@ fn msat(value: &Value) -> Option<u64> {
     value
         .as_u64()
         .or_else(|| value.as_str()?.strip_suffix("msat")?.parse().ok())
+}
+
+/// Channel states in which a lease or a ring can count on a channel; any other state is closing
+/// or gone.
+const LIVE_STATES: [&str; 5] = [
+    "OPENINGD",
+    "CHANNELD_AWAITING_LOCKIN",
+    "DUALOPEND_AWAITING_LOCKIN",
+    "CHANNELD_NORMAL",
+    "CHANNELD_AWAITING_SPLICE",
+];
+
+/// Who closed a channel, from a `closer` field (`local` or `remote`, absent when unknown).
+fn closer_of(value: &Value) -> Closer {
+    match value.as_str() {
+        Some("local") => Closer::Local,
+        Some("remote") => Closer::Remote,
+        _ => Closer::Unknown,
+    }
+}
+
+/// `txid:vout` split into its parts.
+fn outpoint_parts(outpoint: &str) -> Result<(&str, u64), BackendError> {
+    outpoint
+        .rsplit_once(':')
+        .and_then(|(txid, vout)| Some((txid, vout.parse().ok()?)))
+        .filter(|(txid, _)| txid.len() == 64 && txid.bytes().all(|b| b.is_ascii_hexdigit()))
+        .ok_or_else(|| BackendError::Rejected("a funding outpoint must be txid:vout".into()))
+}
+
+/// Unix seconds now.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// The block a short channel id (`block x tx x output`) names.
@@ -289,6 +324,15 @@ impl LightningBackend for ClnBackend {
             .ok_or_else(|| BackendError::Rejected("Core Lightning reported no such payment".into()))
     }
 
+    async fn payment_lookup(
+        &self,
+        payment_hash: &str,
+    ) -> Result<Option<PaymentState>, BackendError> {
+        hash32(payment_hash, "payment hash")?;
+        // `listpays` answers an empty list for a hash this node never paid.
+        self.pay_record(payment_hash).await
+    }
+
     async fn add_invoice(
         &self,
         amount_msat: u64,
@@ -316,6 +360,28 @@ impl LightningBackend for ClnBackend {
             )
             .await?;
         Ok(text(&answer, "bolt11", "invoice")?.to_string())
+    }
+
+    async fn invoice_state(&self, bolt11: &str) -> Result<InvoiceStatus, BackendError> {
+        let answer = self
+            .rpc("listinvoices", json!({"invstring": bolt11}))
+            .await?;
+        let Some(invoice) = answer["invoices"].as_array().and_then(|all| all.first()) else {
+            return Err(BackendError::Rejected(
+                "Core Lightning reported no such invoice".into(),
+            ));
+        };
+        match invoice["status"].as_str() {
+            Some("paid") => Ok(InvoiceStatus::Paid),
+            Some("expired") => Ok(InvoiceStatus::Expired),
+            Some("unpaid") => match invoice["expires_at"].as_u64() {
+                Some(at) if unix_now() >= at => Ok(InvoiceStatus::Expired),
+                _ => Ok(InvoiceStatus::Unpaid),
+            },
+            _ => Err(BackendError::Unavailable(
+                "Core Lightning reported an invoice state this backend does not know".into(),
+            )),
+        }
     }
 
     async fn connect(&self, remote_pubkey: &str, remote_addr: &str) -> Result<(), BackendError> {
@@ -375,15 +441,7 @@ impl LightningBackend for ClnBackend {
             .filter_map(|channel| {
                 // A channel that is closing or gone is not one a lease or a ring can count on.
                 let state = channel["state"].as_str()?;
-                let live = matches!(
-                    state,
-                    "OPENINGD"
-                        | "CHANNELD_AWAITING_LOCKIN"
-                        | "DUALOPEND_AWAITING_LOCKIN"
-                        | "CHANNELD_NORMAL"
-                        | "CHANNELD_AWAITING_SPLICE"
-                );
-                if !live {
+                if !LIVE_STATES.contains(&state) {
                     return None;
                 }
                 let txid = channel["funding_txid"].as_str()?;
@@ -404,6 +462,47 @@ impl LightningBackend for ClnBackend {
                 })
             })
             .collect())
+    }
+
+    async fn closed_channel(
+        &self,
+        remote_pubkey: &str,
+        funding_outpoint: &str,
+    ) -> Result<Option<ClosedChannel>, BackendError> {
+        node_key(remote_pubkey)?;
+        let (txid, vout) = outpoint_parts(funding_outpoint)?;
+        let funded_at = |channel: &&Value| {
+            channel["funding_txid"].as_str() == Some(txid)
+                && channel["funding_outnum"].as_u64() == Some(vout)
+        };
+        // A channel that is still closing is listed with its peer, in a closing state.
+        let peer = self
+            .rpc("listpeerchannels", json!({"id": remote_pubkey}))
+            .await?;
+        if let Some(channel) = peer["channels"]
+            .as_array()
+            .and_then(|all| all.iter().find(funded_at))
+        {
+            let state = channel["state"].as_str().unwrap_or_default();
+            if LIVE_STATES.contains(&state) {
+                return Ok(None);
+            }
+            return Ok(Some(ClosedChannel {
+                closer: closer_of(&channel["closer"]),
+                close_height: None,
+            }));
+        }
+        // Once its outputs are settled it moves to the closed list, which gives no height.
+        let closed = self
+            .rpc("listclosedchannels", json!({"id": remote_pubkey}))
+            .await?;
+        Ok(closed["closedchannels"]
+            .as_array()
+            .and_then(|all| all.iter().find(funded_at))
+            .map(|channel| ClosedChannel {
+                closer: closer_of(&channel["closer"]),
+                close_height: None,
+            }))
     }
 
     async fn graph_node(&self, node_pubkey: &str) -> Result<Option<(u32, u64)>, BackendError> {
@@ -446,6 +545,27 @@ impl LightningBackend for ClnBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outpoints_and_closers_are_read_strictly() {
+        let txid = "ab".repeat(32);
+        assert_eq!(outpoint_parts(&format!("{txid}:1")), Ok((txid.as_str(), 1)));
+        let (no_vout, bad_vout) = (format!("{txid}:"), format!("{txid}:x"));
+        for bad in [
+            "",
+            ":1",
+            "ab:1",
+            no_vout.as_str(),
+            bad_vout.as_str(),
+            txid.as_str(),
+        ] {
+            assert!(outpoint_parts(bad).is_err(), "{bad}");
+        }
+        assert_eq!(closer_of(&json!("local")), Closer::Local);
+        assert_eq!(closer_of(&json!("remote")), Closer::Remote);
+        assert_eq!(closer_of(&Value::Null), Closer::Unknown);
+        assert_eq!(closer_of(&json!("mutual")), Closer::Unknown);
+    }
 
     #[test]
     fn amounts_and_short_channel_ids_are_read_in_both_forms() {

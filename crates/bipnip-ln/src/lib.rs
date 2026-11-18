@@ -87,6 +87,38 @@ pub enum PaymentState {
     },
 }
 
+/// A plain invoice's state, as the node that made it reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvoiceStatus {
+    /// Not paid, and still payable.
+    Unpaid,
+    /// Paid.
+    Paid,
+    /// No longer payable: it expired unpaid, or was cancelled.
+    Expired,
+}
+
+/// Who closed a channel, as the local node knows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Closer {
+    /// The local node.
+    Local,
+    /// The peer.
+    Remote,
+    /// The node does not say.
+    Unknown,
+}
+
+/// A channel that is closing or closed, as the local node knows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClosedChannel {
+    /// Who closed it.
+    pub closer: Closer,
+    /// Height of the block that confirmed the close, when the node gives it (not while the close
+    /// is still pending).
+    pub close_height: Option<u32>,
+}
+
 /// Parameters for a hold invoice.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HoldInvoiceRequest {
@@ -199,6 +231,16 @@ pub trait LightningBackend: Send + Sync {
     /// Current state of an outgoing payment, by its payment hash (64 lower-case hex).
     async fn payment_state(&self, payment_hash: &str) -> Result<PaymentState, BackendError>;
 
+    /// Where the outgoing payment for `payment_hash` stands, or `None` when the node says it
+    /// has no payment for that hash at all. Unlike [`LightningBackend::payment_state`], "no
+    /// such payment" is an answer here, given only when the node says so plainly; anything
+    /// short of that is an error. A caller deciding whether money already left (for example,
+    /// before paying a second invoice for the same debt) relies on that.
+    async fn payment_lookup(
+        &self,
+        payment_hash: &str,
+    ) -> Result<Option<PaymentState>, BackendError>;
+
     /// A plain BOLT 11 invoice for `amount_msat` (the node picks the preimage).
     async fn add_invoice(
         &self,
@@ -207,14 +249,28 @@ pub trait LightningBackend: Send + Sync {
         description: &str,
     ) -> Result<String, BackendError>;
 
+    /// The state of a plain invoice this node made with [`LightningBackend::add_invoice`],
+    /// given as the BOLT 11 text. Not for hold invoices, which have
+    /// [`LightningBackend::hold_invoice_state`].
+    async fn invoice_state(&self, bolt11: &str) -> Result<InvoiceStatus, BackendError>;
+
     /// Connects to a peer.
     async fn connect(&self, remote_pubkey: &str, remote_addr: &str) -> Result<(), BackendError>;
 
     /// Opens a channel from the node's own wallet; returns the funding outpoint once broadcast.
     async fn open_channel(&self, req: &OpenRequest) -> Result<String, BackendError>;
 
-    /// Pending and open channels with `remote_pubkey`.
+    /// Pending and open channels with `remote_pubkey`. A channel that is closing is not here.
     async fn channels_with(&self, remote_pubkey: &str) -> Result<Vec<ChannelView>, BackendError>;
+
+    /// The channel with `remote_pubkey` funded at `funding_outpoint` (`txid:vout`), if the node
+    /// knows it as closing or closed; `None` when it does not (the channel may still be open,
+    /// or the node never had it).
+    async fn closed_channel(
+        &self,
+        remote_pubkey: &str,
+        funding_outpoint: &str,
+    ) -> Result<Option<ClosedChannel>, BackendError>;
 
     /// What the node's graph knows about another node: number of public channels and their
     /// total capacity in satoshi, or `None` if the node is not in the graph.
