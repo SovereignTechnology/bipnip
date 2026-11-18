@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use bipnip_ln::{LightningBackend, OpenRequest, PaymentState};
 
-use super::{SELLER, Stage, to_instance};
+use super::{NOW, SELLER, Stage, to_instance};
 use crate::lease::BuyerLease;
 use crate::lease::run::{BuyerRun, BuyerState, SellerRun, SellerState};
 use crate::lease::store::{LeaseStore, StoreError};
@@ -99,14 +99,14 @@ async fn a_lease_survives_a_restart_at_every_step() {
 
     assert!(
         seller
-            .tick(&stage.seller_node)
+            .tick(&stage.seller_node, NOW)
             .await
             .expect("tick")
             .is_empty()
     );
     let mut seller = restart_seller(&store, seller);
     assert_eq!(seller.state(), SellerState::Opening);
-    let report = to_instance(seller.tick(&stage.seller_node).await.expect("tick"));
+    let report = to_instance(seller.tick(&stage.seller_node, NOW).await.expect("tick"));
     let mut seller = restart_seller(&store, seller);
     assert_eq!(seller.state(), SellerState::Opened);
     assert_eq!(stage.channels(), 1);
@@ -115,13 +115,13 @@ async fn a_lease_survives_a_restart_at_every_step() {
     let mut buyer = restart_buyer(&store, buyer);
     assert_eq!(buyer.state(), BuyerState::Verifying);
     stage.confirm(&seller);
-    let out = buyer.tick(&stage.buyer_node).await.expect("tick");
+    let out = buyer.tick(&stage.buyer_node, NOW).await.expect("tick");
     let mut buyer = restart_buyer(&store, buyer);
     assert_eq!(buyer.state(), BuyerState::Released);
     // Released once, also after a restart.
     assert!(
         buyer
-            .tick(&stage.buyer_node)
+            .tick(&stage.buyer_node, NOW)
             .await
             .expect("tick")
             .is_empty()
@@ -184,7 +184,7 @@ async fn a_seller_that_stopped_mid_open_does_not_open_twice() {
     stage.to_buyer(&mut buyer, &invoice).await.expect("invoice");
     assert!(
         seller
-            .tick(&stage.seller_node)
+            .tick(&stage.seller_node, NOW)
             .await
             .expect("tick")
             .is_empty()
@@ -193,13 +193,13 @@ async fn a_seller_that_stopped_mid_open_does_not_open_twice() {
     store.save_seller(&seller).expect("save");
 
     // The next tick opened the channel, and the agent died before it could record that.
-    let lost = to_instance(seller.tick(&stage.seller_node).await.expect("tick"));
+    let lost = to_instance(seller.tick(&stage.seller_node, NOW).await.expect("tick"));
     assert_eq!(stage.channels(), 2);
     drop(seller);
 
     let mut seller = store.load().expect("load").sellers.pop().expect("the run");
     assert_eq!(seller.state(), SellerState::Opening);
-    let report = to_instance(seller.tick(&stage.seller_node).await.expect("tick"));
+    let report = to_instance(seller.tick(&stage.seller_node, NOW).await.expect("tick"));
     assert_eq!(stage.channels(), 2, "no second channel");
     assert_eq!(
         report.as_json().expect("json"),
@@ -212,7 +212,7 @@ async fn a_seller_that_stopped_mid_open_does_not_open_twice() {
     // The lease then finishes as usual.
     stage.to_buyer(&mut buyer, &report).await.expect("report");
     stage.confirm(&seller);
-    let out = buyer.tick(&stage.buyer_node).await.expect("tick");
+    let out = buyer.tick(&stage.buyer_node, NOW).await.expect("tick");
     stage
         .peer_to_seller(&mut seller, &out[0])
         .await
@@ -227,7 +227,7 @@ async fn a_cancel_between_noticing_the_payment_and_opening_gives_it_back() {
     stage.to_buyer(&mut buyer, &invoice).await.expect("invoice");
     assert!(
         seller
-            .tick(&stage.seller_node)
+            .tick(&stage.seller_node, NOW)
             .await
             .expect("tick")
             .is_empty()
@@ -245,7 +245,7 @@ async fn a_cancel_between_noticing_the_payment_and_opening_gives_it_back() {
     ));
     assert!(
         seller
-            .tick(&stage.seller_node)
+            .tick(&stage.seller_node, NOW)
             .await
             .expect("tick")
             .is_empty()

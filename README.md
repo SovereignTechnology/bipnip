@@ -97,9 +97,15 @@ bipnip-agent --config agent.toml lease resume    # carry on after a restart
 A seller can ask its buyer for a bond with `lease offer … --bond 20000` (on an instance that takes bonds);
 a buyer's agent takes such an order only up to its `[policy] max_bond_sat` (see Rings below).
 
-Both commands run until the lease is finished: active, when all of the fee was upfront (the default), or
+Both commands run until the lease is active, when all of the fee was upfront (the default), or until it is
 paid in full at the end of the lease when `--upfront` is below 100. The buyer's agent keeps the lease's preimage in an
 owner-only file under `data_dir/leases` from before it sends the take, so a restart does not lose it.
+
+An active lease is then watched by the agent's daemon (`bipnip-agent run`, below): both sides look at the leased
+channel on their own node until it has as many confirmations as the lease is long, or is gone. The lease ends
+`complete`, or `closed` when the channel went first. The buyer pays one completion invoice per lease, and pays it
+when its own node saw the lease through, even if the channel is gone by the time the bill arrives; a seller whose
+invoice expired unpaid bills again for up to a week.
 
 ### Rings
 

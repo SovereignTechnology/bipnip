@@ -44,13 +44,19 @@
 //! payment back and the lease is over: a seller is paid for one or the other, never both.
 //!
 //! The end of a lease is judged the same way on both sides: by how many confirmations the
-//! channel has on the party's own node. Once that reaches the lease's length the seller bills the
-//! completion share, and the buyer pays it only if its node still has the channel. A channel
-//! that is gone ends the lease with the completion share unpaid, whoever closed it.
+//! channel has on the party's own node ([`super::watch`]). Both runs watch the channel from the
+//! moment the lease is active, whatever share of the fee was upfront. Once the channel has the
+//! lease's length in confirmations the seller bills the completion share, and the buyer pays it
+//! if its own node saw that too, even if the channel is gone by the time the bill arrives. A
+//! channel that went before that ends the lease with the completion share not owed, whoever
+//! closed it. The buyer pays one completion invoice per lease: a second is taken only after the
+//! first expired with no payment for it out or made.
 
 use std::path::Path;
+use std::str::FromStr;
 
 use bipnip_ln::{HoldState, InvoiceStatus, LightningBackend, PaymentState, hexutil};
+use lightning_invoice::Bolt11Invoice;
 use mostro_core::bond::payout_sat;
 use mostro_core::lease::{LeaseContract, LeaseTerms};
 use mostro_core::lease_message::{LeaseInvoice, LeaseOffer};
@@ -62,6 +68,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::store::StoreError;
+use super::watch::Watch;
 use super::{BuyerLease, LeaseStepError, SellerLease};
 use crate::lease_wire::{self, Incoming, WireError};
 use crate::ring::bond::{self, BondClaim, BondPayment};
@@ -73,6 +80,12 @@ const CLAIM_RETRY_TICKS: u32 = 12;
 
 /// How long the buyer's node may take over the completion payment before the run looks again.
 const COMPLETION_PAY_WAIT_SECS: u32 = 30;
+/// Most completion invoices a seller sends for one lease; each stays payable a day.
+const MAX_COMPLETION_INVOICES: u8 = 8;
+/// How long after a lease ended its seller keeps billing the completion share.
+const COMPLETION_BILLING_SECS: u64 = 7 * 24 * 3_600;
+/// How long after a lease ended its buyer waits for the seller's completion invoice.
+const COMPLETION_WAIT_SECS: u64 = 14 * 24 * 3_600;
 
 /// A message to send.
 #[derive(Debug, Clone)]
@@ -186,14 +199,18 @@ pub enum SellerState {
     Opening,
     /// The buyer's payment is locked and the channel is opening; waiting for the preimage.
     Opened,
-    /// The hold invoice is settled. The end of the lease when all of the fee was upfront.
+    /// The hold invoice is settled; the leased channel is watched until the lease has run its
+    /// length.
     Active,
     /// The lease has run its length and the completion invoice is out.
     Completing,
-    /// The completion share is paid.
+    /// The lease ran its length, and the completion share, if any, is paid.
     Complete,
-    /// The channel closed before the completion share could be billed.
+    /// The channel was gone before the lease had run its length (or our node cannot tell when it
+    /// closed): nothing more is billed.
     Closed,
+    /// The lease ran its length and the completion share was never paid, though billed.
+    Unpaid,
     /// Over before it was active.
     Canceled,
 }
@@ -234,6 +251,12 @@ pub struct SellerRun {
     bond_claim: Option<BondClaim>,
     /// Looks at the node still to wait before claiming again.
     claim_wait_ticks: u32,
+    /// What our node has shown of the leased channel since the lease went active.
+    watch: Watch,
+    /// When the lease ended (ran its length, or the channel went), unix seconds.
+    ended_at: Option<u64>,
+    /// Completion invoices sent so far.
+    completion_issued: u8,
     /// True when the answer the current state implies has not reached a relay.
     unsent: bool,
 }
@@ -265,6 +288,12 @@ struct SellerRecord {
     bond_claim: Option<BondClaim>,
     #[serde(default)]
     claim_wait_ticks: u32,
+    #[serde(default)]
+    watch: Watch,
+    #[serde(default)]
+    ended_at: Option<u64>,
+    #[serde(default)]
+    completion_issued: u8,
     unsent: bool,
 }
 
@@ -318,6 +347,9 @@ impl SellerRun {
             bond_owed: false,
             bond_claim: None,
             claim_wait_ticks: 0,
+            watch: Watch::default(),
+            ended_at: None,
+            completion_issued: 0,
             unsent: false,
         };
         (run, Outgoing::ToInstance(message))
@@ -356,6 +388,9 @@ impl SellerRun {
             bond_owed: self.bond_owed,
             bond_claim: self.bond_claim.clone(),
             claim_wait_ticks: self.claim_wait_ticks,
+            watch: self.watch,
+            ended_at: self.ended_at,
+            completion_issued: self.completion_issued,
             unsent: self.unsent,
         })
     }
@@ -396,6 +431,7 @@ impl SellerRun {
                 | SellerState::Completing
                 | SellerState::Complete
                 | SellerState::Closed
+                | SellerState::Unpaid
         );
         let needs_lease =
             after_opening || matches!(state, SellerState::Invoiced | SellerState::Opening);
@@ -430,6 +466,12 @@ impl SellerRun {
             bond_owed: record.bond_owed,
             bond_claim: record.bond_claim,
             claim_wait_ticks: record.claim_wait_ticks,
+            watch: record.watch,
+            ended_at: record.ended_at,
+            // A run stored before the count was kept had sent one invoice if it has one.
+            completion_issued: record
+                .completion_issued
+                .max(u8::from(record.completion_invoice.is_some())),
             unsent: record.unsent,
         })
     }
@@ -518,16 +560,38 @@ impl SellerRun {
         self.unsent = unsent;
     }
 
-    /// True when nothing more will happen in this run: it was canceled, the completion share
-    /// is paid, the channel closed first, or the lease is active and had no completion share.
+    /// True when nothing more will happen in this run: it was canceled, the lease ran its
+    /// length (and the completion share is paid or was never paid), or the channel went first.
     pub fn finished(&self) -> bool {
-        match self.state {
-            SellerState::Canceled | SellerState::Complete | SellerState::Closed => true,
-            SellerState::Active => self
-                .contract()
-                .is_some_and(|contract| contract.terms.completion_sat() == Ok(0)),
-            _ => false,
-        }
+        matches!(
+            self.state,
+            SellerState::Canceled
+                | SellerState::Complete
+                | SellerState::Closed
+                | SellerState::Unpaid
+        )
+    }
+
+    /// True while the lease is active and only being watched: its channel is looked at until
+    /// the lease has run its length, and its completion share, if any, is billed. No money of
+    /// ours moves any more.
+    pub fn watching(&self) -> bool {
+        matches!(self.state, SellerState::Active | SellerState::Completing)
+    }
+
+    /// True when a command driving the run may stop: the run is finished, or the lease is
+    /// active with all of its fee paid upfront, so nothing is left but watching it.
+    pub fn at_rest(&self) -> bool {
+        self.finished()
+            || (self.state == SellerState::Active
+                && self
+                    .contract()
+                    .is_some_and(|contract| contract.terms.completion_sat() == Ok(0)))
+    }
+
+    /// What our node has shown of the leased channel since the lease went active.
+    pub fn watch(&self) -> &Watch {
+        &self.watch
     }
 
     /// The message the current state implies, made again: the offer while it is unanswered, the
@@ -714,6 +778,7 @@ impl SellerRun {
     pub async fn tick(
         &mut self,
         backend: &dyn LightningBackend,
+        now: u64,
     ) -> Result<Vec<Outgoing>, RunError> {
         let (Some(lease), Some(order_id)) = (self.lease.clone(), self.order_id) else {
             return Ok(Vec::new());
@@ -752,22 +817,8 @@ impl SellerRun {
             SellerState::Opened if self.bond_owed => {
                 self.claim_bond(&lease, order_id, backend).await
             }
-            SellerState::Active => self.bill(&lease, order_id, backend).await,
-            SellerState::Completing => {
-                let Some(bolt11) = &self.completion_invoice else {
-                    return Ok(Vec::new());
-                };
-                super::check_completion_invoice(bolt11, lease.contract())?;
-                let paid = backend
-                    .invoice_state(bolt11)
-                    .await
-                    .map_err(LeaseStepError::from)?
-                    == InvoiceStatus::Paid;
-                if paid {
-                    self.state = SellerState::Complete;
-                }
-                Ok(Vec::new())
-            }
+            SellerState::Active => self.bill(&lease, order_id, backend, now).await,
+            SellerState::Completing => self.collect(&lease, order_id, backend, now).await,
             _ => Ok(Vec::new()),
         }
     }
@@ -825,47 +876,103 @@ impl SellerRun {
         ))])
     }
 
-    /// Once the leased channel has as many confirmations as the lease is long, bills the
-    /// completion share. A channel our node no longer has ends the lease unbilled. Nothing
-    /// happens for a lease whose fee was all upfront.
+    /// Watches the leased channel on our node. Once the lease has run its length: bills the
+    /// completion share, or is complete when all of the fee was upfront. When the channel went
+    /// before that (or our node cannot tell when it went), the lease is over unbilled.
     async fn bill(
         &mut self,
         lease: &SellerLease,
         order_id: Uuid,
         backend: &dyn LightningBackend,
+        now: u64,
     ) -> Result<Vec<Outgoing>, RunError> {
         let contract = lease.contract();
-        if contract
-            .terms
-            .completion_sat()
-            .map_err(LeaseStepError::from)?
-            == 0
-        {
-            return Ok(Vec::new());
-        }
         let Some(outpoint) = self.outpoint.clone() else {
             return Ok(Vec::new());
         };
-        let channels = backend
-            .channels_with(&contract.buyer_node.to_string())
+        let duration = contract.terms.duration_blocks;
+        self.watch
+            .look(
+                backend,
+                &contract.buyer_node.to_string(),
+                &outpoint,
+                duration,
+            )
             .await
             .map_err(LeaseStepError::from)?;
-        let Some(channel) = channels
-            .iter()
-            .find(|channel| channel.funding_outpoint == outpoint)
-        else {
-            self.state = SellerState::Closed;
-            return Ok(Vec::new());
-        };
-        if channel.confirmations < contract.terms.duration_blocks {
-            return Ok(Vec::new());
+        if self.watch.ran(duration) {
+            self.ended_at.get_or_insert(now);
+            if contract
+                .terms
+                .completion_sat()
+                .map_err(LeaseStepError::from)?
+                == 0
+            {
+                self.state = SellerState::Complete;
+                return Ok(Vec::new());
+            }
+            return self.issue_completion(lease, order_id, backend).await;
         }
+        if self.watch.gone.is_some() {
+            self.ended_at.get_or_insert(now);
+            self.state = SellerState::Closed;
+        }
+        Ok(Vec::new())
+    }
+
+    /// Makes a completion invoice on our node and sends it.
+    async fn issue_completion(
+        &mut self,
+        lease: &SellerLease,
+        order_id: Uuid,
+        backend: &dyn LightningBackend,
+    ) -> Result<Vec<Outgoing>, RunError> {
         let bolt11 = lease.completion_invoice(backend).await?;
         self.completion_invoice = Some(bolt11.clone());
+        self.completion_issued = self.completion_issued.saturating_add(1);
         self.state = SellerState::Completing;
         Ok(vec![Outgoing::ToInstance(lease_wire::completion_invoice(
-            order_id, contract, bolt11,
+            order_id,
+            lease.contract(),
+            bolt11,
         ))])
+    }
+
+    /// Follows the completion invoice on our node: paid, the lease is complete. One that expired
+    /// unpaid is replaced, up to [`MAX_COMPLETION_INVOICES`] and for
+    /// [`COMPLETION_BILLING_SECS`] after the lease ended; after that the share is unpaid.
+    async fn collect(
+        &mut self,
+        lease: &SellerLease,
+        order_id: Uuid,
+        backend: &dyn LightningBackend,
+        now: u64,
+    ) -> Result<Vec<Outgoing>, RunError> {
+        let Some(bolt11) = self.completion_invoice.clone() else {
+            return Ok(Vec::new());
+        };
+        super::check_completion_invoice(&bolt11, lease.contract())?;
+        match backend
+            .invoice_state(&bolt11)
+            .await
+            .map_err(LeaseStepError::from)?
+        {
+            InvoiceStatus::Paid => {
+                self.state = SellerState::Complete;
+                Ok(Vec::new())
+            }
+            InvoiceStatus::Unpaid => Ok(Vec::new()),
+            InvoiceStatus::Expired => {
+                let ended_at = *self.ended_at.get_or_insert(now);
+                if self.completion_issued >= MAX_COMPLETION_INVOICES
+                    || now >= ended_at.saturating_add(COMPLETION_BILLING_SECS)
+                {
+                    self.state = SellerState::Unpaid;
+                    return Ok(Vec::new());
+                }
+                self.issue_completion(lease, order_id, backend).await
+            }
+        }
     }
 
     /// Withdraws the offer, or backs out of a lease before the channel is opened: the hold
@@ -901,14 +1008,33 @@ pub enum BuyerState {
     Verifying,
     /// The channel passed the check and the preimage was released.
     Released,
-    /// The seller settled. The end of the lease when all of the fee was upfront.
+    /// The seller settled; the leased channel is watched until the lease has run its length,
+    /// and its completion share, if any, is paid.
     Active,
-    /// The completion share is paid.
+    /// The lease ran its length, and the completion share, if any, is paid.
     Complete,
-    /// The channel was gone when the completion share was billed; it is not paid.
+    /// The channel was gone before the lease had run its length (or our node cannot tell when
+    /// it went): the completion share is not owed.
     Closed,
+    /// The lease ran its length and the seller never billed the completion share in time.
+    Unbilled,
     /// Over before the preimage was released.
     Canceled,
+}
+
+/// The completion invoice a buyer accepted, kept before it is paid so a restart never pays a
+/// second one for the same lease.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompletionPayment {
+    /// The seller's invoice.
+    pub invoice: String,
+    /// Its payment hash, 64 hex.
+    pub payment_hash: String,
+    /// Unix seconds after which it can no longer be paid.
+    pub expires_at: u64,
+    /// True once a payment for it was seen out.
+    pub sent: bool,
 }
 
 /// The buyer's limits for a lease.
@@ -976,6 +1102,12 @@ pub struct BuyerRun {
     /// The bond the order asks for, and our payment of it once the invoice passed our checks.
     bond_terms: Option<BondTerms>,
     bond: Option<BondPayment>,
+    /// What our node has shown of the leased channel since the lease went active.
+    watch: Watch,
+    /// When the lease ended (ran its length, or the channel went), unix seconds.
+    ended_at: Option<u64>,
+    /// The completion invoice we accepted, if any.
+    completion: Option<CompletionPayment>,
     /// True when the answer the current state implies has not reached a relay.
     unsent: bool,
 }
@@ -1002,6 +1134,12 @@ struct BuyerRecord {
     bond_terms: Option<BondTerms>,
     #[serde(default)]
     bond: Option<BondPayment>,
+    #[serde(default)]
+    watch: Watch,
+    #[serde(default)]
+    ended_at: Option<u64>,
+    #[serde(default)]
+    completion: Option<CompletionPayment>,
     unsent: bool,
 }
 
@@ -1037,6 +1175,9 @@ impl BuyerRun {
             node_address: self.node_address.clone(),
             bond_terms: self.bond_terms.clone(),
             bond: self.bond.clone(),
+            watch: self.watch,
+            ended_at: self.ended_at,
+            completion: self.completion.clone(),
             unsent: self.unsent,
         })
     }
@@ -1055,7 +1196,11 @@ impl BuyerRun {
         let state = record.state;
         let needs_peer = matches!(
             state,
-            BuyerState::Released | BuyerState::Active | BuyerState::Complete | BuyerState::Closed
+            BuyerState::Released
+                | BuyerState::Active
+                | BuyerState::Complete
+                | BuyerState::Closed
+                | BuyerState::Unbilled
         );
         let needs_outpoint = needs_peer || state == BuyerState::Verifying;
         if (needs_outpoint && record.outpoint.is_none()) || (needs_peer && seller_trade.is_none()) {
@@ -1083,6 +1228,9 @@ impl BuyerRun {
             node_address: record.node_address,
             bond_terms: record.bond_terms,
             bond: record.bond,
+            watch: record.watch,
+            ended_at: record.ended_at,
+            completion: record.completion,
             unsent: record.unsent,
         })
     }
@@ -1135,6 +1283,9 @@ impl BuyerRun {
             node_address: request.node_address,
             bond_terms: request.bond,
             bond: None,
+            watch: Watch::default(),
+            ended_at: None,
+            completion: None,
             unsent: false,
         };
         Ok((run, Outgoing::ToInstance(message)))
@@ -1243,12 +1394,13 @@ impl BuyerRun {
         }
     }
 
-    /// Handles one message that `sender` authored.
+    /// Handles one message that `sender` authored, at `now` (unix seconds).
     pub async fn on_message(
         &mut self,
         incoming: Incoming,
         sender: &PublicKey,
         backend: &dyn LightningBackend,
+        now: u64,
     ) -> Result<Vec<Outgoing>, RunError> {
         if !lease_wire::sender_ok(
             &incoming,
@@ -1362,7 +1514,7 @@ impl BuyerRun {
                 Ok(Vec::new())
             }
             (Incoming::CompletionInvoice { invoice, .. }, BuyerState::Active) => {
-                self.pay_completion(&invoice, backend).await
+                self.accept_completion(&invoice, backend, now).await
             }
             (Incoming::Active { .. }, BuyerState::Released) => {
                 self.state = BuyerState::Active;
@@ -1387,13 +1539,20 @@ impl BuyerRun {
         }
     }
 
-    /// Looks at our node. After the take, in a lease with a bond: pays the bond invoice that
-    /// passed our checks, once. Once the channel the seller reported passes the check, and only
-    /// while our payment is still locked, releases the preimage to the seller's trade key.
+    /// Looks at our node, at `now` (unix seconds). After the take, in a lease with a bond: pays
+    /// the bond invoice that passed our checks, once. Once the channel the seller reported passes
+    /// the check, and only while our payment is still locked, releases the preimage to the
+    /// seller's trade key. Once the lease is active: watches the channel, and pays the
+    /// completion invoice we accepted.
     pub async fn tick(
         &mut self,
         backend: &dyn LightningBackend,
+        now: u64,
     ) -> Result<Vec<Outgoing>, RunError> {
+        if self.state == BuyerState::Active {
+            self.watch_and_pay(backend, now).await?;
+            return Ok(Vec::new());
+        }
         if self.state == BuyerState::Taking {
             if let (Some(bond), Some(terms)) = (&mut self.bond, &self.bond_terms) {
                 let failure = bond::pay_bond(backend, bond, terms.bond_sat)
@@ -1441,78 +1600,205 @@ impl BuyerRun {
         }
     }
 
-    /// True when nothing more will happen in this run: it was canceled, the completion share
-    /// is paid, the channel was gone when it was billed, or the lease is active and had no
-    /// completion share.
+    /// True when nothing more will happen in this run: it was canceled, the lease ran its
+    /// length (and the completion share, if any, is paid or was never billed), or the channel
+    /// went first.
     pub fn finished(&self) -> bool {
-        match self.state {
-            BuyerState::Canceled | BuyerState::Complete | BuyerState::Closed => true,
-            BuyerState::Active => self.lease.contract().terms.completion_sat() == Ok(0),
-            _ => false,
-        }
+        matches!(
+            self.state,
+            BuyerState::Canceled | BuyerState::Complete | BuyerState::Closed | BuyerState::Unbilled
+        )
     }
 
-    /// Pays the completion share, if our own node says the lease earned it: the channel is still
-    /// there and has as many confirmations as the lease is long. Too early is an out-of-order
-    /// message, looked at again later; a channel that is gone ends the lease unpaid.
-    async fn pay_completion(
-        &mut self,
-        invoice: &LeaseInvoice,
-        backend: &dyn LightningBackend,
-    ) -> Result<Vec<Outgoing>, RunError> {
-        let contract = self.lease.contract().clone();
-        lease_wire::check_names(&contract, &invoice.lease_id)?;
-        let hash = super::check_completion_invoice(&invoice.invoice, &contract)?;
+    /// True while the lease is active and only being watched: its channel is looked at until
+    /// the lease has run its length, and the completion share, if any, is paid.
+    pub fn watching(&self) -> bool {
+        self.state == BuyerState::Active
+    }
+
+    /// True when a command driving the run may stop: the run is finished, or the lease is
+    /// active with all of its fee paid upfront, so nothing is left but watching it.
+    pub fn at_rest(&self) -> bool {
+        self.finished()
+            || (self.state == BuyerState::Active
+                && self.lease.contract().terms.completion_sat() == Ok(0))
+    }
+
+    /// What our node has shown of the leased channel since the lease went active.
+    pub fn watch(&self) -> &Watch {
+        &self.watch
+    }
+
+    /// The completion invoice we accepted, if any.
+    pub fn completion(&self) -> Option<&CompletionPayment> {
+        self.completion.as_ref()
+    }
+
+    /// Looks at the leased channel on our node.
+    async fn look(&mut self, backend: &dyn LightningBackend) -> Result<(), RunError> {
         let Some(outpoint) = self.outpoint.clone() else {
             return Err(RunError::OutOfOrder(
                 "no channel is recorded for this lease",
             ));
         };
-        let channels = backend
-            .channels_with(&contract.seller_node.to_string())
+        let contract = self.lease.contract();
+        let (peer, duration) = (
+            contract.seller_node.to_string(),
+            contract.terms.duration_blocks,
+        );
+        self.watch
+            .look(backend, &peer, &outpoint, duration)
             .await
             .map_err(LeaseStepError::from)?;
-        let Some(channel) = channels
-            .iter()
-            .find(|channel| channel.funding_outpoint == outpoint)
-        else {
-            self.state = BuyerState::Closed;
-            return Ok(Vec::new());
-        };
-        if channel.confirmations < contract.terms.duration_blocks {
-            return Err(RunError::OutOfOrder("the lease has not run its length yet"));
-        }
-        // A run that stopped after paying and before it was saved does not pay again.
-        match backend.payment_state(&hash).await {
-            Ok(PaymentState::Succeeded { .. }) => {
-                self.state = BuyerState::Complete;
+        Ok(())
+    }
+
+    /// Takes the seller's completion invoice if our own node says the lease earned it: the
+    /// channel was open, with as many confirmations as the lease is long. Too early is an
+    /// out-of-order message, looked at again later. The invoice is kept and paid on the next
+    /// look at our node, so it is on disk before any payment leaves.
+    ///
+    /// **One completion payment per lease.** A different invoice replaces the one kept only once
+    /// that one has expired and our node says no payment for it is out or made; otherwise it is
+    /// refused.
+    async fn accept_completion(
+        &mut self,
+        invoice: &LeaseInvoice,
+        backend: &dyn LightningBackend,
+        now: u64,
+    ) -> Result<Vec<Outgoing>, RunError> {
+        let contract = self.lease.contract().clone();
+        lease_wire::check_names(&contract, &invoice.lease_id)?;
+        let payment_hash = super::check_completion_invoice(&invoice.invoice, &contract)?;
+        let expires_at = Bolt11Invoice::from_str(&invoice.invoice)
+            .ok()
+            .and_then(|parsed| parsed.expires_at())
+            .map_or(0, |at| at.as_secs());
+        if let Some(kept) = &self.completion {
+            if kept.invoice == invoice.invoice {
                 return Ok(Vec::new());
             }
-            Ok(PaymentState::InFlight) => {
-                return Err(RunError::OutOfOrder(
-                    "the completion payment is still under way",
+            if now < kept.expires_at {
+                return Err(bond_error(
+                    "a completion invoice for this lease is already being paid".into(),
                 ));
             }
-            _ => {}
+            match backend
+                .payment_lookup(&kept.payment_hash)
+                .await
+                .map_err(LeaseStepError::from)?
+            {
+                None | Some(PaymentState::Failed { .. }) => {}
+                Some(_) => {
+                    return Err(bond_error(
+                        "the completion share is already paid, or its payment is under way".into(),
+                    ));
+                }
+            }
         }
-        let paid = backend
-            .pay_invoice(
-                &invoice.invoice,
-                self.config.max_fee_msat,
-                COMPLETION_PAY_WAIT_SECS,
-            )
+        if now >= expires_at {
+            return Err(bond_error("the completion invoice has expired".into()));
+        }
+        self.look(backend).await?;
+        if !self.watch.ran(contract.terms.duration_blocks) {
+            return Err(RunError::OutOfOrder("the lease has not run its length yet"));
+        }
+        self.completion = Some(CompletionPayment {
+            invoice: invoice.invoice.clone(),
+            payment_hash,
+            expires_at,
+            sent: false,
+        });
+        self.waiting_on = None;
+        Ok(Vec::new())
+    }
+
+    /// The look at our node while the lease is active: the channel, then the completion share.
+    /// Pays the completion invoice we kept, unless our node says a payment for it is already out
+    /// or made. Without one, the run ends once the lease has run its length (all of the fee was
+    /// upfront, or the seller never billed in time) or once the channel went before that.
+    async fn watch_and_pay(
+        &mut self,
+        backend: &dyn LightningBackend,
+        now: u64,
+    ) -> Result<(), RunError> {
+        self.look(backend).await?;
+        let terms = self.lease.contract().terms;
+        let ran = self.watch.ran(terms.duration_blocks);
+        if ran || self.watch.gone.is_some() {
+            self.ended_at.get_or_insert(now);
+        }
+        if let Some(kept) = self.completion.clone() {
+            return self.pay_completion(kept, backend, now).await;
+        }
+        if terms.completion_sat().map_err(LeaseStepError::from)? == 0 {
+            if ran {
+                self.state = BuyerState::Complete;
+            } else if self.watch.gone.is_some() {
+                self.state = BuyerState::Closed;
+            }
+            return Ok(());
+        }
+        if ran {
+            let ended_at = self.ended_at.unwrap_or(now);
+            if now >= ended_at.saturating_add(COMPLETION_WAIT_SECS) {
+                self.state = BuyerState::Unbilled;
+            } else {
+                self.waiting_on = Some("the seller's completion invoice".into());
+            }
+        } else if self.watch.gone.is_some() {
+            self.state = BuyerState::Closed;
+        }
+        Ok(())
+    }
+
+    /// Pays the completion invoice we kept, once: our node is asked first, so a restart, or a
+    /// stop between paying and saving, never pays it twice.
+    async fn pay_completion(
+        &mut self,
+        mut kept: CompletionPayment,
+        backend: &dyn LightningBackend,
+        now: u64,
+    ) -> Result<(), RunError> {
+        let known = backend
+            .payment_lookup(&kept.payment_hash)
             .await
             .map_err(LeaseStepError::from)?;
-        match paid {
-            PaymentState::Succeeded { .. } => {
-                self.state = BuyerState::Complete;
-                Ok(Vec::new())
+        let state = match known {
+            Some(PaymentState::Failed { .. }) | None if now >= kept.expires_at => {
+                kept.sent = false;
+                self.completion = Some(kept);
+                self.waiting_on =
+                    Some("the completion invoice expired unpaid; waiting for a new one".into());
+                return Ok(());
             }
-            PaymentState::InFlight => Err(RunError::OutOfOrder(
-                "the completion payment is still under way",
-            )),
-            PaymentState::Failed { reason } => Err(RunError::PaymentFailed(reason)),
+            Some(PaymentState::Failed { .. }) | None => backend
+                .pay_invoice(
+                    &kept.invoice,
+                    self.config.max_fee_msat,
+                    COMPLETION_PAY_WAIT_SECS,
+                )
+                .await
+                .map_err(LeaseStepError::from)?,
+            Some(state) => state,
+        };
+        match state {
+            PaymentState::Succeeded { .. } => {
+                kept.sent = true;
+                self.state = BuyerState::Complete;
+                self.waiting_on = None;
+            }
+            PaymentState::InFlight => {
+                kept.sent = true;
+                self.waiting_on = Some("the completion payment is under way".into());
+            }
+            PaymentState::Failed { reason } => {
+                kept.sent = false;
+                self.waiting_on = Some(format!("the completion payment failed: {reason}"));
+            }
         }
+        self.completion = Some(kept);
+        Ok(())
     }
 
     /// Backs out before paying. After the payment is locked there is nothing for the buyer to

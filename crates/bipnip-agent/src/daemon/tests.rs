@@ -454,7 +454,8 @@ async fn a_lease_is_asked_for_approved_and_carried_through_a_restart_by_the_sock
         }
         assert!(seen.iter().any(|line| line["status"] == json!("watching")));
 
-        // A finished run is no longer under way, and its fee counts against the day.
+        // A lease that is active, with all of its fee paid upfront, is only watched: it is not
+        // under way (it holds no slot), and its fee counts against the day.
         tokio::time::sleep(POLL * 3).await;
         let status = ok(&buyer.socket(), "status", Value::Null).await;
         assert_eq!(status["runs"]["under_way"], json!(0), "{status}");
@@ -462,8 +463,10 @@ async fn a_lease_is_asked_for_approved_and_carried_through_a_restart_by_the_sock
         let status = ok(&seller.socket(), "status", Value::Null).await;
         assert_eq!(status["last_day"]["capacity_sat"], json!(1_000_000));
         let listed = ok(&seller.socket(), "lease.list", Value::Null).await;
-        assert_eq!(listed["runs"][0]["finished"], json!(true));
+        assert_eq!(listed["runs"][0]["finished"], json!(false));
+        assert_eq!(listed["runs"][0]["watching"], json!(true));
         assert_eq!(listed["runs"][0]["under_way"], json!(false));
+        assert_eq!(status["runs"]["watching"], json!(1), "{status}");
         assert_eq!(listed["runs"][0]["order_id"], json!(order_id));
     };
     tokio::select! {

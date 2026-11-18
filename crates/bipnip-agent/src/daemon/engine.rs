@@ -53,6 +53,8 @@ const RESOLVE_EVERY_TICKS: u32 = 12;
 const TIDY_EVERY_TICKS: u32 = 720;
 /// How long a finished run stays where it is listed before it is put away, in seconds.
 const KEEP_FINISHED_SECS: u64 = 30 * 24 * 3600;
+/// How often a lease that is only watched is looked at, in seconds.
+const WATCH_EVERY_SECS: u64 = 60;
 
 /// Where a request's lines go: the client's connection. Lines that do not fit are dropped; the
 /// engine never waits for a client.
@@ -86,6 +88,16 @@ impl Run {
             Run::Seller(run) => run.finished(),
             Run::Buyer(run) => run.finished(),
             Run::Ring(run) => run.finished(),
+        }
+    }
+
+    /// True for a lease that is active and only watched: it holds no slot under `max_runs`
+    /// and is looked at once every [`WATCH_EVERY_SECS`].
+    fn watching(&self) -> bool {
+        match self {
+            Run::Seller(run) => run.watching(),
+            Run::Buyer(run) => run.watching(),
+            Run::Ring(_) => false,
         }
     }
 
@@ -132,6 +144,7 @@ impl Run {
                 "order_id": order_id,
                 "state": self.state(),
                 "finished": self.finished(),
+                "watching": self.watching(),
                 "line": self.line(),
             })
         };
@@ -207,6 +220,8 @@ struct Entry {
     line: String,
     /// Why the run is not stepped any more, if it could not be saved.
     halted: Option<String>,
+    /// For a run that is only watched: not stepped again before this time (unix seconds).
+    next_look: u64,
 }
 
 struct Watcher {
@@ -259,7 +274,7 @@ async fn step_run(
 ) -> Result<StepReport, StoreError> {
     match run {
         Run::Seller(run) => step_seller(run, link, backend, leases, now).await,
-        Run::Buyer(run) => step_buyer(run, link, backend, leases).await,
+        Run::Buyer(run) => step_buyer(run, link, backend, leases, now).await,
         Run::Ring(run) => ring_link::step(run, link, backend, rings, now).await,
     }
 }
@@ -398,6 +413,7 @@ impl Engine {
                 grant,
                 line,
                 halted: None,
+                next_look: 0,
             });
         }
         Ok(())
@@ -523,6 +539,12 @@ impl Engine {
         };
         if entry.halted.is_some() || entry.run.finished() {
             return;
+        }
+        if entry.run.watching() {
+            if now < entry.next_look {
+                return;
+            }
+            entry.next_look = now.saturating_add(WATCH_EVERY_SECS);
         }
         let stepped = match entry.grant.take() {
             Some(grant) => {
@@ -659,7 +681,7 @@ impl Engine {
         let count = self
             .entries
             .iter()
-            .filter(|entry| !entry.run.finished())
+            .filter(|entry| !entry.run.finished() && !entry.run.watching())
             .count();
         u32::try_from(count).unwrap_or(u32::MAX)
     }
@@ -710,6 +732,7 @@ impl Engine {
                 .map(|entry| entry.pubkey.to_hex()).collect::<Vec<_>>(),
             "runs": {
                 "under_way": usage.runs,
+                "watching": self.entries.iter().filter(|entry| entry.run.watching()).count(),
                 "halted": self.entries.iter().filter(|entry| entry.halted.is_some()).count(),
                 "by_state": by_state,
             },
@@ -877,6 +900,7 @@ impl Engine {
             grant: Some(grant),
             line,
             halted: None,
+            next_look: 0,
         });
         Ok(result)
     }
@@ -995,7 +1019,7 @@ impl Engine {
                 let name = run.name();
                 match self.entries.iter().find(|entry| entry.name == name) {
                     Some(entry) => {
-                        value["under_way"] = json!(entry.halted.is_none());
+                        value["under_way"] = json!(entry.halted.is_none() && !entry.run.watching());
                         if let Some(why) = &entry.halted {
                             value["halted"] = json!(why);
                         }
