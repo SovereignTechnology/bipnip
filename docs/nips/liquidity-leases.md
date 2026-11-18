@@ -33,13 +33,14 @@ unless noted):
 | `confs` | confirmations the buyer waits for before releasing the preimage |
 | `announce` | `true` or `false` |
 | `channel_type` | `anchors` or `taproot` (repeatable) |
-| `rules` | buyer requirements, `key=value` values (e.g. `min_channels=3`, `min_capacity=5000000`, `clearnet=true`) |
+| `rules` | optional: what the buyer's node must show in the public graph, one `name=value` value per rule set, in this order: `min_channels=<n>`, `min_capacity_sat=<sat>`; absent when none is set |
 | `bond` | buyer bond in sat, or `0` |
 | `expiration` | NIP-40 |
 
 Implemented so far (`bipnip-core`, `lease`, `lease_message` and `lease_order`): `node`, `network`,
-`capacity`, `duration`, `fee`, `split`, `confs`, `announce`, `bond` and the expiry. `fee_caps`,
-`channel_type` and `rules` are not part of the v1 contract yet. The buyer's bond works as described under
+`capacity`, `duration`, `fee`, `split`, `confs`, `announce`, `bond`, `rules` and the expiry. `fee_caps` and
+`channel_type` are not part of the v1 contract yet. The rules are not in the contract text: they decide who
+may take the offer, not what is leased. The buyer's bond works as described under
 [The buyer's bond](#the-buyers-bond): the `bond` tag and the offer's `bond_sat` (0, or at least 1 000 sat,
 at most the smallest capacity on offer, announced channels only). The bond is not in the contract text:
 the buyer agrees to it by paying the instance's bond invoice.
@@ -130,7 +131,12 @@ between the two trade keys over the same transport.
    reports `lease-active`.
 7. **Completion.** At `funding height + duration`, the seller sends an ordinary invoice for the remaining
    share (`lease-completion-invoice`); the buyer's agent pays it if its node still sees the channel open.
-8. **Outcomes.** Each party may publish a kind 8735 outcome; both may rate through Mostro's rating flow.
+8. **The watch and the end.** Both agents watch the channel on their own node from the moment the lease is
+   active until it has the lease's length in confirmations, or is gone. The seller bills the completion share
+   then; an invoice that expires unpaid may be replaced (the instance relays a new one once the last has
+   expired, up to eight). The buyer pays one completion invoice per lease, and pays it when its own node saw
+   the lease through, even if the channel is gone when the bill arrives.
+9. **Outcomes.** Each party may publish a kind 8735 outcome (the liquidity-outcomes draft).
 
 ## The buyer's bond
 
