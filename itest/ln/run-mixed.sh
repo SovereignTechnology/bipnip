@@ -38,7 +38,7 @@ HOLD_V=v0.3.3
 HOLD_SHA=f9d916430fb70a3d75089f2d1b88d5d71d4987ef79933035978c1f44aab84be5
 LDK_SERVER_REV=d7e7a2e708664af922c53c786ad6a5df622f5dd8
 # The instance: the same revision run-lnd.sh uses.
-BIPNIPD_REV=c801879600f4a75f3d9e26c0c81d47e0badab404
+BIPNIPD_REV=028099e547a30a929fe0dcee36ef4d15d19a3b43
 fetch() { curl -fsSL --retry 3 -o "$3" "$1"; echo "$2  $3" | sha256sum -c --quiet; }
 
 log "tools"
@@ -203,7 +203,8 @@ for key, value in values.items():
     assert n == 1, (key, n)
 # This instance takes ring bonds: its node (carol) holds them.
 # A lease buyer's bond is decided 180 seconds after the take (48 hours by default).
-text += "\n[liquidity]\nbonds = true\nmax_bond_sat = 100000\nlease_bond_window_secs = 180\n"
+# Its node starts with no peer, so its graph knows no seller yet (run-lnd.sh says more).
+text += "\n[liquidity]\nbonds = true\nmax_bond_sat = 100000\nlease_bond_window_secs = 180\nrequire_seller_in_graph = false\n"
 open(sys.argv[2], "w").write(text)
 PY
 chmod 600 "$W/instance/settings.toml"
