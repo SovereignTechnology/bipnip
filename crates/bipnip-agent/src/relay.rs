@@ -251,10 +251,10 @@ pub fn newest_open_orders(
 /// them. Nothing is checked here: [`crate::record::read`] does that.
 pub async fn fetch_outcomes(client: &Client, node: &str) -> Result<Vec<Event>, String> {
     use mostro_core::outcome::KIND_LIQUIDITY_OUTCOME;
-    use nostr_sdk::prelude::{Alphabet, SingleLetterTag};
+    use nostr_sdk::prelude::SingleLetterTag;
     let filter = Filter::new()
         .kind(Kind::Custom(KIND_LIQUIDITY_OUTCOME))
-        .custom_tag(SingleLetterTag::lowercase(Alphabet::N), node);
+        .custom_tag(SingleLetterTag::LOWERCASE_N, node);
     let events = client
         .fetch_events(filter)
         .timeout(RELAY_TIMEOUT)
