@@ -444,6 +444,10 @@ impl SellerRun {
         {
             return Err(corrupt("the state does not fit the rest of the record"));
         }
+        // A run stored before the count was kept had sent one invoice if it has one.
+        let completion_issued = record
+            .completion_issued
+            .max(u8::from(record.completion_invoice.is_some()));
         Ok(SellerRun {
             instance: stored_key(&record.instance)?,
             offer: record.offer,
@@ -468,10 +472,7 @@ impl SellerRun {
             claim_wait_ticks: record.claim_wait_ticks,
             watch: record.watch,
             ended_at: record.ended_at,
-            // A run stored before the count was kept had sent one invoice if it has one.
-            completion_issued: record
-                .completion_issued
-                .max(u8::from(record.completion_invoice.is_some())),
+            completion_issued,
             unsent: record.unsent,
         })
     }
