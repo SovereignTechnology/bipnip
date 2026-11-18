@@ -498,7 +498,7 @@ mod tests {
                 r#"{"v":1,"method":"orders","params":{"kind":"ring"}}"#.to_string(),
                 Call::Orders(OrdersParams {
                     kind: Some(OrderKind::Ring),
-                    instance: None,
+                    ..OrdersParams::default()
                 }),
             ),
             (

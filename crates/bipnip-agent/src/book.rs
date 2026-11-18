@@ -106,7 +106,7 @@ pub fn merge(orders: Vec<(PublicKey, OpenOrder)>, network: Network, query: &Quer
             seller_listings: 0,
         });
     }
-    let sellers: Vec<Option<PublicKey>> = listed.iter().map(seller).collect();
+    let sellers: Vec<Option<secp256k1::PublicKey>> = listed.iter().map(seller).collect();
     for (i, entry) in listed.iter_mut().enumerate() {
         if let Some(node) = sellers[i] {
             entry.seller_listings = sellers.iter().filter(|s| **s == Some(node)).count();
@@ -116,7 +116,7 @@ pub fn merge(orders: Vec<(PublicKey, OpenOrder)>, network: Network, query: &Quer
     listed
 }
 
-fn seller(entry: &Listed) -> Option<PublicKey> {
+fn seller(entry: &Listed) -> Option<secp256k1::PublicKey> {
     match &entry.order {
         OpenOrder::Lease(order) => Some(order.seller_node),
         OpenOrder::Ring(_) => None,
