@@ -184,9 +184,10 @@ grep -q "revoked" "$W/verify2.out" || fail "no revocation reported"
 log "AGENT E2E PASS: init, bind, publish, verify, revoke against a real LND node"
 
 # --- two agents lease through a real instance ---------------------------------------------------
-# bipnipd main: lease and ring handlers, the public orders, and bonds on rings and leases (#7, #8;
-# bonds run on regtest, as here, and are refused on mainnet until they are read, bipnipd #9).
-BIPNIPD_REV=c801879600f4a75f3d9e26c0c81d47e0badab404
+# bipnipd main: lease and ring handlers, the public orders, bonds on rings and leases (#7, #8; bonds
+# run on regtest, as here, and are refused on mainnet until they are read, bipnipd #9), the fresh
+# completion invoice (#10), the vetting of nodes (#11) and the instance's outcomes (#12).
+BIPNIPD_REV=028099e547a30a929fe0dcee36ef4d15d19a3b43
 log "build the instance (bipnipd ${BIPNIPD_REV:0:12})"
 git clone --quiet https://github.com/SovereignTechnology/bipnipd "$W/bipnipd"
 git -C "$W/bipnipd" checkout --quiet "$BIPNIPD_REV"
@@ -225,7 +226,9 @@ for key, value in values.items():
     assert n == 1, (key, n)
 # This instance takes ring bonds: its node (carol) holds them.
 # A lease buyer's bond is decided 180 seconds after the take (48 hours by default).
-text += "\n[liquidity]\nbonds = true\nmax_bond_sat = 100000\nlease_bond_window_secs = 180\n"
+# Its node (carol) starts with no peer, so its graph knows no seller yet: the seller-in-graph check
+# is the instance's unit tests' to cover; the rules on takers are checked further down.
+text += "\n[liquidity]\nbonds = true\nmax_bond_sat = 100000\nlease_bond_window_secs = 180\nrequire_seller_in_graph = false\n"
 open(sys.argv[2], "w").write(text)
 PY
 chmod 600 "$W/instance/settings.toml"
@@ -839,7 +842,110 @@ done
 # Alice opened 222222 sat today and may open 250000: another 200000 is over her day.
 OVER=$(parked alice max_capacity_per_day_sat ring create --capacity 200000 --slots 2 --feerate 2)
 bip alice deny "$OVER" > /dev/null || fail "the ring over alice's day could not be denied"
+log "DAEMON E2E PASS: a lease and a ring through two agent daemons and the bipnip command line, against a real bipnipd: requests over a limit were parked and went ahead only when approved; a daemon stopped and started again mid-lease carried on; each run paid and opened exactly what it was granted"
+
+# --- the trust layer: leases watched to their end, signed outcomes, a node's record, rules -------
+d_state() { # name, role, order: the state of that run, or nothing
+  bip "$1" lease list | sed -n "s/^$2 order=$3 state=\([a-z-]*\) .*/\1/p" | head -1
+}
+d_both_in() { [ "$(d_state alice buyer "$1")" = "$2" ] && [ "$(d_state bob seller "$1")" = "$2" ]; }
+record_of() { bip "$1" record "$2"; } # who asks, node: the record as JSON
+
+log "trust: the daemon lease (all upfront, 144 blocks) is watched to its end; both write it up as kept"
+[ "$(d_state alice buyer "$ORDER_D")" = active ] || { daemon_dump; fail "the daemon lease is not active before its end"; }
+bip alice status | python3 -c '
+import json, sys
+s = json.load(sys.stdin)
+assert s["runs"]["watching"] >= 1, s
+' || { daemon_dump; fail "alice's daemon does not report its watched lease"; }
+"$W/mine.sh" 150
+# Watched leases are looked at once a minute.
+t=0
+until d_both_in "$ORDER_D" complete; do
+  sleep 5; t=$((t+1))
+  [ "$t" -lt 60 ] || { daemon_dump; fail "the daemon lease did not end complete on both sides"; }
+done
+kept() { record_of alice "$BPK" | python3 -c '
+import json, sys
+r = json.load(sys.stdin)["record"]
+assert r["kept"] >= 1 and r["counterparties"] >= 1 and r["closed_early"] == 0, r
+'; }
+wait_until 120 kept || { record_of alice "$BPK"; daemon_dump; fail "bob's record does not show the kept lease"; }
+
+log "trust: a lease bob closes early; both write it up, and bob's record shows it"
+EARLY=$(parked bob max_capacity_per_day_sat lease offer --min-capacity 300000 --max-capacity 400000 \
+  --duration 1000 --fee-base 1000 --fee-ppm 2000 --feerate 2 --confs 3 --expires-in 3600)
+bip bob approve "$EARLY" > /dev/null || { daemon_dump; fail "the offer to close early was not started"; }
+e_order() { bip bob lease list | sed -n 's/^seller order=\([0-9a-f-]\{36\}\) state=open .*/\1/p' | head -1; }
+e_open() { [ -n "$(e_order)" ]; }
+wait_until 90 e_open || { daemon_dump; fail "the offer to close early did not open"; }
+ORDER_E=$(e_order)
+TAKE_E=$(parked alice max_fee_per_day_sat lease take "$ORDER_E" --capacity 333333 --node-address "127.0.0.1:${P2P[alice]}")
+bip alice approve "$TAKE_E" > /dev/null || { daemon_dump; fail "alice's take of the lease to close early was not started"; }
+t=0
+until d_both_in "$ORDER_E" active; do
+  "$W/mine.sh" 1; sleep 2; t=$((t+1))
+  [ "$t" -lt 90 ] || { daemon_dump; fail "the lease to close early did not become active"; }
+done
+CP=$(lnc bob listchannels | python3 -c '
+import json, sys
+c = [c for c in json.load(sys.stdin)["channels"] if c["capacity"] == "333333"]
+assert len(c) == 1, c
+print(c[0]["channel_point"])')
+lnc bob closechannel --funding_txid "${CP%%:*}" --output_index "${CP##*:}" > /dev/null || fail "bob could not close the leased channel"
+"$W/mine.sh" 6
+t=0
+until d_both_in "$ORDER_E" closed; do
+  "$W/mine.sh" 1; sleep 5; t=$((t+1))
+  [ "$t" -lt 60 ] || { daemon_dump; fail "the lease closed early did not end closed on both sides"; }
+done
+early() { record_of alice "$BPK" | python3 -c '
+import json, sys
+r = json.load(sys.stdin)["record"]
+assert r["closed_early"] == 1 and r["kept"] >= 1, r
+'; }
+wait_until 120 early || { record_of alice "$BPK"; daemon_dump; fail "bob's record does not show the lease he closed early"; }
+# Alice did not close it: nothing against her.
+record_of bob "$APK" | python3 -c '
+import json, sys
+r = json.load(sys.stdin)["record"]
+assert r["closed_early"] == 0 and r["kept"] >= 1, r
+' || { record_of bob "$APK"; fail "alice's record counts the close against her"; }
+
+log "trust: an offer asks its buyer for 50 public channels; the instance refuses alice's take"
+RULED=$(parked bob max_capacity_per_day_sat lease offer --min-capacity 300000 --max-capacity 400000 \
+  --duration 1000 --fee-base 1000 --fee-ppm 2000 --feerate 2 --confs 3 --expires-in 3600 \
+  --min-buyer-channels 50)
+bip bob approve "$RULED" > /dev/null || { daemon_dump; fail "the offer with rules was not started"; }
+wait_until 90 e_open || { daemon_dump; fail "the offer with rules did not open"; }
+ORDER_R=$(e_order)
+TAKE_R=$(parked alice max_fee_per_day_sat lease take "$ORDER_R" --capacity 300000 --node-address "127.0.0.1:${P2P[alice]}")
+bip alice approve "$TAKE_R" > /dev/null || { daemon_dump; fail "alice's take of the offer with rules was not started"; }
+r_refused() { [ "$(d_state alice buyer "$ORDER_R")" = canceled ]; }
+wait_until 120 r_refused || { daemon_dump; fail "the take below the offer's rules was not refused"; }
+grep -q "RulesNotMet" "$W/daemon-alice.out" "$W/daemon-alice.err" || { daemon_dump; fail "the take was refused, but not for the rules"; }
+[ "$(d_state bob seller "$ORDER_R")" = open ] || { daemon_dump; fail "the offer did not stay open after the refused take"; }
+
+log "trust: one book over two instances, one of them silent, and a relay that is down"
+stop_daemon alice
+read -r _ SILENT_PUB < <("$W/target/release/test-key")
+sed -e 's|^relays = \["ws://127.0.0.1:7777"\]$|relays = ["ws://127.0.0.1:7777", "ws://127.0.0.1:7778"]|' \
+  -e "s|^\[policy\]\$|[[instance]]\npubkey = \"$SILENT_PUB\"\npow = 0\n\n[policy]|" \
+  "$W/alice-d.toml" > "$W/alice-book.toml"
+grep -q 7778 "$W/alice-book.toml" && grep -q "$SILENT_PUB" "$W/alice-book.toml" || fail "the two-instance config was not written"
+"$AGENT" --config "$W/alice-book.toml" run --poll 2 >> "$W/daemon-alice.out" 2>> "$W/daemon-alice.err" &
+DPID[alice]=$!
+wait_until 90 bip alice status || { daemon_dump; fail "alice's daemon did not come up with two instances"; }
+bip alice orders --kind lease --capacity 300000 | python3 -c '
+import json, sys
+b = json.load(sys.stdin)
+order, silent = sys.argv[1], sys.argv[2]
+assert any(o["order_id"] == order and o["fee_sat"] == 1600 and o["ppb_per_block"] > 0 for o in b["orders"]), b
+assert b["instances_silent"] == [silent], b
+assert b["relays_down"] == ["ws://127.0.0.1:7778"], b
+' "$ORDER_R" "$SILENT_PUB" || { bip alice orders --kind lease; daemon_dump; fail "the book over two instances is not what it should be"; }
+
 stop_daemon alice; stop_daemon bob
 kill "$INSTANCE_PID"
 
-log "DAEMON E2E PASS: a lease and a ring through two agent daemons and the bipnip command line, against a real bipnipd: requests over a limit were parked and went ahead only when approved; a daemon stopped and started again mid-lease carried on; each run paid and opened exactly what it was granted"
+log "TRUST E2E PASS: leases watched to their end through real nodes and a real bipnipd: a lease paid all upfront ended complete on both sides; one the seller closed early ended closed on both; both sides wrote each up as a signed outcome, and the record read from the relays shows the kept lease for both and the early close against the seller alone; the instance refused a take below the offer's rules; one book over two instances named the silent one and the relay that was down"
