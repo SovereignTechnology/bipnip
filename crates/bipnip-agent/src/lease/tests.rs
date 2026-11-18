@@ -193,10 +193,6 @@ impl LightningBackend for NoHold {
     }
 }
 
-fn unsupported<T>() -> Result<T, BackendError> {
-    Err(BackendError::Unsupported("not simulated"))
-}
-
 #[async_trait]
 impl LightningBackend for Node {
     async fn node_info(&self) -> Result<NodeInfo, BackendError> {

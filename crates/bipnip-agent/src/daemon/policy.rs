@@ -74,8 +74,6 @@ pub struct Usage {
     pub runs: u32,
 }
 
-/// The limits `ask` is over, each named by its key in `[policy]`; empty when it is within all
-/// of them.
 /// Why a take from a seller whose node our graph shows as `graph` (public channels, their
 /// capacity; `None` for a node not in it) is over the policy's seller minimums; empty when it
 /// is not, or when the policy sets none.
@@ -100,6 +98,8 @@ pub fn seller_reasons(policy: &PolicyConfig, graph: Option<(u32, u64)>) -> Vec<S
     )]
 }
 
+/// The limits `ask` is over, each named by its key in `[policy]`; empty when it is within all
+/// of them.
 pub fn over(policy: &PolicyConfig, ask: &Ask, usage: &Usage) -> Vec<String> {
     let mut reasons = Vec::new();
     if usage.runs >= policy.max_runs {
