@@ -880,7 +880,7 @@ e_order() { bip bob lease list | sed -n 's/^seller order=\([0-9a-f-]\{36\}\) sta
 e_open() { [ -n "$(e_order)" ]; }
 wait_until 90 e_open || { daemon_dump; fail "the offer to close early did not open"; }
 ORDER_E=$(e_order)
-TAKE_E=$(parked alice max_fee_per_day_sat lease take "$ORDER_E" --capacity 333333 --node-address "127.0.0.1:${P2P[alice]}")
+TAKE_E=$(parked alice max_fee_per_day_sat lease take "$ORDER_E" --capacity 345678 --node-address "127.0.0.1:${P2P[alice]}")
 bip alice approve "$TAKE_E" > /dev/null || { daemon_dump; fail "alice's take of the lease to close early was not started"; }
 t=0
 until d_both_in "$ORDER_E" active; do
@@ -889,7 +889,7 @@ until d_both_in "$ORDER_E" active; do
 done
 CP=$(lnc bob listchannels | python3 -c '
 import json, sys
-c = [c for c in json.load(sys.stdin)["channels"] if c["capacity"] == "333333"]
+c = [c for c in json.load(sys.stdin)["channels"] if c["capacity"] == "345678"]
 assert len(c) == 1, c
 print(c[0]["channel_point"])')
 lnc bob closechannel --funding_txid "${CP%%:*}" --output_index "${CP##*:}" > /dev/null || fail "bob could not close the leased channel"
