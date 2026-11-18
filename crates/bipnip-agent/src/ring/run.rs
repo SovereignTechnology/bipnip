@@ -35,11 +35,12 @@
 
 use bipnip_ln::{InvoiceStatus, LightningBackend, OpenRequest};
 use mostro_core::bond::{BOND_CLAIM_WINDOW_SECS, payout_sat};
+use mostro_core::outcome::{Deal, Outcome, OutcomeError, OutcomeResult};
 use mostro_core::prelude::{CantDoReason, Message};
 use mostro_core::ring::{Ring, RingTerms};
 use mostro_core::ring_message::{RingOffer, RingRoster, RingSeat};
 use mostro_core::rules::Rules;
-use nostr_sdk::prelude::{Keys, PublicKey};
+use nostr_sdk::prelude::{EventBuilder, Keys, PublicKey, Timestamp};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -191,6 +192,8 @@ pub struct RingRun {
     claim_not_before: u64,
     /// Messages for the instance that no relay has taken yet, oldest first.
     unsent: Vec<Message>,
+    /// True once the outcome of the edge opened to us was published, or is not to be.
+    outcome_sent: bool,
     waiting_on: Option<String>,
 }
 
@@ -241,6 +244,8 @@ struct RingRecord {
     /// The messages still owed to the instance, as JSON, oldest first.
     #[serde(default)]
     unsent: Vec<String>,
+    #[serde(default)]
+    outcome_sent: bool,
 }
 
 const RECORD_VERSION: u8 = 1;
@@ -299,6 +304,7 @@ impl RingRun {
             claim: None,
             claim_not_before: 0,
             unsent: Vec::new(),
+            outcome_sent: false,
             waiting_on: None,
         }
     }
@@ -371,11 +377,72 @@ impl RingRun {
     /// True when nothing more will happen in this run. A ring that ended with a bond owed to
     /// us is not finished until our claim is paid, or the time to claim has passed.
     pub fn finished(&self) -> bool {
+        self.ended() && !self.outcome_owed()
+    }
+
+    /// True once the ring is over for us (and any bond we are owed is paid), whether or not the
+    /// outcome of our edge is published yet.
+    pub fn ended(&self) -> bool {
         match self.state {
             RingState::Success | RingState::Canceled => true,
             RingState::Partial => !self.owed || self.claim.as_ref().is_some_and(|c| c.paid),
             _ => false,
         }
+    }
+
+    /// The outcome of the edge opened to us, once the ring ended: opened, if our node confirmed
+    /// the channel from the member before us, else missing. We are the receiver: the member that
+    /// owed the channel cannot vouch for its own.
+    pub fn outcome(&self) -> Option<Outcome> {
+        if !matches!(self.state, RingState::Success | RingState::Partial) {
+            return None;
+        }
+        let ring = self.roster.as_ref()?.validate().ok()?;
+        let own = self.seat.node_key().ok()?;
+        let opener = ring.receives_from(&own)?;
+        let opened = self.in_confirmed;
+        Some(Outcome {
+            deal: Deal::Ring,
+            subject: ring.id(),
+            network: ring.terms.network,
+            nodes: [opener, own],
+            result: if opened {
+                OutcomeResult::Opened
+            } else {
+                OutcomeResult::Missing
+            },
+            closer: None,
+            funding_height: None,
+            close_height: None,
+            outpoint: (ring.terms.announce && opened)
+                .then(|| self.in_outpoint.clone())
+                .flatten(),
+            instance: Some(self.instance.to_hex()),
+        })
+    }
+
+    /// True when the ring ended and the outcome of our edge was not published yet.
+    pub fn outcome_owed(&self) -> bool {
+        !self.outcome_sent && self.outcome().is_some()
+    }
+
+    /// The outcome, ready to sign with our liquidity identity: our seat's binding as content,
+    /// dated when the ring closed.
+    pub fn outcome_event(&self) -> Option<Result<EventBuilder, OutcomeError>> {
+        let outcome = self.outcome()?;
+        Some(outcome.to_event_builder(&self.seat.binding).map(|builder| {
+            builder.custom_created_at(Timestamp::from(self.closed_at.unwrap_or_default()))
+        }))
+    }
+
+    /// True when the ring's channels are announced.
+    pub fn announced(&self) -> bool {
+        self.terms.announce
+    }
+
+    /// Records that the outcome was published, or is not to be.
+    pub fn set_outcome_sent(&mut self) {
+        self.outcome_sent = true;
     }
 
     /// Our bond, in a word: `-` (the ring has none), `awaited` (no invoice yet), `checked` (the
@@ -516,6 +583,7 @@ impl RingRun {
                 .map(Message::as_json)
                 .collect::<Result<_, _>>()
                 .map_err(|_| corrupt("a message that is owed"))?,
+            outcome_sent: self.outcome_sent,
         };
         serde_json::to_string(&record).map_err(|e| StoreError::Corrupt(e.to_string()))
     }
@@ -594,6 +662,7 @@ impl RingRun {
                 .map(Message::from_json)
                 .collect::<Result<_, _>>()
                 .map_err(|_| corrupt("a message that is owed"))?,
+            outcome_sent: record.outcome_sent,
             waiting_on: None,
         })
     }

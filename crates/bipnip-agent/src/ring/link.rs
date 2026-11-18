@@ -12,7 +12,7 @@ use mostro_core::prelude::Message;
 
 use super::run::{RingRun, RingRunError};
 use super::store::RingStore;
-use crate::lease::link::{Link, StepReport};
+use crate::lease::link::{Link, StepReport, publish_outcome};
 use crate::lease::store::StoreError;
 
 /// Sends the messages in order and stops at the first that no relay takes. Returns that one and
@@ -120,6 +120,20 @@ pub async fn step(
             send_or_owe(run, messages, link, store, &mut report).await?;
         }
         Err(e) => report.problems.push(format!("node: {e}")),
+    }
+    if run.outcome_owed() {
+        let done = match (link.outcomes().allows(run.announced()), run.outcome_event()) {
+            (true, Some(Ok(builder))) => publish_outcome(link, builder, &mut report).await,
+            (true, Some(Err(e))) => {
+                report.problems.push(format!("outcome: {e}"));
+                true
+            }
+            _ => true,
+        };
+        if done {
+            run.set_outcome_sent();
+            store.save(run)?;
+        }
     }
     Ok(report)
 }

@@ -504,7 +504,7 @@ async fn a_ring_of_three_completes_and_survives_restarts_on_the_way() {
         };
         table.deliver(run, i, closed).await.expect("closed");
         assert_eq!(run.state(), RingState::Success);
-        assert!(run.finished());
+        assert!(run.ended());
         assert_eq!(run.reported_confirmed(), &[0, 1, 2]);
     }
     assert_eq!(table.channels().len(), 3);
@@ -847,7 +847,7 @@ async fn nothing_is_opened_after_the_window_and_a_crash_after_opening_opens_noth
     };
     table.deliver(&mut again, 0, closed).await.expect("closed");
     assert_eq!(again.state(), RingState::Partial);
-    assert!(again.finished());
+    assert!(again.ended());
     assert!(
         again
             .tick(&table.members[0].node, NOW + 30)
@@ -891,7 +891,7 @@ async fn a_ring_can_be_left_while_it_fills_and_refusals_end_what_they_refuse() {
     let cancel = creator.cancel(9).expect("cancel");
     assert_eq!(cancel[0].get_inner_message_kind().action, Action::Cancel);
     assert_eq!(creator.state(), RingState::Canceled);
-    assert!(creator.finished());
+    assert!(creator.ended());
 
     // A take the instance refuses, and a ring the instance cancels while it fills.
     let request = |request_id: u64| JoinRequest {
@@ -1288,7 +1288,7 @@ async fn a_bonded_ring_canceled_after_the_commits_ends_the_run_and_a_plain_one_i
             .is_empty()
     );
     assert_eq!(runs[0].state(), RingState::Canceled);
-    assert!(runs[0].finished());
+    assert!(runs[0].ended());
 
     // Without a bond nothing can cancel a ring once its roster is fixed.
     let plain = Table::new(3);
@@ -1339,7 +1339,7 @@ async fn a_member_owed_a_bond_claims_the_exact_payout_and_sees_it_paid_on_its_ow
     assert!(!runs[0].finished());
     for (i, run) in runs.iter_mut().enumerate().skip(1) {
         assert_eq!(run.owed_status(), "-");
-        assert!(run.finished());
+        assert!(run.ended());
         let node = &table.members[i].node;
         assert!(run.tick(node, NOW).await.expect("tick").is_empty());
     }
@@ -1400,7 +1400,7 @@ async fn a_member_owed_a_bond_claims_the_exact_payout_and_sees_it_paid_on_its_ow
             .is_empty()
     );
     assert_eq!(run.owed_status(), "paid");
-    assert!(run.finished());
+    assert!(run.ended());
     let mut run = restarted(run);
     assert!(
         run.tick(node, NOW + 61 + 3_800)
@@ -1408,7 +1408,7 @@ async fn a_member_owed_a_bond_claims_the_exact_payout_and_sees_it_paid_on_its_ow
             .expect("tick")
             .is_empty()
     );
-    assert!(run.finished());
+    assert!(run.ended());
 }
 
 /// On a node that keeps no hold invoices (an LDK Server, or Core Lightning's `hold` plugin, which
@@ -1447,7 +1447,44 @@ async fn a_bond_claim_is_seen_paid_on_a_node_that_keeps_no_hold_invoices() {
         .expect("the payout");
     assert!(run.tick(&node, NOW + 60).await.expect("tick").is_empty());
     assert_eq!(run.owed_status(), "paid");
-    assert!(run.finished());
+    assert!(run.ended());
+}
+
+/// When a ring ends, each member writes up the edge opened to it: the member before it is the
+/// opener, and the result is what its own node confirmed.
+#[tokio::test]
+async fn a_member_owes_the_outcome_of_the_edge_opened_to_it() {
+    use mostro_core::outcome::{Deal, OutcomeResult};
+    let table = Table::new(3);
+    let (mut runs, ring) = table.opened(&[0, 1, 2]).await;
+    assert!(runs.iter().all(|run| run.outcome().is_none()));
+    let closed = RingIncoming::Closed {
+        order_id: table.order_id,
+        closed: RingClosed {
+            ring_id: ring.id(),
+            verified: vec![0, 1, 2],
+            slashed: vec![],
+        },
+    };
+    for (i, run) in runs.iter_mut().enumerate() {
+        table.deliver(run, i, closed.clone()).await.expect("closed");
+        assert!(run.ended());
+        let outcome = run.outcome().expect("an outcome");
+        let own = table.members[i].node_key();
+        assert_eq!(outcome.deal, Deal::Ring);
+        assert_eq!(outcome.subject, ring.id());
+        assert_eq!(
+            outcome.nodes,
+            [ring.receives_from(&own).expect("in it"), own]
+        );
+        assert!(matches!(
+            outcome.result,
+            OutcomeResult::Opened | OutcomeResult::Missing
+        ));
+        assert!(run.outcome_owed() && !run.finished());
+        run.set_outcome_sent();
+        assert!(run.finished());
+    }
 }
 
 /// A member checks the ring's rules on its own node's graph before it commits: the instance
@@ -1520,7 +1557,7 @@ async fn a_bond_that_is_never_paid_out_stops_being_claimed_after_the_claim_windo
     assert!(run.tick(node, end).await.expect("tick").is_empty());
     assert!(run.tick(node, end).await.expect("tick").is_empty());
     assert_eq!(run.owed_status(), "-");
-    assert!(run.finished());
+    assert!(run.ended());
 
     // A closing report that takes a bond in a ring without bonds is refused.
     let plain = Table::new(2);

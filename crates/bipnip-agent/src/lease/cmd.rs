@@ -155,14 +155,12 @@ pub(crate) async fn link_for(
         .wallet
         .liquidity_trade(trade_index)
         .map_err(|e| e.to_string())?;
+    let outcomes = session.config.policy.publish_outcomes;
     if let Some(hub) = session.hub {
-        return Ok(Link::shared(
-            hub.clone(),
-            identity,
-            trade,
-            instance.pubkey,
-            instance.pow,
-        ));
+        return Ok(
+            Link::shared(hub.clone(), identity, trade, instance.pubkey, instance.pow)
+                .with_outcomes(outcomes),
+        );
     }
     Link::connect(
         &session.config.relays,
@@ -173,6 +171,7 @@ pub(crate) async fn link_for(
         since,
     )
     .await
+    .map(|link| link.with_outcomes(outcomes))
 }
 
 /// Says so when a first message reached no relay. The run is stored as owing it, and the loop

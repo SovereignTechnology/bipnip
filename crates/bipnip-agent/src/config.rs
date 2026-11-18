@@ -32,6 +32,7 @@
 //! allowed_peers = []                  # node keys (66 hex); empty means any
 //! min_seller_channels = 0             # a take from a seller with fewer public channels parks
 //! min_seller_capacity_sat = 0         # likewise for less public capacity, in satoshi
+//! publish_outcomes = "announced"     # signed outcomes: "announced" channels, "all", "none"
 //! ```
 //!
 //! A single `[instance]` table is read as one `[[instance]]`.
@@ -126,6 +127,31 @@ pub struct ClnConfig {
     pub rpc_socket: PathBuf,
 }
 
+/// Which of its finished leases and ring edges the agent writes up as signed outcomes
+/// (kind 8735, `docs/nips/liquidity-outcomes.md`).
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum PublishOutcomes {
+    /// Announced channels only: the graph already shows them and their ends.
+    #[default]
+    Announced,
+    /// Every channel, unannounced ones too (with no outpoint).
+    All,
+    /// None.
+    None,
+}
+
+impl PublishOutcomes {
+    /// Whether an outcome about a channel that is (or is not) announced is written.
+    pub fn allows(self, announced: bool) -> bool {
+        match self {
+            PublishOutcomes::Announced => announced,
+            PublishOutcomes::All => true,
+            PublishOutcomes::None => false,
+        }
+    }
+}
+
 /// Limits on what the agent does with the node's money without being asked again.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -160,6 +186,9 @@ pub struct PolicyConfig {
     /// no such limit.
     #[serde(default)]
     pub min_seller_capacity_sat: u64,
+    /// Which finished leases and ring edges are written up as signed outcomes.
+    #[serde(default)]
+    pub publish_outcomes: PublishOutcomes,
 }
 
 #[derive(Debug, Deserialize)]

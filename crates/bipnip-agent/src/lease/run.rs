@@ -61,14 +61,15 @@ use mostro_core::bond::payout_sat;
 use mostro_core::lease::{LeaseContract, LeaseTerms};
 use mostro_core::lease_message::{LeaseInvoice, LeaseOffer};
 use mostro_core::node_binding::Network;
+use mostro_core::outcome::{ClosedBy as Closer, Deal, Outcome, OutcomeError, OutcomeResult, Role};
 use mostro_core::prelude::{CantDoReason, Message};
-use nostr_sdk::prelude::{Event, Keys, PublicKey};
+use nostr_sdk::prelude::{Event, EventBuilder, Keys, PublicKey, Timestamp};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::store::StoreError;
-use super::watch::Watch;
+use super::watch::{ClosedBy, Ending, Watch};
 use super::{BuyerLease, LeaseStepError, SellerLease};
 use crate::lease_wire::{self, Incoming, WireError};
 use crate::ring::bond::{self, BondClaim, BondPayment};
@@ -172,6 +173,59 @@ impl From<LeaseStepError> for RunError {
     }
 }
 
+/// A lease's outcome as the party in `us` states it: the two nodes, the closer as our node saw it
+/// (for a lease closed early), the heights our node saw, the outpoint for an announced channel.
+fn lease_outcome(
+    contract: &LeaseContract,
+    watch: &Watch,
+    result: OutcomeResult,
+    us: Role,
+    outpoint: Option<&str>,
+    instance: &PublicKey,
+) -> Outcome {
+    let them = if us == Role::Seller {
+        Role::Buyer
+    } else {
+        Role::Seller
+    };
+    let closer = (result == OutcomeResult::ClosedEarly).then(|| {
+        match watch.gone.map(|gone| gone.closed_by) {
+            Some(ClosedBy::Us) => Closer::Party(us),
+            Some(ClosedBy::Peer) => Closer::Party(them),
+            _ => Closer::Unknown,
+        }
+    });
+    Outcome {
+        deal: Deal::Lease,
+        subject: contract.id(),
+        network: contract.network,
+        nodes: [contract.seller_node, contract.buyer_node],
+        result,
+        closer,
+        funding_height: watch.funding_height,
+        close_height: watch
+            .funding_height
+            .and(watch.gone.and_then(|gone| gone.close_height)),
+        outpoint: contract
+            .terms
+            .announce
+            .then(|| outpoint.map(str::to_string))
+            .flatten(),
+        instance: Some(instance.to_hex()),
+    }
+}
+
+/// The unsigned outcome event: `binding` as content, dated `ended_at`.
+fn outcome_builder(
+    outcome: &Outcome,
+    binding: &str,
+    ended_at: Option<u64>,
+) -> Result<EventBuilder, OutcomeError> {
+    Ok(outcome
+        .to_event_builder(binding)?
+        .custom_created_at(Timestamp::from(ended_at.unwrap_or_default())))
+}
+
 /// Stores the other party's trade key, or checks it has not changed.
 fn learn_peer(known: &mut Option<PublicKey>, trade_key: PublicKey) -> Result<(), RunError> {
     match known {
@@ -257,6 +311,8 @@ pub struct SellerRun {
     ended_at: Option<u64>,
     /// Completion invoices sent so far.
     completion_issued: u8,
+    /// True once this lease's outcome was published, or found not to be published.
+    outcome_sent: bool,
     /// True when the answer the current state implies has not reached a relay.
     unsent: bool,
 }
@@ -294,6 +350,8 @@ struct SellerRecord {
     ended_at: Option<u64>,
     #[serde(default)]
     completion_issued: u8,
+    #[serde(default)]
+    outcome_sent: bool,
     unsent: bool,
 }
 
@@ -350,6 +408,7 @@ impl SellerRun {
             watch: Watch::default(),
             ended_at: None,
             completion_issued: 0,
+            outcome_sent: false,
             unsent: false,
         };
         (run, Outgoing::ToInstance(message))
@@ -391,6 +450,7 @@ impl SellerRun {
             watch: self.watch,
             ended_at: self.ended_at,
             completion_issued: self.completion_issued,
+            outcome_sent: self.outcome_sent,
             unsent: self.unsent,
         })
     }
@@ -473,6 +533,7 @@ impl SellerRun {
             watch: record.watch,
             ended_at: record.ended_at,
             completion_issued,
+            outcome_sent: record.outcome_sent,
             unsent: record.unsent,
         })
     }
@@ -564,6 +625,11 @@ impl SellerRun {
     /// True when nothing more will happen in this run: it was canceled, the lease ran its
     /// length (and the completion share is paid or was never paid), or the channel went first.
     pub fn finished(&self) -> bool {
+        self.ended() && !self.outcome_owed()
+    }
+
+    /// True once the run is over, whether or not its outcome is published yet.
+    pub fn ended(&self) -> bool {
         matches!(
             self.state,
             SellerState::Canceled
@@ -573,11 +639,66 @@ impl SellerRun {
         )
     }
 
+    /// How this lease ended, as a signed outcome states it, once it has: kept (it ran its
+    /// length), closed early, or unpaid. `None` while it runs, and for a lease that ended any
+    /// other way (canceled, or gone with our node unable to tell when).
+    pub fn outcome(&self) -> Option<Outcome> {
+        let contract = self.contract()?;
+        let result = match self.state {
+            SellerState::Complete => OutcomeResult::Kept,
+            SellerState::Unpaid => OutcomeResult::Unpaid,
+            SellerState::Closed
+                if self
+                    .watch
+                    .gone
+                    .is_some_and(|gone| gone.ending == Ending::Early) =>
+            {
+                OutcomeResult::ClosedEarly
+            }
+            _ => return None,
+        };
+        Some(lease_outcome(
+            contract,
+            &self.watch,
+            result,
+            Role::Seller,
+            self.outpoint.as_deref(),
+            &self.instance,
+        ))
+    }
+
+    /// True when this lease has an outcome that was not published yet.
+    pub fn outcome_owed(&self) -> bool {
+        !self.outcome_sent && self.outcome().is_some()
+    }
+
+    /// The outcome, ready to sign with our liquidity identity: our binding as content, dated
+    /// when the lease ended, so the same outcome made twice is the same event.
+    pub fn outcome_event(&self) -> Option<Result<EventBuilder, OutcomeError>> {
+        let outcome = self.outcome()?;
+        Some(outcome_builder(
+            &outcome,
+            &self.offer.binding,
+            self.ended_at,
+        ))
+    }
+
+    /// True when the leased channel is announced.
+    pub fn announced(&self) -> bool {
+        self.offer.announce
+    }
+
+    /// Records that the outcome was published, or is not to be.
+    pub fn set_outcome_sent(&mut self) {
+        self.outcome_sent = true;
+    }
+
     /// True while the lease is active and only being watched: its channel is looked at until
     /// the lease has run its length, and its completion share, if any, is billed. No money of
     /// ours moves any more.
     pub fn watching(&self) -> bool {
         matches!(self.state, SellerState::Active | SellerState::Completing)
+            || (self.ended() && self.outcome_owed())
     }
 
     /// True when a command driving the run may stop: the run is finished, or the lease is
@@ -1123,6 +1244,8 @@ pub struct BuyerRun {
     ended_at: Option<u64>,
     /// The completion invoice we accepted, if any.
     completion: Option<CompletionPayment>,
+    /// True once this lease's outcome was published, or found not to be published.
+    outcome_sent: bool,
     /// True when the answer the current state implies has not reached a relay.
     unsent: bool,
 }
@@ -1155,6 +1278,8 @@ struct BuyerRecord {
     ended_at: Option<u64>,
     #[serde(default)]
     completion: Option<CompletionPayment>,
+    #[serde(default)]
+    outcome_sent: bool,
     unsent: bool,
 }
 
@@ -1193,6 +1318,7 @@ impl BuyerRun {
             watch: self.watch,
             ended_at: self.ended_at,
             completion: self.completion.clone(),
+            outcome_sent: self.outcome_sent,
             unsent: self.unsent,
         })
     }
@@ -1246,6 +1372,7 @@ impl BuyerRun {
             watch: record.watch,
             ended_at: record.ended_at,
             completion: record.completion,
+            outcome_sent: record.outcome_sent,
             unsent: record.unsent,
         })
     }
@@ -1301,6 +1428,7 @@ impl BuyerRun {
             watch: Watch::default(),
             ended_at: None,
             completion: None,
+            outcome_sent: false,
             unsent: false,
         };
         Ok((run, Outgoing::ToInstance(message)))
@@ -1619,6 +1747,11 @@ impl BuyerRun {
     /// length (and the completion share, if any, is paid or was never billed), or the channel
     /// went first.
     pub fn finished(&self) -> bool {
+        self.ended() && !self.outcome_owed()
+    }
+
+    /// True once the run is over, whether or not its outcome is published yet.
+    pub fn ended(&self) -> bool {
         matches!(
             self.state,
             BuyerState::Canceled | BuyerState::Complete | BuyerState::Closed | BuyerState::Unbilled
@@ -1626,9 +1759,58 @@ impl BuyerRun {
     }
 
     /// True while the lease is active and only being watched: its channel is looked at until
-    /// the lease has run its length, and the completion share, if any, is paid.
+    /// the lease has run its length, and the completion share, if any, is paid. Also while an
+    /// outcome is still to be published.
     pub fn watching(&self) -> bool {
-        self.state == BuyerState::Active
+        self.state == BuyerState::Active || (self.ended() && self.outcome_owed())
+    }
+
+    /// How this lease ended, as a signed outcome states it, once it has: kept (it ran its
+    /// length, billed or not) or closed early. `None` while it runs, and for a lease that ended
+    /// any other way.
+    pub fn outcome(&self) -> Option<Outcome> {
+        let result = match self.state {
+            BuyerState::Complete | BuyerState::Unbilled => OutcomeResult::Kept,
+            BuyerState::Closed
+                if self
+                    .watch
+                    .gone
+                    .is_some_and(|gone| gone.ending == Ending::Early) =>
+            {
+                OutcomeResult::ClosedEarly
+            }
+            _ => return None,
+        };
+        Some(lease_outcome(
+            self.lease.contract(),
+            &self.watch,
+            result,
+            Role::Buyer,
+            self.outpoint.as_deref(),
+            &self.instance,
+        ))
+    }
+
+    /// True when this lease has an outcome that was not published yet.
+    pub fn outcome_owed(&self) -> bool {
+        !self.outcome_sent && self.outcome().is_some()
+    }
+
+    /// The outcome, ready to sign with our liquidity identity: our binding as content, dated
+    /// when the lease ended.
+    pub fn outcome_event(&self) -> Option<Result<EventBuilder, OutcomeError>> {
+        let outcome = self.outcome()?;
+        Some(outcome_builder(&outcome, &self.binding, self.ended_at))
+    }
+
+    /// True when the leased channel is announced.
+    pub fn announced(&self) -> bool {
+        self.lease.contract().terms.announce
+    }
+
+    /// Records that the outcome was published, or is not to be.
+    pub fn set_outcome_sent(&mut self) {
+        self.outcome_sent = true;
     }
 
     /// True when a command driving the run may stop: the run is finished, or the lease is

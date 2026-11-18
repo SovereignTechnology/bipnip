@@ -28,10 +28,13 @@ use std::collections::HashSet;
 
 use bipnip_ln::LightningBackend;
 use mostro_core::prelude::Message;
-use nostr_sdk::prelude::{Client, Event, EventId, Filter, Keys, Kind, PublicKey, Timestamp};
+use nostr_sdk::prelude::{
+    Client, Event, EventBuilder, EventId, Filter, FinalizeEvent, Keys, Kind, PublicKey, Timestamp,
+};
 
 use super::run::{BuyerRun, Outgoing, RunError, SellerRun};
 use super::store::{LeaseStore, StoreError};
+use crate::config::PublishOutcomes;
 use crate::lease_wire::{self, Incoming};
 use crate::relay::{RELAY_TIMEOUT, connected};
 use crate::ring_wire::{self, RingIncoming};
@@ -65,6 +68,8 @@ pub struct Link {
     pow: u8,
     since: Timestamp,
     done: HashSet<EventId>,
+    /// Which finished leases and ring edges this link writes up as outcomes.
+    outcomes: PublishOutcomes,
 }
 
 impl std::fmt::Debug for Link {
@@ -94,6 +99,7 @@ impl Link {
             pow,
             since: Timestamp::from(since),
             done: HashSet::new(),
+            outcomes: PublishOutcomes::default(),
         })
     }
 
@@ -115,7 +121,23 @@ impl Link {
             pow,
             since: Timestamp::from(0),
             done: HashSet::new(),
+            outcomes: PublishOutcomes::default(),
         }
+    }
+
+    /// Sets which finished leases and ring edges this link writes up as outcomes
+    /// (`[policy] publish_outcomes`; announced channels only unless set).
+    pub fn with_outcomes(mut self, outcomes: PublishOutcomes) -> Self {
+        self.outcomes = outcomes;
+        self
+    }
+
+    /// Signs `builder` with our liquidity identity and publishes it. For outcomes.
+    pub async fn publish_signed(&self, builder: EventBuilder) -> Result<(), String> {
+        let event = builder
+            .finalize(&self.identity)
+            .map_err(|e| format!("cannot sign: {e}"))?;
+        self.publish(&event).await
     }
 
     /// Hands a shared link everything the relays now hold for its trade key. The next poll
@@ -379,6 +401,20 @@ pub async fn step_seller(
         }
         Err(e) => report.problems.push(format!("node: {e}")),
     }
+    if run.outcome_owed() {
+        let done = match (link.outcomes.allows(run.announced()), run.outcome_event()) {
+            (true, Some(Ok(builder))) => publish_outcome(link, builder, &mut report).await,
+            (true, Some(Err(e))) => {
+                report.problems.push(format!("outcome: {e}"));
+                true
+            }
+            _ => true,
+        };
+        if done {
+            run.set_outcome_sent();
+            store.save_seller(run)?;
+        }
+    }
     Ok(report)
 }
 
@@ -442,5 +478,44 @@ pub async fn step_buyer(
         }
         Err(e) => report.problems.push(format!("node: {e}")),
     }
+    if run.outcome_owed() {
+        let done = match (link.outcomes.allows(run.announced()), run.outcome_event()) {
+            (true, Some(Ok(builder))) => publish_outcome(link, builder, &mut report).await,
+            (true, Some(Err(e))) => {
+                report.problems.push(format!("outcome: {e}"));
+                true
+            }
+            _ => true,
+        };
+        if done {
+            run.set_outcome_sent();
+            store.save_buyer(run)?;
+        }
+    }
     Ok(report)
+}
+
+/// Publishes an outcome; true once a relay took it. A failure is told and tried on the next
+/// step: the event is dated when the run ended, so it is the same event every time.
+pub(crate) async fn publish_outcome(
+    link: &Link,
+    builder: EventBuilder,
+    report: &mut StepReport,
+) -> bool {
+    match link.publish_signed(builder).await {
+        Ok(()) => true,
+        Err(e) => {
+            report
+                .problems
+                .push(format!("outcome not published yet: {e}"));
+            false
+        }
+    }
+}
+
+impl Link {
+    /// Which finished leases and ring edges this link writes up as outcomes.
+    pub fn outcomes(&self) -> PublishOutcomes {
+        self.outcomes
+    }
 }

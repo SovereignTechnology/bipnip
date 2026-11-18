@@ -52,6 +52,7 @@ response names runs, orders, states, amounts, public node keys and outpoints.
 | `ring.list` | none | every stored ring run |
 | `binding.publish` | none | the binding event's id and the relays that took it |
 | `approvals` | none | the parked requests: `approval`, what was asked, which limit it is over and by how much |
+| `record` | `node` (66 hex) | `record`: the node's record from signed outcomes on the relays (`kept`, `opened`, `missing`, `closed_early`, `disputed`, `unpaid`, `counterparties`, `subjects`), and `outcomes_read` |
 | `approve` | `approval` | the run it started |
 | `deny` | `approval` | none |
 | `watch` | `run`? | no result until the client disconnects; a status line for every change of state of the run, or of every run |
@@ -89,6 +90,12 @@ and was never paid) or `unbilled` (a buyer was never billed).
 A run that finished more than 30 days ago is put away: its files move into a `done` directory beside the
 others (`<data_dir>/leases/done`, `rings/done`, `policy/done`). Nothing is deleted, and such a run is no
 longer listed.
+
+When a lease ends (kept, closed early, unpaid) or a ring the agent sat in ends, the agent writes a signed
+outcome (kind 8735, `docs/nips/liquidity-outcomes.md`) with its liquidity identity: for announced channels
+by default (`[policy] publish_outcomes`). A ring member writes up the edge opened to it. `record` counts a
+node's outcomes by the draft's reading rules, trusting the configured instances; it does not yet confirm
+an outcome from this agent's own graph.
 
 ## Policy
 
