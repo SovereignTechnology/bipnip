@@ -41,7 +41,7 @@ response names runs, orders, states, amounts, public node keys and outpoints.
 | method | params | result |
 |---|---|---|
 | `status` | none | agent version, network, node key and sync state, instances, counts of runs by state, today's use of each limit |
-| `orders` | `kind`?: `lease` \| `ring`; `instance`? | the open orders of the configured instances, each read from the relays and verified as the one-shot commands do |
+| `orders` | `kind`?: `lease` \| `ring`; `instance`?; `capacity_sat`?; `max_fee_sat`? | one book over the configured instances (see below) |
 | `lease.offer` | `min_capacity_sat`, `max_capacity_sat`, `duration_blocks`, `fee_base_sat`, `fee_ppm`, `feerate_sat_vb`, `upfront_percent`?, `min_confirmations`?, `announce`?, `expires_in_secs`?, `bond_sat`?, `instance`? | `run`, `state` |
 | `lease.take` | `order_id`, `capacity_sat`, `node_address`?, `instance`? | `run`, `state` |
 | `lease.cancel` | `run` | `state` |
@@ -62,6 +62,16 @@ is saved and its first message is on its way; the run then goes on in the agent.
 first writes a `{"status": "run", …}` line for each run under way, then `{"status": "watching"}`, then a
 `run` line for every change and a `{"status": "problem", "run": "…", "problem": "…"}` line for whatever
 went wrong in a step. It ends when the client closes the connection.
+
+`orders` reads every configured instance's order events in one request over the agent's relay connection,
+keeps the newest version of each (an order is named by its instance and its id together) and only events
+the instance signed, then lists the open ones on the agent's network: leases first, cheapest first by
+`ppb_per_block` (the whole fee per satoshi of capacity per block, in parts per billion, at `capacity_sat` if
+given, else at the largest capacity the order offers), then rings, largest channel first. `capacity_sat` keeps
+leases that offer it and rings at least that large; `max_fee_sat` keeps leases whose whole fee at that
+capacity is at most it. Each lease also gives `priced_capacity_sat`, `fee_sat` and `seller_listings` (how
+many open leases its seller's node has on the book). The answer names `instances_silent` (no order event
+from them at all) and `relays_down` (relays the agent is not connected to) instead of failing.
 
 A run is described the same way everywhere (`lease.list`, `ring.list`, `watch`, the answer to a request
 that starts one): `run`, `role` (`seller`, `buyer` or `member`), `order_id`, `state`, `finished`,

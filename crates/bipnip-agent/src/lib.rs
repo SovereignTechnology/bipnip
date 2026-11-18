@@ -2,6 +2,7 @@
 //! (`docs/decisions/0002-instance-and-agent-roles.md`).
 
 pub mod binding;
+pub mod book;
 pub mod config;
 pub mod daemon;
 pub mod keys;

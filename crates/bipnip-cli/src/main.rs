@@ -4,7 +4,8 @@
 //!
 //! ```text
 //! bipnip [--socket PATH] status
-//! bipnip [--socket PATH] orders [--kind lease|ring] [--instance KEY]
+//! bipnip [--socket PATH] orders [--kind lease|ring] [--instance KEY] [--capacity SAT]
+//!         [--max-fee SAT]
 //! bipnip [--socket PATH] lease offer --min-capacity SAT --max-capacity SAT --duration BLOCKS
 //!         --fee-base SAT --fee-ppm PPM --feerate SAT_PER_VB [--upfront PERCENT] [--confs N]
 //!         [--private] [--expires-in SECS] [--bond SAT] [--instance KEY]
@@ -168,6 +169,8 @@ fn request(args: &[String]) -> Result<(String, Value), String> {
             let mut options = Options::parse(rest, &[])?;
             options.text(&mut params, "kind", "kind");
             options.text(&mut params, "instance", "instance");
+            options.number(&mut params, "capacity", "capacity_sat", false)?;
+            options.number(&mut params, "max-fee", "max_fee_sat", false)?;
             no_words(options)?;
             "orders"
         }
@@ -387,6 +390,11 @@ mod tests {
             ("watch ring-0f", "watch", json!({"run": "ring-0f"})),
             ("orders", "orders", json!({})),
             ("orders --kind ring", "orders", json!({"kind": "ring"})),
+            (
+                "orders --capacity 500000 --max-fee 900",
+                "orders",
+                json!({"capacity_sat": 500_000, "max_fee_sat": 900}),
+            ),
             ("lease list", "lease.list", json!({})),
             ("ring list", "ring.list", json!({})),
             (

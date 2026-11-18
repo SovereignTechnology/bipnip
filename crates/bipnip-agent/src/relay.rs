@@ -208,26 +208,24 @@ pub enum OpenOrder {
     Ring(RingOrder),
 }
 
-/// Every lease and ring order `instance` has open at `now`, newest version of each. Only events
-/// that verify and are signed by `instance` count, as for [`fetch_lease_order`].
-pub async fn fetch_open_orders(
-    instance: &PublicKey,
-    relays: &[String],
+/// The newest version of every order in `events` that one of `instances` signed, kept when it is
+/// open at `now`, with the instance that published it. An event signed by anyone else, or that
+/// does not verify as a lease or ring order, is passed over. Orders are told apart by instance
+/// and order id together, so two instances cannot shadow each other's orders.
+pub fn newest_open_orders(
+    events: &[Event],
+    instances: &[PublicKey],
     now: u64,
-) -> Result<Vec<OpenOrder>, String> {
-    let client = connected(relays).await?;
-    let filter = Filter::new()
-        .kind(Kind::Custom(KIND_LEASE_ORDER))
-        .author(*instance);
-    let fetched = client.fetch_events(filter).timeout(RELAY_TIMEOUT).await;
-    client.shutdown().await;
-    let events = fetched.map_err(|e| format!("fetch: {e}"))?;
+) -> Vec<(PublicKey, OpenOrder)> {
     let mut newest: Vec<&Event> = Vec::new();
-    for event in events.iter().filter(|event| event.pubkey == *instance) {
+    for event in events
+        .iter()
+        .filter(|event| instances.contains(&event.pubkey))
+    {
         let id = event.tags.identifier();
         match newest
             .iter_mut()
-            .find(|known| known.tags.identifier() == id)
+            .find(|known| known.pubkey == event.pubkey && known.tags.identifier() == id)
         {
             Some(known) if known.created_at < event.created_at => *known = event,
             Some(_) => {}
@@ -238,15 +236,65 @@ pub async fn fetch_open_orders(
     for event in newest {
         if let Ok(order) = LeaseOrder::from_event(event) {
             if order.is_open(now) {
-                orders.push(OpenOrder::Lease(order));
+                orders.push((event.pubkey, OpenOrder::Lease(order)));
             }
         } else if let Ok(order) = RingOrder::from_event(event)
             && order.is_open(now)
         {
-            orders.push(OpenOrder::Ring(order));
+            orders.push((event.pubkey, OpenOrder::Ring(order)));
         }
     }
-    Ok(orders)
+    orders
+}
+
+/// What one request for every instance's orders found.
+#[derive(Debug, Default)]
+pub struct Books {
+    /// Every open order, with the instance that published it.
+    pub orders: Vec<(PublicKey, OpenOrder)>,
+    /// Instances the relays held no order event from at all.
+    pub silent: Vec<PublicKey>,
+    /// Relays the client is not connected to.
+    pub relays_down: Vec<String>,
+}
+
+/// Every open order of `instances` at `now`, in one request through `client` (already
+/// connected). A relay that is down is named in the answer instead of failing it; the request
+/// fails only when it fails as a whole.
+pub async fn fetch_books(
+    client: &Client,
+    instances: &[PublicKey],
+    now: u64,
+) -> Result<Books, String> {
+    if instances.is_empty() {
+        return Ok(Books::default());
+    }
+    let filter = Filter::new()
+        .kind(Kind::Custom(KIND_LEASE_ORDER))
+        .authors(instances.iter().copied());
+    let events = client
+        .fetch_events(filter)
+        .timeout(RELAY_TIMEOUT)
+        .await
+        .map_err(|e| format!("fetch: {e}"))?;
+    let events: Vec<Event> = events.into_iter().collect();
+    let silent = instances
+        .iter()
+        .filter(|instance| !events.iter().any(|event| event.pubkey == **instance))
+        .copied()
+        .collect();
+    let mut relays_down: Vec<String> = Vec::new();
+    for (url, relay) in client.relays().await {
+        if !relay.status().is_connected() {
+            relays_down.push(url.to_string());
+        }
+    }
+    relays_down.sort();
+    Ok(Books {
+        orders: newest_open_orders(&events, instances, now),
+        silent,
+        relays_down,
+    })
 }
 
 /// The newest lease order `instance` published under `order_id`, if the relays hold one. Only

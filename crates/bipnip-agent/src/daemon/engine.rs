@@ -29,6 +29,7 @@ use super::api::{
 };
 use super::policy::{Ask, Grant, Guard, Parked, PolicyStore, Usage, over};
 use crate::binding::make_binding_event;
+use crate::book;
 use crate::config::{Config, InstanceConfig, InstanceEntry};
 use crate::keys::Wallet;
 use crate::lease::cmd::{
@@ -777,34 +778,43 @@ impl Engine {
         }
     }
 
+    /// One book over the instances asked for: a single request through the shared relay
+    /// connection, the newest version of each order, filtered and sorted ([`book::merge`]).
     async fn orders(&mut self, params: &OrdersParams) -> Result<Value, ApiError> {
-        let instances: Vec<InstanceConfig> = match params.instance.as_deref() {
-            Some(named) => vec![self.instance(Some(named))?],
-            None => self.instances.clone(),
+        let instances: Vec<PublicKey> = match params.instance.as_deref() {
+            Some(named) => vec![self.instance(Some(named))?.pubkey],
+            None => self
+                .instances
+                .iter()
+                .map(|instance| instance.pubkey)
+                .collect(),
         };
-        let now = unix_now();
-        let mut orders = Vec::new();
-        for instance in &instances {
-            let open = relay::fetch_open_orders(&instance.pubkey, &self.config.relays, now)
-                .await
-                .map_err(|e| ApiError::new(Code::Relay, e))?;
-            for order in &open {
-                let wanted = match params.kind {
-                    None => true,
-                    Some(OrderKind::Lease) => matches!(order, OpenOrder::Lease(_)),
-                    Some(OrderKind::Ring) => matches!(order, OpenOrder::Ring(_)),
-                };
-                // Orders on another network are not ours to take.
-                let network = match order {
-                    OpenOrder::Lease(order) => order.network,
-                    OpenOrder::Ring(order) => order.network,
-                };
-                if wanted && network == self.config.network {
-                    orders.push(order_json(&instance.pubkey, order));
+        let books = relay::fetch_books(&self.client, &instances, unix_now())
+            .await
+            .map_err(|e| ApiError::new(Code::Relay, e))?;
+        let query = book::Query {
+            leases: params.kind.map(|kind| kind == OrderKind::Lease),
+            capacity_sat: params.capacity_sat,
+            max_fee_sat: params.max_fee_sat,
+        };
+        let orders: Vec<Value> = book::merge(books.orders, self.config.network, &query)
+            .iter()
+            .map(|listed| {
+                let mut value = order_json(&listed.instance, &listed.order);
+                if let Some(price) = listed.price {
+                    value["priced_capacity_sat"] = json!(price.capacity_sat);
+                    value["fee_sat"] = json!(price.fee_sat);
+                    value["ppb_per_block"] = json!(price.ppb_per_block);
+                    value["seller_listings"] = json!(listed.seller_listings);
                 }
-            }
-        }
-        Ok(json!({"orders": orders}))
+                value
+            })
+            .collect();
+        Ok(json!({
+            "orders": orders,
+            "instances_silent": books.silent.iter().map(PublicKey::to_hex).collect::<Vec<_>>(),
+            "relays_down": books.relays_down,
+        }))
     }
 
     /// Starts the run a request asks for: prepares it with every check the one-shot command
