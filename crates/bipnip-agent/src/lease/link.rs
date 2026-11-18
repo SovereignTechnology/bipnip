@@ -369,7 +369,7 @@ pub async fn step_seller(
             }
         }
     }
-    match run.tick(backend).await {
+    match run.tick(backend, now).await {
         Ok(outgoing) => {
             store.save_seller(run)?;
             if !send_all(link, &outgoing, &mut report).await {
@@ -382,13 +382,14 @@ pub async fn step_seller(
     Ok(report)
 }
 
-/// One step of a buyer's run: the messages waiting on the relays, then a look at the node.
-/// Fails only when the run cannot be saved.
+/// One step of a buyer's run at `now` (unix seconds): the messages waiting on the relays, then
+/// a look at the node. Fails only when the run cannot be saved.
 pub async fn step_buyer(
     run: &mut BuyerRun,
     link: &mut Link,
     backend: &dyn LightningBackend,
     store: &LeaseStore,
+    now: u64,
 ) -> Result<StepReport, StoreError> {
     let mut report = StepReport::default();
     if run.unsent() {
@@ -407,7 +408,7 @@ pub async fn step_buyer(
         Ok(received) => {
             for message in received {
                 match run
-                    .on_message(message.incoming, &message.sender, backend)
+                    .on_message(message.incoming, &message.sender, backend, now)
                     .await
                 {
                     Ok(outgoing) => {
@@ -431,7 +432,7 @@ pub async fn step_buyer(
             }
         }
     }
-    match run.tick(backend).await {
+    match run.tick(backend, now).await {
         Ok(outgoing) => {
             store.save_buyer(run)?;
             if !send_all(link, &outgoing, &mut report).await {

@@ -64,10 +64,17 @@ first writes a `{"status": "run", …}` line for each run under way, then `{"sta
 went wrong in a step. It ends when the client closes the connection.
 
 A run is described the same way everywhere (`lease.list`, `ring.list`, `watch`, the answer to a request
-that starts one): `run`, `role` (`seller`, `buyer` or `member`), `order_id`, `state`, `finished`, and
-`line`, the one-line summary the one-shot commands print; then, by role, `lease`, `ring`, `channel`,
-`bond`, `owed_bond`, `waiting_on`. The lists add `under_way` and, for a run the agent had to stop because
-it could not be saved, `halted`.
+that starts one): `run`, `role` (`seller`, `buyer` or `member`), `order_id`, `state`, `finished`,
+`watching`, and `line`, the one-line summary the one-shot commands print; then, by role, `lease`, `ring`,
+`channel`, `bond`, `owed_bond`, `waiting_on`. The lists add `under_way` and, for a run the agent had to
+stop because it could not be saved, `halted`.
+
+A lease that is active is `watching` until it ends: the agent looks at the leased channel on its own node
+once a minute until the lease has run its length (then bills or pays the completion share) or the channel
+is gone. Such a run is neither `finished` nor `under_way`: it holds no slot under `max_runs`. `status`
+counts them under `runs.watching`. A lease ends `complete` (it ran its length; the completion share, if
+any, is paid), `closed` (the channel went first, or the node cannot tell when), `unpaid` (a seller billed
+and was never paid) or `unbilled` (a buyer was never billed).
 
 A run that finished more than 30 days ago is put away: its files move into a `done` directory beside the
 others (`<data_dir>/leases/done`, `rings/done`, `policy/done`). Nothing is deleted, and such a run is no
@@ -81,7 +88,7 @@ max_fee_per_lease_sat = 0        # a buyer's whole fee for one lease, upfront an
 max_fee_per_day_sat = 0          # all leases taken in a day
 max_capacity_per_day_sat = 0     # channels this agent opens in a day: leases sold, rings
 max_bond_sat = 0                 # the largest bond locked at an instance
-max_runs = 0                     # runs that are not finished, at once
+max_runs = 0                     # runs under way at once (not finished, not only watched)
 allowed_peers = []               # node keys; empty means any
 ```
 

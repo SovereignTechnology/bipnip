@@ -258,6 +258,7 @@ async fn a_lease_runs_over_a_relay_and_survives_both_agents_restarting() {
             &mut buyer_link,
             &wired.stage.buyer_node,
             &wired.buyer_store,
+            stage_now,
         )
         .await
         .expect("step");
@@ -405,7 +406,10 @@ async fn steps_that_reached_the_node_before_a_crash_are_not_done_twice() {
     let report = stage.open(&mut seller).await;
     stage.to_buyer(&mut buyer, &report).await.expect("report");
     stage.confirm(&seller);
-    let out = buyer.tick(&stage.buyer_node).await.expect("tick");
+    let out = buyer
+        .tick(&stage.buyer_node, super::super::NOW)
+        .await
+        .expect("tick");
     let before = seller.to_json().expect("json");
     stage
         .peer_to_seller(&mut seller, &out[0])

@@ -428,12 +428,14 @@ pub fn describe_buyer(run: &BuyerRun) -> String {
     )
 }
 
+/// A command stops at rest: a lease that is active and was paid for in full upfront is left to
+/// the daemon to watch.
 fn seller_done(run: &SellerRun) -> bool {
-    run.finished()
+    run.at_rest()
 }
 
 fn buyer_done(run: &BuyerRun) -> bool {
-    run.finished()
+    run.at_rest()
 }
 
 fn tell(report: StepReport, say: &mut dyn FnMut(String)) {
@@ -481,7 +483,7 @@ pub async fn run_buyer(
     let store = store(session.config)?;
     let mut last = None;
     loop {
-        let report = step_buyer(run, link, session.backend, &store)
+        let report = step_buyer(run, link, session.backend, &store, unix_now())
             .await
             .map_err(|e| e.to_string())?;
         tell(report, say);
@@ -563,7 +565,7 @@ pub async fn resume(
             }
             busy = true;
             let before = run.state();
-            let report = step_buyer(run, link, session.backend, &store)
+            let report = step_buyer(run, link, session.backend, &store, unix_now())
                 .await
                 .map_err(|e| e.to_string())?;
             tell(report, say);

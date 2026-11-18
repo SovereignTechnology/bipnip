@@ -19,6 +19,7 @@ pub mod cmd;
 pub mod link;
 pub mod run;
 pub mod store;
+pub mod watch;
 
 use std::path::Path;
 use std::str::FromStr;
