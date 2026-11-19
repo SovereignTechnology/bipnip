@@ -474,7 +474,9 @@ async fn what_is_not_a_page_of_this_origin_asking_never_reaches_the_agent() {
     let origin = format!("http://{addr}");
     let json = ("content-type", "application/json");
     let big = format!("{{\"pad\":\"{}\"}}", "x".repeat(MAX_AGENT_BODY));
-    let cases: Vec<(&str, Vec<(&str, &str)>, String, StatusCode)> = vec![
+    // Method, headers, body, and the answer the host must give without touching the agent.
+    type Case<'a> = (&'a str, Vec<(&'a str, &'a str)>, String, StatusCode);
+    let cases: Vec<Case<'_>> = vec![
         (
             "GET",
             vec![("origin", origin.as_str())],
