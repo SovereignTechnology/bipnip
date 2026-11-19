@@ -226,9 +226,12 @@ wait "$WEB_BUILD" || { tail -40 "$W/web-build.log"; fail "bipnip-web did not bui
 install -d -m 755 /opt/bipnip-web
 rm -rf /opt/bipnip-web/dist; cp -r "$W/web/dist" /opt/bipnip-web/dist; chmod -R a+rX /opt/bipnip-web
 install -m 755 "$W/target-ws/release/bipnip-webhost" /opt/bipnip-web/bipnip-webhost
-IP=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
-[ -n "$IP" ] || IP=$(hostname -I | awk '{print $1}')
-[ -n "$IP" ] || fail "the VM has no address but loopback"
+# The address the VM reaches out from (a UDP connect sends nothing). Not `ip`: the image has none.
+IP=$(python3 -c 'import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.connect(("192.0.2.1", 9))
+print(s.getsockname()[0])' 2>/dev/null || true)
+case "$IP" in "" | 127.*) fail "the VM has no address but loopback (${IP:-none})" ;; esac
 host() { # listen address, log name
   runuser -u bipweb -- /opt/bipnip-web/bipnip-webhost --dist /opt/bipnip-web/dist --listen "$1" \
     --allow-host "$1" --no-tor --agent-socket "$DOOR_DIR/web.sock" > "$W/$2.log" 2>&1 &
