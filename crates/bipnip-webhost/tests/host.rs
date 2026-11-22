@@ -14,6 +14,7 @@ use axum::extract::Request;
 use axum::extract::ws::{Message as WsMsg, WebSocketUpgrade};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use bipnip_webhost::agent::{AgentLink, MAX_AGENT_BODY, MAX_AGENT_STREAMS};
 use bipnip_webhost::app::{AppState, router};
 use bipnip_webhost::connector::LoopbackForTests;
 use bipnip_webhost::federation::Coordinators;
@@ -102,6 +103,11 @@ fn dist(coordinator_port: u16) -> PathBuf {
 }
 
 async fn host() -> SocketAddr {
+    host_with(None).await
+}
+
+/// A host whose page requests go to the agent's web door `agent`, if given.
+async fn host_with(agent: Option<AgentLink>) -> SocketAddr {
     let coordinator = mock_coordinator().await;
     let dist = dist(coordinator.port());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -116,7 +122,8 @@ async fn host() -> SocketAddr {
         coordinators: Coordinators::from_federation_json(&read("static/federation.json"))
             .expect("federation"),
         allowed: Allowed::new(vec![addr.to_string()]),
-        connector: Arc::new(LoopbackForTests),
+        connector: Some(Arc::new(LoopbackForTests)),
+        agent,
     });
     tokio::spawn(async move { axum::serve(listener, router(state)).await.expect("serve") });
     addr
@@ -176,6 +183,12 @@ async fn pages_carry_a_nonce_matching_the_csp() {
         body.matches(&format!("<script nonce=\"{nonce}\"")).count(),
         2
     );
+    // Styles too, with no other way in.
+    assert!(
+        csp.contains(&format!("style-src 'self' 'nonce-{nonce}'")),
+        "{csp}"
+    );
+    assert!(!csp.contains("unsafe-inline"), "{csp}");
     assert!(!body.contains("onion-location"));
     assert!(body.contains("selfhosted-basic"));
     assert_eq!(hv(&h, "x-frame-options"), "DENY");
@@ -348,4 +361,281 @@ async fn relay_websocket_is_proxied_only_for_our_origin() {
     ws.send(TMsg::text("hello")).await.expect("send");
     let reply = ws.next().await.expect("reply").expect("ok");
     assert_eq!(reply.into_text().expect("text").as_str(), "echo:hello");
+}
+
+/// A stand-in for the agent's web door: it records every line it is sent, answers `answer` (one
+/// line per item), and then holds the connection open if `hold`, as a watch does.
+struct FakeAgent {
+    socket: PathBuf,
+    seen: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+async fn fake_agent(name: &str, answer: Vec<&'static str>, hold: bool) -> FakeAgent {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let dir = std::env::temp_dir().join(format!(
+        "bipnip-webhost-agent-{}-{name}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let socket = dir.join("web.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).expect("bind");
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let record = seen.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let record = record.clone();
+            let answer = answer.clone();
+            tokio::spawn(async move {
+                let (read, mut write) = stream.into_split();
+                let mut lines = BufReader::new(read).lines();
+                let Ok(Some(line)) = lines.next_line().await else {
+                    return;
+                };
+                record.lock().expect("lock").push(line);
+                for out in answer {
+                    let _ = write.write_all(format!("{out}\n").as_bytes()).await;
+                }
+                if hold {
+                    // Until the host closes its side.
+                    while let Ok(Some(_)) = lines.next_line().await {}
+                }
+            });
+        }
+    });
+    FakeAgent { socket, seen }
+}
+
+impl FakeAgent {
+    fn link(&self) -> AgentLink {
+        AgentLink::with_heartbeat(self.socket.clone(), std::time::Duration::from_millis(200))
+    }
+
+    fn seen(&self) -> Vec<String> {
+        self.seen.lock().expect("lock").clone()
+    }
+}
+
+const SIGNED: &str = r#"{"kind":24735,"content":"{\"v\":1,\"method\":\"status\"}","sig":"00"}"#;
+
+#[tokio::test]
+async fn a_page_s_request_reaches_the_agent_as_it_was_sent_and_the_answer_comes_back() {
+    let agent = fake_agent(
+        "verbatim",
+        vec![
+            r#"{"status":"started","run":"x"}"#,
+            r#"{"ok":true,"result":{}}"#,
+        ],
+        false,
+    )
+    .await;
+    let addr = host_with(Some(agent.link())).await;
+    let origin = format!("http://{addr}");
+    let (status, h, body) = call(
+        addr,
+        "POST",
+        "/agent/call",
+        &[("origin", &origin), ("content-type", "application/json")],
+        SIGNED,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(hv(&h, "content-type"), "application/x-ndjson");
+    assert_eq!(hv(&h, "cache-control"), "no-store");
+    assert_eq!(
+        body,
+        "{\"status\":\"started\",\"run\":\"x\"}\n{\"ok\":true,\"result\":{}}\n"
+    );
+    // Byte for byte: the host reads nothing into it and adds nothing to it.
+    assert_eq!(agent.seen(), vec![SIGNED.to_string()]);
+    // A browser on a plain-HTTP address sends no Sec-Fetch-Site; one that does says same-origin.
+    let (status, _, _) = call(
+        addr,
+        "POST",
+        "/agent/call",
+        &[
+            ("origin", &origin),
+            ("content-type", "application/json; charset=utf-8"),
+            ("sec-fetch-site", "same-origin"),
+        ],
+        SIGNED,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn what_is_not_a_page_of_this_origin_asking_never_reaches_the_agent() {
+    let agent = fake_agent("refused", vec![r#"{"ok":true,"result":{}}"#], false).await;
+    let addr = host_with(Some(agent.link())).await;
+    let origin = format!("http://{addr}");
+    let json = ("content-type", "application/json");
+    let big = format!("{{\"pad\":\"{}\"}}", "x".repeat(MAX_AGENT_BODY));
+    // Method, headers, body, and the answer the host must give without touching the agent.
+    type Case<'a> = (&'a str, Vec<(&'a str, &'a str)>, String, StatusCode);
+    let cases: Vec<Case<'_>> = vec![
+        (
+            "GET",
+            vec![("origin", origin.as_str())],
+            String::new(),
+            StatusCode::METHOD_NOT_ALLOWED,
+        ),
+        ("POST", vec![json], SIGNED.into(), StatusCode::FORBIDDEN),
+        (
+            "POST",
+            vec![("origin", "http://evil.example"), json],
+            SIGNED.into(),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "POST",
+            vec![("origin", "null"), json],
+            SIGNED.into(),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "POST",
+            vec![
+                ("origin", origin.as_str()),
+                json,
+                ("sec-fetch-site", "cross-site"),
+            ],
+            SIGNED.into(),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "POST",
+            vec![
+                ("origin", origin.as_str()),
+                json,
+                ("sec-fetch-site", "none"),
+            ],
+            SIGNED.into(),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "POST",
+            vec![("origin", origin.as_str()), ("content-type", "text/plain")],
+            SIGNED.into(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        ),
+        (
+            "POST",
+            vec![("origin", origin.as_str()), json],
+            big,
+            StatusCode::PAYLOAD_TOO_LARGE,
+        ),
+        (
+            "POST",
+            vec![("origin", origin.as_str()), json],
+            format!("{SIGNED}\n{SIGNED}"),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "POST",
+            vec![("origin", origin.as_str()), json],
+            "  ".into(),
+            StatusCode::BAD_REQUEST,
+        ),
+    ];
+    for (method, headers, body, want) in cases {
+        let (status, _, text) = call(addr, method, "/agent/call", &headers, &body).await;
+        assert_eq!(status, want, "{method} {headers:?}: {text}");
+    }
+    // Nothing else under /agent/ is a route.
+    let (status, _, _) = call(
+        addr,
+        "POST",
+        "/agent/approve",
+        &[("origin", origin.as_str()), json],
+        SIGNED,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        agent.seen(),
+        Vec::<String>::new(),
+        "the agent was never reached"
+    );
+}
+
+#[tokio::test]
+async fn without_an_agent_or_with_one_that_is_gone_the_page_is_told() {
+    let addr = host_with(None).await;
+    let origin = format!("http://{addr}");
+    let headers = [
+        ("origin", origin.as_str()),
+        ("content-type", "application/json"),
+    ];
+    let (status, _, _) = call(addr, "POST", "/agent/call", &headers, SIGNED).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let gone = AgentLink::new(std::env::temp_dir().join("bipnip-webhost-no-such-agent.sock"));
+    let addr = host_with(Some(gone)).await;
+    let origin = format!("http://{addr}");
+    let headers = [
+        ("origin", origin.as_str()),
+        ("content-type", "application/json"),
+    ];
+    let (status, _, _) = call(addr, "POST", "/agent/call", &headers, SIGNED).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+}
+
+#[tokio::test]
+async fn open_watches_are_limited_and_one_the_page_drops_frees_its_slot() {
+    let agent = fake_agent("watches", vec![r#"{"status":"watching"}"#], true).await;
+    let addr = host_with(Some(agent.link())).await;
+    let origin = format!("http://{addr}");
+    // Each watch on its own connection, held open without reading the body.
+    let open = |addr: SocketAddr, origin: String| async move {
+        let stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+            .await
+            .expect("handshake");
+        let task = tokio::spawn(conn);
+        let req = hyper::Request::builder()
+            .method("POST")
+            .uri("/agent/call")
+            .header("host", addr.to_string())
+            .header("origin", origin)
+            .header("content-type", "application/json")
+            .body(Full::new(axum::body::Bytes::from(SIGNED)))
+            .expect("req");
+        let resp = sender.send_request(req).await.expect("send");
+        (resp, sender, task)
+    };
+    let mut held = Vec::new();
+    for _ in 0..MAX_AGENT_STREAMS {
+        let (resp, sender, task) = open(addr, origin.clone()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        held.push((resp, sender, task));
+    }
+    let headers = [
+        ("origin", origin.as_str()),
+        ("content-type", "application/json"),
+    ];
+    let (status, _, _) = call(addr, "POST", "/agent/call", &headers, SIGNED).await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "one more than may be open"
+    );
+    // The page goes away: its connection closes, and the next heartbeat finds it gone.
+    let (resp, sender, task) = held.pop().expect("one");
+    drop(resp);
+    drop(sender);
+    task.abort();
+    let mut freed = false;
+    for _ in 0..50 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let (resp, sender, task) = open(addr, origin.clone()).await;
+        if resp.status() == StatusCode::OK {
+            freed = true;
+            held.push((resp, sender, task));
+            break;
+        }
+    }
+    assert!(freed, "the dropped watch's slot came back");
 }

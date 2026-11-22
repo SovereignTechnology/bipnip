@@ -1,6 +1,6 @@
-//! The host: the two UI pages and their static files from `dist/`, and `/<network>/<alias>/…`
+//! The host: the two UI pages and their static files from `dist/`, `/<network>/<alias>/…`
 //! proxied to that coordinator's onion over Tor (RoboSats' self-hosted mode: the page only ever
-//! talks to this origin).
+//! talks to this origin), and `POST /agent/call` passed to the agent's web door ([`crate::agent`]).
 //!
 //! Requests carry robot tokens and encrypted keys in `Authorization`; nothing here logs headers or
 //! bodies.
@@ -21,6 +21,7 @@ use hyper_util::rt::TokioIo;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message as TMsg;
 
+use crate::agent::{self, AgentLink};
 use crate::connector::{BoxIo, Connector};
 use crate::federation::{Coordinators, NETWORKS, Upstream};
 use crate::html::prepare_page;
@@ -59,8 +60,10 @@ pub struct AppState {
     pub coordinators: Coordinators,
     /// Host names and origins this server answers to.
     pub allowed: Allowed,
-    /// How coordinators are reached.
-    pub connector: Arc<dyn Connector>,
+    /// How coordinators are reached; `None` with `--no-tor`: their routes then answer 503.
+    pub connector: Option<Arc<dyn Connector>>,
+    /// The agent's web door, if one is named.
+    pub agent: Option<AgentLink>,
 }
 
 /// The whole app: one fallback handler, since every route is decided by path shape.
@@ -104,7 +107,11 @@ fn page_for(path: &str) -> Option<Page> {
         return Some(Page::Pro);
     }
     let first = p.trim_start_matches('/').split('/').next().unwrap_or("");
-    matches!(first, "create" | "garage" | "offers" | "order" | "settings").then_some(Page::Root)
+    matches!(
+        first,
+        "create" | "garage" | "offers" | "order" | "settings" | "liquidity"
+    )
+    .then_some(Page::Root)
 }
 
 /// `/<network>/<alias>/<rest>` → `(network, alias, "/<rest>")` for a known network and a plain alias.
@@ -149,6 +156,9 @@ async fn route(st: &Arc<AppState>, req: Request) -> Response {
         }
         return static_file(&st.static_dir, rest).await;
     }
+    if path == "/agent/call" {
+        return agent::call(st.agent.as_ref(), req).await;
+    }
     if let Some((network, alias, rest)) = split_coordinator(&path) {
         if !security::fetch_site_ok(req.headers()) {
             return plain(StatusCode::FORBIDDEN, "cross-site request refused");
@@ -156,6 +166,12 @@ async fn route(st: &Arc<AppState>, req: Request) -> Response {
         let Some(upstream) = st.coordinators.get(network, alias).cloned() else {
             return plain(StatusCode::NOT_FOUND, "unknown coordinator");
         };
+        if st.connector.is_none() {
+            return plain(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "coordinators are off on this host (--no-tor)",
+            );
+        }
         let target = match req.uri().query() {
             Some(q) => format!("{rest}?{q}"),
             None => rest,
@@ -273,7 +289,8 @@ fn host_header(up: &Upstream) -> String {
 }
 
 async fn connect(st: &AppState, up: &Upstream) -> Option<BoxIo> {
-    match tokio::time::timeout(UPSTREAM_TIMEOUT, st.connector.connect(&up.host, up.port)).await {
+    let connector = st.connector.as_ref()?;
+    match tokio::time::timeout(UPSTREAM_TIMEOUT, connector.connect(&up.host, up.port)).await {
         Ok(Ok(io)) => Some(io),
         _ => None,
     }
@@ -434,6 +451,8 @@ mod tests {
         assert_eq!(page_for("/garage/abc/"), Some(Page::Root));
         assert_eq!(page_for("/order/temple/42/"), Some(Page::Root));
         assert_eq!(page_for("/offers"), Some(Page::Root));
+        assert_eq!(page_for("/liquidity"), Some(Page::Root));
+        assert_eq!(page_for("/agent/call"), None);
         assert_eq!(page_for("/mainnet/temple/api/info/"), None);
         assert_eq!(page_for("/static/x.js"), None);
         assert_eq!(page_for("/professional"), None);

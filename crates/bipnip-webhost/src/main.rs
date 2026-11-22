@@ -1,17 +1,22 @@
 //! `bipnip-webhost --dist <bipnip-web dist dir> [--listen ADDR:PORT] [--allow-host HOST:PORT]…
-//!                 [--tor-dir DIR]`
+//!                 [--tor-dir DIR | --no-tor] [--agent-socket PATH]`
 //!
 //! Serves `dist/basic.html`, `dist/pro.html` and `dist/static/`, and proxies
 //! `/<mainnet|testnet>/<alias>/…` to the coordinator's onion (from `dist/static/federation.json`)
 //! over Tor. Defaults: listen `127.0.0.1:12596`; allowed hosts `127.0.0.1:<port>` and
 //! `localhost:<port>`. Binding a wildcard address requires naming the allowed hosts.
+//!
+//! `--agent-socket` names an agent's web door (its `[web] socket`): a paired page's requests go
+//! there (`POST /agent/call`). `--no-tor` starts no Tor client: the coordinator routes answer 503,
+//! and the host serves the UI and the agent alone.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use bipnip_webhost::agent::AgentLink;
 use bipnip_webhost::app::{AppState, router};
-use bipnip_webhost::connector::Tor;
+use bipnip_webhost::connector::{Connector, Tor};
 use bipnip_webhost::federation::Coordinators;
 use bipnip_webhost::security::Allowed;
 
@@ -20,11 +25,14 @@ struct Args {
     listen: SocketAddr,
     allow_hosts: Vec<String>,
     tor_dir: PathBuf,
+    no_tor: bool,
+    agent_socket: Option<PathBuf>,
 }
 
 fn usage() -> ! {
     eprintln!(
-        "usage: bipnip-webhost --dist DIR [--listen ADDR:PORT] [--allow-host HOST:PORT]... [--tor-dir DIR]"
+        "usage: bipnip-webhost --dist DIR [--listen ADDR:PORT] [--allow-host HOST:PORT]... \
+         [--tor-dir DIR | --no-tor] [--agent-socket PATH]"
     );
     std::process::exit(2);
 }
@@ -34,6 +42,8 @@ fn parse_args() -> Args {
     let mut listen: SocketAddr = SocketAddr::from(([127, 0, 0, 1], 12596));
     let mut allow_hosts = Vec::new();
     let mut tor_dir = None;
+    let mut no_tor = false;
+    let mut agent_socket = None;
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         let mut value = || it.next().unwrap_or_else(|| usage());
@@ -42,8 +52,13 @@ fn parse_args() -> Args {
             "--listen" => listen = value().parse().unwrap_or_else(|_| usage()),
             "--allow-host" => allow_hosts.push(value()),
             "--tor-dir" => tor_dir = Some(PathBuf::from(value())),
+            "--no-tor" => no_tor = true,
+            "--agent-socket" => agent_socket = Some(PathBuf::from(value())),
             _ => usage(),
         }
+    }
+    if no_tor && tor_dir.is_some() {
+        usage();
     }
     let tor_dir = tor_dir.unwrap_or_else(|| {
         let base = std::env::var_os("XDG_DATA_HOME")
@@ -57,6 +72,8 @@ fn parse_args() -> Args {
         listen,
         allow_hosts,
         tor_dir,
+        no_tor,
+        agent_socket,
     }
 }
 
@@ -96,15 +113,27 @@ async fn main() {
         ]
     };
 
-    eprintln!(
-        "bipnip-webhost: bootstrapping Tor in {}",
-        args.tor_dir.display()
-    );
-    std::fs::create_dir_all(&args.tor_dir)
-        .unwrap_or_else(|e| fail(format!("tor dir {}: {e}", args.tor_dir.display())));
-    let tor = Tor::bootstrap(&args.tor_dir)
-        .await
-        .unwrap_or_else(|e| fail(e));
+    let connector: Option<Arc<dyn Connector>> = if args.no_tor {
+        eprintln!("bipnip-webhost: no Tor (--no-tor): coordinator routes answer 503");
+        None
+    } else {
+        eprintln!(
+            "bipnip-webhost: bootstrapping Tor in {}",
+            args.tor_dir.display()
+        );
+        std::fs::create_dir_all(&args.tor_dir)
+            .unwrap_or_else(|e| fail(format!("tor dir {}: {e}", args.tor_dir.display())));
+        let tor = Tor::bootstrap(&args.tor_dir)
+            .await
+            .unwrap_or_else(|e| fail(e));
+        Some(Arc::new(tor))
+    };
+    if let Some(socket) = &args.agent_socket {
+        eprintln!(
+            "bipnip-webhost: paired pages' requests go to the agent at {}",
+            socket.display()
+        );
+    }
 
     let state = Arc::new(AppState {
         static_dir,
@@ -112,7 +141,8 @@ async fn main() {
         pro,
         coordinators,
         allowed: Allowed::new(allow_hosts.clone()),
-        connector: Arc::new(tor),
+        connector,
+        agent: args.agent_socket.clone().map(AgentLink::new),
     });
     let listener = tokio::net::TcpListener::bind(args.listen)
         .await
