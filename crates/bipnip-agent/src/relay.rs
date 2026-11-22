@@ -247,14 +247,14 @@ pub fn newest_open_orders(
     orders
 }
 
-/// Every outcome event (kind 8735) that names `node` (66 hex) in an `n` tag, as the relays hold
-/// them. Nothing is checked here: [`crate::record::read`] does that.
-pub async fn fetch_outcomes(client: &Client, node: &str) -> Result<Vec<Event>, String> {
+/// Every outcome event (kind 8735) that names any of `nodes` (66 hex each) in an `n` tag, as the
+/// relays hold them, in one request. Nothing is checked here: [`crate::record::read`] does that.
+pub async fn fetch_outcomes(client: &Client, nodes: &[String]) -> Result<Vec<Event>, String> {
     use mostro_core::outcome::KIND_LIQUIDITY_OUTCOME;
     use nostr_sdk::prelude::SingleLetterTag;
     let filter = Filter::new()
         .kind(Kind::Custom(KIND_LIQUIDITY_OUTCOME))
-        .custom_tag(SingleLetterTag::LOWERCASE_N, node);
+        .custom_tags(SingleLetterTag::LOWERCASE_N, nodes.iter().cloned());
     let events = client
         .fetch_events(filter)
         .timeout(RELAY_TIMEOUT)

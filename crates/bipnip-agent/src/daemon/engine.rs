@@ -17,6 +17,7 @@
 use std::collections::BTreeMap;
 
 use bipnip_ln::LightningBackend;
+use mostro_core::lease::LeaseContract;
 use mostro_core::node_binding::Action as BindingAction;
 use mostro_core::prelude::Message;
 use mostro_core::rules::Rules;
@@ -25,12 +26,12 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use super::api::{
-    self, ApiError, Call, Code, LeaseOfferParams, LeaseTakeParams, OrderKind, OrdersParams,
-    Request, RingCreateParams, RingJoinParams,
+    self, ApiError, Call, Code, LeaseOfferParams, LeaseTakeParams, Request, RingCreateParams,
+    RingJoinParams,
 };
 use super::policy::{Ask, Grant, Guard, Parked, PolicyStore, Usage, over, seller_reasons};
+use super::reads::Reader;
 use crate::binding::make_binding_event;
-use crate::book;
 use crate::config::{Config, InstanceConfig, InstanceEntry};
 use crate::keys::Wallet;
 use crate::lease::cmd::{
@@ -39,9 +40,9 @@ use crate::lease::cmd::{
 use crate::lease::link::{Link, StepReport, launch_buyer, launch_seller, step_buyer, step_seller};
 use crate::lease::run::{BuyerConfig, BuyerRun, Outgoing, SellerConfig, SellerRun};
 use crate::lease::store::{LeaseStore, StoreError};
+use crate::lease::watch::Watch;
 use crate::lease::{DEFAULT_MAX_CLTV_DELTA, DEFAULT_SELLER_CLTV_DELTA};
-use crate::record;
-use crate::relay::{self, OpenOrder, RELAY_TIMEOUT};
+use crate::relay::{self, RELAY_TIMEOUT};
 use crate::ring::cmd::{self as ring_cmd, CreateParams, JoinParams};
 use crate::ring::link as ring_link;
 use crate::ring::run::RingRun;
@@ -157,6 +158,23 @@ impl Run {
                 value["lease"] = json!(run.contract().map(|contract| contract.id()));
                 value["channel"] = json!(run.funding_outpoint());
                 value["bond"] = json!(run.bond_status());
+                let offered = run.offered();
+                value["offered"] = json!({
+                    "min_capacity_sat": offered.min_capacity_sat,
+                    "max_capacity_sat": offered.max_capacity_sat,
+                    "duration_blocks": offered.duration_blocks,
+                    "fee_base_sat": offered.fee_base_sat,
+                    "fee_ppm": offered.fee_ppm,
+                    "upfront_percent": offered.upfront_percent,
+                    "bond_sat": offered.bond_sat,
+                    "announce": offered.announce,
+                    "rules": offered.rules,
+                    "expires_at": offered.expires_at,
+                });
+                if let Some(contract) = run.contract() {
+                    value["terms"] =
+                        lease_numbers(contract, contract.buyer_node.to_string(), run.watch());
+                }
                 value
             }
             Run::Buyer(run) => {
@@ -164,10 +182,21 @@ impl Run {
                 value["lease"] = json!(run.contract().id());
                 value["bond"] = json!(run.bond_status());
                 value["waiting_on"] = json!(run.waiting_on());
+                let contract = run.contract();
+                value["terms"] =
+                    lease_numbers(contract, contract.seller_node.to_string(), run.watch());
                 value
             }
             Run::Ring(run) => {
                 let mut value = common("member", run.order_id().map(|id| id.to_string()));
+                let terms = run.terms();
+                value["terms"] = json!({
+                    "capacity_sat": terms.capacity_sat,
+                    "bond_sat": terms.bond_sat,
+                    "announce": terms.announce,
+                    "open_window_secs": terms.open_window_secs,
+                    "members": run.ring().map(|ring| ring.members.len()),
+                });
                 value["ring"] = json!(run.ring().map(|ring| ring.id()));
                 value["channel"] = json!(run.opened_outpoint());
                 value["ours_confirmed"] = json!(run.our_channel_confirmed());
@@ -210,6 +239,23 @@ impl Run {
             },
         }
     }
+}
+
+/// A lease's numbers for a client: what the contract says, the other party's node, and the
+/// height the lease ends at once its channel is confirmed.
+fn lease_numbers(contract: &LeaseContract, peer: String, watch: &Watch) -> Value {
+    let terms = &contract.terms;
+    json!({
+        "capacity_sat": terms.capacity_sat,
+        "fee_sat": terms.total_fee_sat().ok(),
+        "upfront_sat": terms.upfront_sat().ok(),
+        "duration_blocks": terms.duration_blocks,
+        "announce": terms.announce,
+        "peer": peer,
+        "ends_at_height": watch
+            .funding_height
+            .map(|height| height.saturating_add(terms.duration_blocks)),
+    })
 }
 
 /// A run under way, with what it needs to go on.
@@ -279,39 +325,6 @@ async fn step_run(
         Run::Seller(run) => step_seller(run, link, backend, leases, now).await,
         Run::Buyer(run) => step_buyer(run, link, backend, leases, now).await,
         Run::Ring(run) => ring_link::step(run, link, backend, rings, now).await,
-    }
-}
-
-fn order_json(instance: &PublicKey, order: &OpenOrder) -> Value {
-    match order {
-        OpenOrder::Lease(order) => json!({
-            "kind": "lease",
-            "instance": instance.to_hex(),
-            "order_id": order.id.to_string(),
-            "seller_node": order.seller_node.to_string(),
-            "min_capacity_sat": order.min_capacity_sat,
-            "max_capacity_sat": order.max_capacity_sat,
-            "duration_blocks": order.duration_blocks,
-            "fee_base_sat": order.fee_base_sat,
-            "fee_ppm": order.fee_ppm,
-            "upfront_percent": order.upfront_percent,
-            "min_confirmations": order.min_confirmations,
-            "announce": order.announce,
-            "bond_sat": order.bond_sat,
-            "expires_at": order.expires_at,
-        }),
-        OpenOrder::Ring(order) => json!({
-            "kind": "ring",
-            "instance": instance.to_hex(),
-            "order_id": order.id.to_string(),
-            "capacity_sat": order.capacity_sat,
-            "slots": order.slots,
-            "taken": order.taken,
-            "announce": order.announce,
-            "open_window_secs": order.open_window_secs,
-            "bond_sat": order.bond_sat,
-            "expires_at": order.expires_at,
-        }),
     }
 }
 
@@ -613,15 +626,66 @@ impl Engine {
     /// Answers one request. Every line it has to say goes to `lines`; the last one is the
     /// final line, except for `watch`, which has none.
     pub async fn handle(&mut self, request: Request, lines: Lines) {
-        if let Call::Watch(run) = &request.call {
-            self.watch(run.clone(), lines);
-            return;
+        match &request.call {
+            Call::Watch(run) => {
+                self.watch(run.clone(), lines);
+                return;
+            }
+            Call::Orders(_) | Call::Record(_) => {
+                self.read(request, lines);
+                return;
+            }
+            _ => {}
         }
         let line = match self.call(&request, &lines).await {
             Ok(result) => api::ok_line(result),
             Err(error) => api::error_line(&error),
         };
         send_line(&lines, line);
+    }
+
+    /// What a request that only reads the relays needs, copied out (see [`super::reads`]).
+    fn reader(&self) -> Reader {
+        Reader {
+            client: self.client.clone(),
+            instances: self
+                .instances
+                .iter()
+                .map(|instance| instance.pubkey)
+                .collect(),
+            network: self.config.network,
+        }
+    }
+
+    /// Answers `orders` or `record` in a task of its own, so that a slow relay holds up no run
+    /// and no other request. The instance a request names is settled here first.
+    fn read(&self, request: Request, lines: Lines) {
+        let only = match &request.call {
+            Call::Orders(params) => match params.instance.as_deref() {
+                Some(named) => match self.instance(Some(named)) {
+                    Ok(instance) => Some(instance.pubkey),
+                    Err(error) => {
+                        send_line(&lines, api::error_line(&error));
+                        return;
+                    }
+                },
+                None => None,
+            },
+            _ => None,
+        };
+        let reader = self.reader();
+        tokio::spawn(async move {
+            let answer = match &request.call {
+                Call::Orders(params) => reader.orders(params, only).await,
+                Call::Record(node) => reader.record(node).await,
+                _ => Err(ApiError::internal("not a request that only reads")),
+            };
+            let line = match answer {
+                Ok(result) => api::ok_line(result),
+                Err(error) => api::error_line(&error),
+            };
+            send_line(&lines, line);
+        });
     }
 
     fn watch(&mut self, run: Option<String>, lines: Lines) {
@@ -638,7 +702,6 @@ impl Engine {
     async fn call(&mut self, request: &Request, lines: &Lines) -> Result<Value, ApiError> {
         match &request.call {
             Call::Status => self.status().await,
-            Call::Orders(params) => self.orders(params).await,
             Call::LeaseOffer(_) | Call::LeaseTake(_) | Call::RingCreate(_) | Call::RingJoin(_) => {
                 self.start_run(request, None, lines).await
             }
@@ -647,7 +710,6 @@ impl Engine {
             Call::LeaseList => self.list(true),
             Call::RingList => self.list(false),
             Call::BindingPublish => self.publish_binding().await,
-            Call::Record(node) => self.record(node).await,
             Call::Approvals => {
                 let parked = self.policy.all_parked().map_err(internal)?;
                 Ok(json!({"approvals": parked}))
@@ -679,6 +741,9 @@ impl Engine {
             }
             // Answered in `handle`.
             Call::Watch(_) => Err(ApiError::internal("watch has no answer")),
+            Call::Orders(_) | Call::Record(_) => {
+                Err(ApiError::internal("answered beside the engine"))
+            }
         }
     }
 
@@ -780,68 +845,6 @@ impl Engine {
                 )),
             },
         }
-    }
-
-    /// `node`'s record: the outcomes about it on the relays, read by [`record::read`] (the
-    /// configured instances are the trusted ones) and counted by [`record::summarize`].
-    async fn record(&mut self, node: &str) -> Result<Value, ApiError> {
-        let key: secp256k1::PublicKey = node
-            .parse()
-            .map_err(|_| ApiError::new(Code::BadRequest, "not a node key".to_string()))?;
-        let events = relay::fetch_outcomes(&self.client, node)
-            .await
-            .map_err(|e| ApiError::new(Code::Relay, e))?;
-        let trusted: Vec<PublicKey> = self
-            .instances
-            .iter()
-            .map(|instance| instance.pubkey)
-            .collect();
-        let stated = record::read(&events, &trusted, unix_now());
-        let summary = record::summarize(&key, &stated);
-        Ok(json!({
-            "node": node,
-            "record": summary,
-            "outcomes_read": stated.len(),
-        }))
-    }
-
-    /// One book over the instances asked for: a single request through the shared relay
-    /// connection, the newest version of each order, filtered and sorted ([`book::merge`]).
-    async fn orders(&mut self, params: &OrdersParams) -> Result<Value, ApiError> {
-        let instances: Vec<PublicKey> = match params.instance.as_deref() {
-            Some(named) => vec![self.instance(Some(named))?.pubkey],
-            None => self
-                .instances
-                .iter()
-                .map(|instance| instance.pubkey)
-                .collect(),
-        };
-        let books = relay::fetch_books(&self.client, &instances, unix_now())
-            .await
-            .map_err(|e| ApiError::new(Code::Relay, e))?;
-        let query = book::Query {
-            leases: params.kind.map(|kind| kind == OrderKind::Lease),
-            capacity_sat: params.capacity_sat,
-            max_fee_sat: params.max_fee_sat,
-        };
-        let orders: Vec<Value> = book::merge(books.orders, self.config.network, &query)
-            .iter()
-            .map(|listed| {
-                let mut value = order_json(&listed.instance, &listed.order);
-                if let Some(price) = listed.price {
-                    value["priced_capacity_sat"] = json!(price.capacity_sat);
-                    value["fee_sat"] = json!(price.fee_sat);
-                    value["ppb_per_block"] = json!(price.ppb_per_block);
-                    value["seller_listings"] = json!(listed.seller_listings);
-                }
-                value
-            })
-            .collect();
-        Ok(json!({
-            "orders": orders,
-            "instances_silent": books.silent.iter().map(PublicKey::to_hex).collect::<Vec<_>>(),
-            "relays_down": books.relays_down,
-        }))
     }
 
     /// Starts the run a request asks for: prepares it with every check the one-shot command
