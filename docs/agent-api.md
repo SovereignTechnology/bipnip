@@ -112,7 +112,9 @@ min_seller_capacity_sat = 0      # in our node's graph, or less public capacity 
 ```
 
 Every limit defaults to 0. With the defaults every request that starts a run is parked as
-`needs-approval`; nothing above a limit happens without `approve`.
+`needs-approval`; nothing above a limit happens without `approve`. A parked request has stored, sent
+and published nothing: an offer's node binding, which ties the node to the agent's identity in public,
+goes out only once the offer is allowed.
 
 A request is weighed by what it would do with the node's money: the whole fee of a lease it takes, the
 capacity of the channel it would open (for an offer, the largest capacity offered), and the bond it would
