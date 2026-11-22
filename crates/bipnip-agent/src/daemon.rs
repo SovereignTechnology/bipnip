@@ -7,13 +7,16 @@
 //!   a run and the node.
 //! - [`engine`]: the one worker that steps the runs and answers the requests.
 //! - [`reads`]: the requests that only read the relays, answered beside the engine.
-//! - [`server`]: the socket, and the loop that feeds the engine.
+//! - [`session`]: paired web pages: their signed requests, scopes, sessions and pairing.
+//! - [`server`]: the sockets (the operator's and the web door), and the loop that feeds the
+//!   engine.
 
 pub mod api;
 pub mod engine;
 pub mod policy;
 pub mod reads;
 pub mod server;
+pub mod session;
 
 #[cfg(test)]
 mod tests;

@@ -25,10 +25,21 @@
 //! bipnip [--socket PATH] ring list
 //! bipnip [--socket PATH] bind
 //! bipnip [--socket PATH] approvals
-//! bipnip [--socket PATH] approve APPROVAL
+//! bipnip [--socket PATH] approve [--yes] APPROVAL
 //! bipnip [--socket PATH] deny APPROVAL
 //! bipnip [--socket PATH] watch [RUN]
+//! bipnip [--socket PATH] pair
+//! bipnip [--socket PATH] pair open [--secs SECS]
+//! bipnip [--socket PATH] pair approve CODE [--scope read|trade] [--expires DAYS] [--label NAME]
+//! bipnip [--socket PATH] pair deny CODE
+//! bipnip [--socket PATH] sessions
+//! bipnip [--socket PATH] revoke SESSION
 //! ```
+//!
+//! `approve` first shows what the parked request would do, as the agent stored it, and asks;
+//! without a terminal to ask on it approves nothing unless given `--yes`. `pair open` lets web
+//! pages ask to be paired for a few minutes; `pair approve` takes the code the page shows
+//! (`docs/decisions/0011-key-roles-pairing-and-session-keys.md`).
 //!
 //! The socket is `--socket`, else `$BIPNIP_SOCKET`, else `~/.bipnip/agent.sock`.
 //!
@@ -48,8 +59,9 @@ use std::process::ExitCode;
 use serde_json::{Map, Value, json};
 
 const USAGE: &str = "usage: bipnip [--socket PATH] <status | orders | record NODE | lease <offer|take|cancel|list> | \
-ring <create|join|cancel|list> | bind | approvals | approve APPROVAL | deny APPROVAL | \
-watch [RUN]> [options] (the options are listed in the README and at the top of the source)";
+ring <create|join|cancel|list> | bind | approvals | approve [--yes] APPROVAL | deny APPROVAL | \
+watch [RUN] | pair [open|approve CODE|deny CODE] | sessions | revoke SESSION> [options] \
+(the options are listed in the README and at the top of the source)";
 
 /// Exit status when the request was parked.
 const EXIT_PARKED: u8 = 3;
@@ -159,10 +171,41 @@ fn request(args: &[String]) -> Result<(String, Value), String> {
             params.insert("node".into(), json!(node));
             "record"
         }
-        ("approve", [approval]) => {
+        ("approve", rest) => {
+            // `--yes` is the command line's, not the agent's: see `confirm`.
+            let approval = one_word(Options::parse(rest, &["yes"])?, "approval")?;
             params.insert("approval".into(), json!(approval));
             "approve"
         }
+        ("sessions", []) => "sessions",
+        ("revoke", [session]) => {
+            params.insert("session".into(), json!(session));
+            "revoke"
+        }
+        ("pair", []) => "pair.list",
+        ("pair", [sub, rest @ ..]) => match sub.as_str() {
+            "open" => {
+                let mut options = Options::parse(rest, &[])?;
+                options.number(&mut params, "secs", "secs", false)?;
+                no_words(options)?;
+                "pair.open"
+            }
+            "approve" => {
+                let mut options = Options::parse(rest, &[])?;
+                options.text(&mut params, "scope", "scope");
+                options.number(&mut params, "expires", "expires_days", false)?;
+                options.text(&mut params, "label", "label");
+                let code = one_word(options, "code")?;
+                params.insert("code".into(), json!(code));
+                "pair.approve"
+            }
+            "deny" => {
+                let code = one_word(Options::parse(rest, &[])?, "code")?;
+                params.insert("code".into(), json!(code));
+                "pair.deny"
+            }
+            _ => return Err(USAGE.to_string()),
+        },
         ("deny", [approval]) => {
             params.insert("approval".into(), json!(approval));
             "deny"
@@ -381,7 +424,111 @@ fn run() -> Result<u8, String> {
         None
     };
     let (method, params) = request(&args)?;
-    talk(&socket_path(socket)?, &method, params)
+    let socket = socket_path(socket)?;
+    if method == "approve" && !args.iter().any(|arg| arg == "--yes") {
+        let approval = params["approval"].as_str().unwrap_or_default().to_string();
+        if !confirm(&socket, &approval)? {
+            eprintln!("bipnip: not approved; it still waits (`bipnip deny {approval}` drops it)");
+            return Ok(1);
+        }
+    }
+    talk(&socket, &method, params)
+}
+
+/// Sends a request and returns its result, printing nothing.
+fn fetch(socket: &Path, method: &str, params: Value) -> Result<Value, String> {
+    let mut stream = UnixStream::connect(socket).map_err(|e| {
+        format!(
+            "cannot reach the agent at {}: {e} (is `bipnip-agent run` running?)",
+            socket.display()
+        )
+    })?;
+    let line = json!({"v": 1, "method": method, "params": params}).to_string();
+    stream
+        .write_all(line.as_bytes())
+        .and_then(|()| stream.write_all(b"\n"))
+        .map_err(|e| format!("cannot send the request: {e}"))?;
+    for line in BufReader::new(stream).lines() {
+        let line = line.map_err(|e| format!("the agent's answer broke off: {e}"))?;
+        let answer: Value = serde_json::from_str(&line)
+            .map_err(|_| "the agent answered with something that is not JSON".to_string())?;
+        match answer["ok"].as_bool() {
+            None => {}
+            Some(true) => return Ok(answer["result"].clone()),
+            Some(false) => {
+                return Err(format!(
+                    "{}: {}",
+                    answer["error"]["code"].as_str().unwrap_or("error"),
+                    answer["error"]["message"].as_str().unwrap_or_default()
+                ));
+            }
+        }
+    }
+    Err("the agent closed the connection without an answer".into())
+}
+
+/// What a parked request would do, as the agent stored it, in words a person checks before
+/// letting it go ahead. What a web page showed when it asked is a claim; this is what is true.
+fn describe_parked(parked: &Value) -> String {
+    let ask = &parked["ask"];
+    let mut text = format!(
+        "approval {}\n  asked for: {}\n",
+        parked["approval"].as_str().unwrap_or("?"),
+        parked["method"].as_str().unwrap_or("?")
+    );
+    if let Some(params) = parked["params"].as_object() {
+        for (key, value) in params {
+            text.push_str(&format!("    {key}: {value}\n"));
+        }
+    }
+    text.push_str(&format!(
+        "  it would: pay up to {} sat in fees, open up to {} sat of channels, lock {} sat of bond",
+        ask["fee_sat"], ask["capacity_sat"], ask["bond_sat"]
+    ));
+    if let Some(peer) = ask["peer"].as_str() {
+        text.push_str(&format!(", with node {peer}"));
+    }
+    text.push('\n');
+    for reason in parked["over"].as_array().into_iter().flatten() {
+        text.push_str(&format!(
+            "  parked: {}\n",
+            reason.as_str().unwrap_or_default()
+        ));
+    }
+    match &parked["asked_by"] {
+        Value::Null => text.push_str("  asked by: this machine (the agent's own socket)\n"),
+        by => text.push_str(&format!(
+            "  asked by: the paired page {} (session {})\n",
+            by["label"],
+            by["session"].as_str().unwrap_or("?")
+        )),
+    }
+    text
+}
+
+/// Shows the parked request and asks on the terminal whether it may go ahead. Without a terminal
+/// to ask on, nothing is approved: scripts say `--yes`.
+fn confirm(socket: &Path, approval: &str) -> Result<bool, String> {
+    use std::io::IsTerminal;
+    let stdin = std::io::stdin();
+    if !stdin.is_terminal() {
+        return Err("no terminal to ask on: add --yes to approve without being asked".into());
+    }
+    let listed = fetch(socket, "approvals", json!({}))?;
+    let parked = listed["approvals"]
+        .as_array()
+        .and_then(|all| {
+            all.iter()
+                .find(|parked| parked["approval"] == json!(approval))
+        })
+        .ok_or_else(|| format!("no parked request {approval}"))?;
+    eprint!("{}Let it go ahead? [y/N] ", describe_parked(parked));
+    let mut answer = String::new();
+    stdin
+        .lock()
+        .read_line(&mut answer)
+        .map_err(|e| format!("cannot read the answer: {e}"))?;
+    Ok(matches!(answer.trim(), "y" | "Y" | "yes"))
 }
 
 fn main() -> ExitCode {
@@ -410,6 +557,23 @@ mod tests {
             ("approvals", "approvals", json!({})),
             ("record 02ab", "record", json!({"node": "02ab"})),
             ("approve ab12", "approve", json!({"approval": "ab12"})),
+            ("approve --yes ab12", "approve", json!({"approval": "ab12"})),
+            ("sessions", "sessions", json!({})),
+            ("revoke 5c0a", "revoke", json!({"session": "5c0a"})),
+            ("pair", "pair.list", json!({})),
+            ("pair open", "pair.open", json!({})),
+            ("pair open --secs 60", "pair.open", json!({"secs": 60})),
+            (
+                "pair approve 1234-5678-9012 --scope trade --expires 3 --label desk",
+                "pair.approve",
+                json!({"code": "1234-5678-9012", "scope": "trade", "expires_days": 3,
+                       "label": "desk"}),
+            ),
+            (
+                "pair deny 1234-5678-9012",
+                "pair.deny",
+                json!({"code": "1234-5678-9012"}),
+            ),
             ("deny ab12", "deny", json!({"approval": "ab12"})),
             ("watch", "watch", json!({})),
             ("watch ring-0f", "watch", json!({"run": "ring-0f"})),
@@ -475,6 +639,11 @@ mod tests {
             "status now",
             "approve",
             "approve a b",
+            "approve ab12 --no",
+            "pair approve",
+            "pair open now",
+            "pair forget",
+            "revoke",
             "lease",
             "lease list all",
             "lease take --capacity 600000",
@@ -490,6 +659,33 @@ mod tests {
         ] {
             assert!(request(&words(line)).is_err(), "{line:?}");
         }
+    }
+
+    #[test]
+    fn a_parked_request_is_shown_with_what_it_would_do_and_who_asked() {
+        let parked = json!({
+            "approval": "3f2a", "at": 5, "method": "lease.take",
+            "params": {"order_id": "5d1c", "capacity_sat": 600_000, "node_address": "1.2.3.4:9735"},
+            "ask": {"fee_sat": 2_500, "capacity_sat": 0, "bond_sat": 0, "peer": "02ab"},
+            "over": ["asked from a paired web page"],
+            "asked_by": {"session": "5c0a", "label": "desk"},
+        });
+        let text = describe_parked(&parked);
+        for part in [
+            "approval 3f2a",
+            "asked for: lease.take",
+            "node_address: \"1.2.3.4:9735\"",
+            "pay up to 2500 sat in fees",
+            "with node 02ab",
+            "parked: asked from a paired web page",
+            "the paired page \"desk\" (session 5c0a)",
+        ] {
+            assert!(text.contains(part), "{part:?} in {text}");
+        }
+        let own = json!({"approval": "3f2b", "method": "lease.offer", "params": {},
+                         "ask": {"fee_sat": 0, "capacity_sat": 1_000_000, "bond_sat": 0,
+                                 "peer": null}, "over": []});
+        assert!(describe_parked(&own).contains("this machine"));
     }
 
     #[test]

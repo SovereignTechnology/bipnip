@@ -745,7 +745,7 @@ assert len(a) == 1 and a[0]["approval"] == sys.argv[1] and a[0]["method"] == "le
 assert a[0]["ask"] == {"fee_sat": 0, "capacity_sat": 600000, "bond_sat": 0, "peer": None}, a
 ' "$APPROVAL" || { daemon_dump; fail "the parked offer is not listed as it was asked"; }
 bip bob lease list | grep -q "state=offering\|state=open" && { daemon_dump; fail "a parked offer was started"; }
-bip bob approve "$APPROVAL" > "$W/d-approve.out" 2> "$W/d-approve.err" || { daemon_dump; fail "the approval did not start the offer"; }
+bip bob approve --yes "$APPROVAL" > "$W/d-approve.out" 2> "$W/d-approve.err" || { daemon_dump; fail "the approval did not start the offer"; }
 SELLER_RUN=$(result_field run < "$W/d-approve.out")
 [ "$(bip bob approvals | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["approvals"]))')" = 0 ] || fail "the approval is still parked"
 d_order() { bip bob lease list | sed -n 's/^seller order=\([0-9a-f-]\{36\}\) state=open .*/\1/p' | head -1; }
@@ -767,7 +767,7 @@ assert len(o) == 1 and o[0]["max_capacity_sat"] == 600000 and o[0]["fee_ppm"] ==
 ' "$ORDER_D" || { daemon_dump; fail "alice's daemon does not list the order"; }
 DEAR=$(parked alice max_fee_per_lease_sat lease take "$ORDER_D" --capacity 600000)
 bip alice deny "$DEAR" > /dev/null || fail "the dear take could not be denied"
-bip alice approve "$DEAR" > /dev/null 2>&1 && fail "a denied request could still be approved"
+bip alice approve --yes "$DEAR" > /dev/null 2>&1 && fail "a denied request could still be approved"
 bip alice lease take "$ORDER_D" --capacity 512000 --node-address "127.0.0.1:${P2P[alice]}" \
   > "$W/d-take.out" 2> "$W/d-take.err" || { daemon_dump; fail "alice's daemon did not take the order"; }
 BUYER_RUN=$(result_field run < "$W/d-take.out")
@@ -816,7 +816,7 @@ assert s["last_day"]["fee_sat"] == 2024, s
 log "daemon: a ring of two through the daemons; bob's is parked and approved, alice's is within her day"
 RING_APPROVAL=$(parked bob max_capacity_per_day_sat ring create --capacity 222222 --slots 2 --feerate 2 \
   --window 3600 --expires-in 3600 --node-address "127.0.0.1:${P2P[bob]}")
-bip bob approve "$RING_APPROVAL" > "$W/d-ring-approve.out" 2> "$W/d-ring-approve.err" || { daemon_dump; fail "the ring was not started on approval"; }
+bip bob approve --yes "$RING_APPROVAL" > "$W/d-ring-approve.out" 2> "$W/d-ring-approve.err" || { daemon_dump; fail "the ring was not started on approval"; }
 d_ring() { bip bob ring list | sed -n 's/^ring order=\([0-9a-f-]\{36\}\) state=seated .*/\1/p' | head -1; }
 d_ring_seated() { [ -n "$(d_ring)" ]; }
 wait_until 90 d_ring_seated || { daemon_dump; fail "the daemon's ring was not stored by the instance"; }
@@ -875,13 +875,13 @@ wait_until 120 kept || { record_of alice "$BPK"; daemon_dump; fail "bob's record
 log "trust: a lease bob closes early; both write it up, and bob's record shows it"
 EARLY=$(parked bob max_capacity_per_day_sat lease offer --min-capacity 300000 --max-capacity 400000 \
   --duration 1000 --fee-base 1000 --fee-ppm 2000 --feerate 2 --confs 3 --expires-in 3600)
-bip bob approve "$EARLY" > /dev/null || { daemon_dump; fail "the offer to close early was not started"; }
+bip bob approve --yes "$EARLY" > /dev/null || { daemon_dump; fail "the offer to close early was not started"; }
 e_order() { bip bob lease list | sed -n 's/^seller order=\([0-9a-f-]\{36\}\) state=open .*/\1/p' | head -1; }
 e_open() { [ -n "$(e_order)" ]; }
 wait_until 90 e_open || { daemon_dump; fail "the offer to close early did not open"; }
 ORDER_E=$(e_order)
 TAKE_E=$(parked alice max_fee_per_day_sat lease take "$ORDER_E" --capacity 345678 --node-address "127.0.0.1:${P2P[alice]}")
-bip alice approve "$TAKE_E" > /dev/null || { daemon_dump; fail "alice's take of the lease to close early was not started"; }
+bip alice approve --yes "$TAKE_E" > /dev/null || { daemon_dump; fail "alice's take of the lease to close early was not started"; }
 t=0
 until d_both_in "$ORDER_E" active; do
   "$W/mine.sh" 1; sleep 2; t=$((t+1))
@@ -916,11 +916,11 @@ log "trust: an offer asks its buyer for 50 public channels; the instance refuses
 RULED=$(parked bob max_capacity_per_day_sat lease offer --min-capacity 300000 --max-capacity 400000 \
   --duration 1000 --fee-base 1000 --fee-ppm 2000 --feerate 2 --confs 3 --expires-in 3600 \
   --min-buyer-channels 50)
-bip bob approve "$RULED" > /dev/null || { daemon_dump; fail "the offer with rules was not started"; }
+bip bob approve --yes "$RULED" > /dev/null || { daemon_dump; fail "the offer with rules was not started"; }
 wait_until 90 e_open || { daemon_dump; fail "the offer with rules did not open"; }
 ORDER_R=$(e_order)
 TAKE_R=$(parked alice max_fee_per_day_sat lease take "$ORDER_R" --capacity 300000 --node-address "127.0.0.1:${P2P[alice]}")
-bip alice approve "$TAKE_R" > /dev/null || { daemon_dump; fail "alice's take of the offer with rules was not started"; }
+bip alice approve --yes "$TAKE_R" > /dev/null || { daemon_dump; fail "alice's take of the offer with rules was not started"; }
 r_refused() { [ "$(d_state alice buyer "$ORDER_R")" = canceled ]; }
 wait_until 120 r_refused || { daemon_dump; fail "the take below the offer's rules was not refused"; }
 grep -q "RulesNotMet" "$W/daemon-alice.out" "$W/daemon-alice.err" || { daemon_dump; fail "the take was refused, but not for the rules"; }
