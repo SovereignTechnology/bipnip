@@ -46,7 +46,7 @@ LND_SHA=2127d4794ea9cbd98e762ba16283615158743646d2d6d2a5bf88664dd6255ce7
 # bipnipd main, as run-lnd.sh builds it.
 BIPNIPD_REV=028099e547a30a929fe0dcee36ef4d15d19a3b43
 # bipnip-web: the style nonce, the agent client and the Liquidity tab.
-BIPNIP_WEB_REV=${BIPNIP_WEB_REV:-2f123ee1d8ee13880fc78caab69bd649620ef4d6}
+BIPNIP_WEB_REV=${BIPNIP_WEB_REV:-4b2a6006dc33c0055d8c846d5aa421fe713dc6a1}
 # Playwright: the release W0 ran with.
 PW=1.64.1
 fetch() { curl -fsSL --retry 3 -o "$3" "$1"; echo "$2  $3" | sha256sum -c --quiet; }
