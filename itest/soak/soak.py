@@ -70,7 +70,12 @@ def finding(kind, money, **fields):
 
 
 def run(argv, timeout=60):
-    done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    """A command's exit code and output; a command that hangs past `timeout` counts as failed
+    (it must never take a driver thread or the auditor down with it)."""
+    try:
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        return 124, str(e.stdout or ""), f"timed out after {timeout} s"
     return done.returncode, done.stdout, done.stderr
 
 
