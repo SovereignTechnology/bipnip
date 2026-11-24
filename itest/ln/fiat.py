@@ -81,8 +81,11 @@ def status(order):
 class Trade:
     """One order between the seller and the buyer, answered step by step as the instance asks."""
 
+    current = None  # the trade under way, for the cleanup after a failure
+
     def __init__(self, name, maker):
         self.name, self.maker = name, maker
+        Trade.current = self
         self.order = None
         self.handled = set()
         self.seen = []
@@ -130,8 +133,10 @@ class Trade:
                 self.handled.discard(key)
                 log(f"{self.name}: {role} was asked for an invoice with no amount ({payload.get('kind')}); waiting")
                 return
+            # The instance wants an invoice valid for its whole invoice_expiration_window (an hour by
+            # default) from when it checks: one that lives exactly an hour is a second short.
             invoice = lnc(role, "addinvoice", "--amt", str(amount), "--memo", "bipnip fiat itest",
-                          "--expiry", "3600")
+                          "--expiry", "7200")
             self.buyer_hash = invoice["r_hash"]
             ok(role, "order", "add-invoice", "--order", self.order, "--invoice",
                invoice["payment_request"], "--yes")
@@ -285,4 +290,11 @@ if __name__ == "__main__":
         steps[sys.argv[1]]()
     except Fail as e:
         log(f"FAIL: {e}")
+        # Leave nothing open: a pending order of one side's would refuse that side's next take.
+        trade = Trade.current
+        if trade is not None and trade.order:
+            for who in ("seller", "buyer"):
+                code, _, text = cli(who, "order", "cancel", "--order", trade.order, "--yes")
+                log(f"cleanup: {who} cancel of {trade.order}: " + ("ok" if code == 0 else text.strip()[-160:]))
+            log(f"cleanup: the order is {status(trade.order)}")
         sys.exit(1)
