@@ -133,8 +133,10 @@ class Trade:
                 self.handled.discard(key)
                 log(f"{self.name}: {role} was asked for an invoice with no amount ({payload.get('kind')}); waiting")
                 return
+            # The instance wants an invoice valid for its whole invoice_expiration_window (an hour by
+            # default) from when it checks: one that lives exactly an hour is a second short.
             invoice = lnc(role, "addinvoice", "--amt", str(amount), "--memo", "bipnip fiat itest",
-                          "--expiry", "3600")
+                          "--expiry", "7200")
             self.buyer_hash = invoice["r_hash"]
             ok(role, "order", "add-invoice", "--order", self.order, "--invoice",
                invoice["payment_request"], "--yes")
