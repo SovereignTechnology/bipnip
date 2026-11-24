@@ -2,6 +2,8 @@
 """The soak's driver and auditor. run-soak.sh sets the scene (chain, nodes, channels, settings) and
 hands over; this runs the long part. Standard library only.
 
+Runs for SOAK_MINUTES, then lets what is under way finish (up to SOAK_DRAIN_SECS).
+
 Threads:
 - the miner: one block at a time, at random (exponential) intervals averaging SOAK_BLOCK_SECS;
 - the workload: leases and rings between the agents, through their daemons' sockets;
@@ -33,7 +35,8 @@ W = os.environ["W"]
 NET = os.environ["NET"]
 BCLI = shlex.split(os.environ["BCLI"])
 MADDR = os.environ["MADDR"]
-HOURS = int(os.environ["SOAK_HOURS"])
+MINUTES = int(os.environ["SOAK_MINUTES"])
+DRAIN = int(os.environ.get("SOAK_DRAIN_SECS", "3600"))
 BLOCK = int(os.environ["SOAK_BLOCK_SECS"])
 AUDIT = int(os.environ["SOAK_AUDIT_SECS"])
 FAULT = int(os.environ["SOAK_FAULT_SECS"])
@@ -298,6 +301,8 @@ def fiat():
         trade = rng.choice(["sell", "buy", "cancel", "dispute"])
         code, out, err = run([sys.executable, os.environ["FIAT_PY"], trade], timeout=1200)
         result = "ok" if code == 0 else "failed"
+        n = sum(stats["fiat"].values()) + 1
+        Path(f"{W}/soak/fiat-{n:03d}-{trade}.log").write_text(out + err)
         stats["fiat"][f"{trade}-{result}"] = stats["fiat"].get(f"{trade}-{result}", 0) + 1
         note("fiat", trade=trade, result=result, tail=(out + err)[-300:] if code else "")
 
@@ -447,18 +452,18 @@ def main():
             print(procs[name].log.read_text(errors="replace")[-2000:], flush=True)
             print(f"[soak] FAIL: {name} did not start", flush=True)
             sys.exit(1)
-    note("start", chain=NET, hours=HOURS, block_secs=BLOCK, fault_secs=FAULT, seed=SEED)
+    note("start", chain=NET, minutes=MINUTES, block_secs=BLOCK, fault_secs=FAULT, seed=SEED)
     threads = [threading.Thread(target=t, args=a, daemon=True) for t, a in
                [(miner, ()), (workload, ()), (fiat, ()), (faults, (procs,))]]
     for t in threads:
         t.start()
-    end = time.time() + HOURS * 3600
+    end = time.time() + MINUTES * 60
     while time.time() < end:
         time.sleep(min(AUDIT, max(1, end - time.time())))
         audit(procs)
     stop.set()
-    # Let what is under way finish: mine on, without faults, for up to an hour.
-    drain_end = time.time() + 3600
+    # Let what is under way finish: mine on, without faults, for up to SOAK_DRAIN_SECS.
+    drain_end = time.time() + DRAIN
     while under_way() and time.time() < drain_end:
         with chain_lock:
             mine(1)
@@ -466,7 +471,7 @@ def main():
         audit(procs)
     audit(procs, final=True)
     money = [f for f in findings if f["money"]]
-    report = {"chain": NET, "seed": SEED, "hours": HOURS, "block_secs": BLOCK, "stats": stats,
+    report = {"chain": NET, "seed": SEED, "minutes": MINUTES, "block_secs": BLOCK, "stats": stats,
               "findings": findings, "unfinished": under_way()}
     Path(f"{W}/soak/report.json").write_text(json.dumps(report, indent=1))
     print(json.dumps(report), flush=True)
@@ -475,7 +480,7 @@ def main():
     if findings:
         print(f"[soak] SOAK FAIL: {len(findings)} findings, {len(money)} about money", flush=True)
         sys.exit(1)
-    print(f"[soak] SOAK PASS: {HOURS} h, {stats['blocks']} blocks, {stats['leases']} leases, "
+    print(f"[soak] SOAK PASS: {MINUTES} min, {stats['blocks']} blocks, {stats['leases']} leases, "
           f"{stats['rings']} rings, fiat {stats['fiat']}, faults {stats['faults']}, no findings", flush=True)
 
 

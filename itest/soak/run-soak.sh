@@ -4,11 +4,13 @@
 # relays go away and the chain reorganises; an auditor checks what must always hold. Inside a VM:
 #
 #   kata-run --cwd ~/Projects/bipnip --net --timeout 10800 -- \
-#     env SOAK_HOURS=1 SOAK_BLOCK_SECS=30 bash itest/soak/run-soak.sh          (the smoke)
+#     env SOAK_MINUTES=20 SOAK_DRAIN_SECS=600 SOAK_BLOCK_SECS=30 bash itest/soak/run-soak.sh  (the smoke:
+#     a kata-run job lives an hour at most, setup included)
 #
 # and for days in the booty lab (sovtech/booty bipnip-soak/). SOAK_CHAIN is regtest (default) or
 # signet. Tunables (digits only):
-#   SOAK_HOURS (default 1), SOAK_BLOCK_SECS (mean block interval, default 600),
+#   SOAK_MINUTES (default 60), SOAK_DRAIN_SECS (default 3600), SOAK_BLOCK_SECS (mean block interval,
+#   default 600),
 #   SOAK_AUDIT_SECS (default 600), SOAK_FAULT_SECS (mean time between faults, default 1800),
 #   SOAK_SEED (default: the time). BIPNIPD_REV picks the instance.
 #
@@ -31,7 +33,8 @@ for k in sys.argv[1:]: d=d[k]
 print(d)' "$@"; }
 wait_until() { local secs=$1; shift; local t=0; until "$@" >/dev/null 2>&1; do sleep 1; t=$((t+1)); [ "$t" -lt "$secs" ] || return 1; done; }
 digits() { [[ "$2" =~ ^[0-9]+$ ]] || fail "$1 must be digits"; }
-SOAK_HOURS=${SOAK_HOURS:-1}; digits SOAK_HOURS "$SOAK_HOURS"
+SOAK_MINUTES=${SOAK_MINUTES:-60}; digits SOAK_MINUTES "$SOAK_MINUTES"
+SOAK_DRAIN_SECS=${SOAK_DRAIN_SECS:-3600}; digits SOAK_DRAIN_SECS "$SOAK_DRAIN_SECS"
 SOAK_BLOCK_SECS=${SOAK_BLOCK_SECS:-600}; digits SOAK_BLOCK_SECS "$SOAK_BLOCK_SECS"
 SOAK_AUDIT_SECS=${SOAK_AUDIT_SECS:-600}; digits SOAK_AUDIT_SECS "$SOAK_AUDIT_SECS"
 SOAK_FAULT_SECS=${SOAK_FAULT_SECS:-1800}; digits SOAK_FAULT_SECS "$SOAK_FAULT_SECS"
@@ -327,7 +330,7 @@ json.dump(procs, open(sys.argv[1], "w"), indent=1)
 PY
 printf '%s\n' "$(lnd_cmd carol)" > "$W/soak/carol.argv"
 
-export W NET BCLI MADDR SOAK_HOURS SOAK_BLOCK_SECS SOAK_AUDIT_SECS SOAK_FAULT_SECS SOAK_SEED
+export W NET BCLI MADDR SOAK_MINUTES SOAK_DRAIN_SECS SOAK_BLOCK_SECS SOAK_AUDIT_SECS SOAK_FAULT_SECS SOAK_SEED
 export INSTANCE_PUB INSTANCE_NSEC SOLVER_NSEC SOLVER_PUB
 export MCLI="$W/target-m/release/mostro-cli" INSTANCE_DB="$W/instance/mostro.db"
 LNC_SELLER="lncli --lnddir=$W/alice --network=$NET --rpcserver=127.0.0.1:${RPC[alice]}"
