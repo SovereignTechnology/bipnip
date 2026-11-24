@@ -58,6 +58,11 @@ git -C "$W/bipnipd" checkout --quiet "$BIPNIPD_REV"
 git clone --quiet https://github.com/MostroP2P/mostro-cli "$W/mostro-cli"
 git -C "$W/mostro-cli" checkout --quiet "$MCLI_REV"
 [ "$(git -C "$W/mostro-cli" rev-parse HEAD)" = "$MCLI_REV" ] || fail "mostro-cli is not at $MCLI_REV"
+# Each tree may pin its own toolchain; let rustup install them one at a time (two installs of the
+# same toolchain at once collide in its download directory).
+for tree in "$W/bipnipd" "$W/mostro-cli" "$HERE"; do
+  (cd "$tree" && cargo --version) > /dev/null || fail "no Rust toolchain for $tree"
+done
 cargo build --quiet --release --locked --manifest-path "$W/bipnipd/Cargo.toml" --bin mostrod \
   --target-dir "$W/target-d" > "$W/build-d.log" 2>&1 &
 BUILD_D=$!
