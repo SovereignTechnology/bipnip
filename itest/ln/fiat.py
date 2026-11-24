@@ -81,8 +81,11 @@ def status(order):
 class Trade:
     """One order between the seller and the buyer, answered step by step as the instance asks."""
 
+    current = None  # the trade under way, for the cleanup after a failure
+
     def __init__(self, name, maker):
         self.name, self.maker = name, maker
+        Trade.current = self
         self.order = None
         self.handled = set()
         self.seen = []
@@ -285,4 +288,11 @@ if __name__ == "__main__":
         steps[sys.argv[1]]()
     except Fail as e:
         log(f"FAIL: {e}")
+        # Leave nothing open: a pending order of one side's would refuse that side's next take.
+        trade = Trade.current
+        if trade is not None and trade.order:
+            for who in ("seller", "buyer"):
+                code, _, text = cli(who, "order", "cancel", "--order", trade.order, "--yes")
+                log(f"cleanup: {who} cancel of {trade.order}: " + ("ok" if code == 0 else text.strip()[-160:]))
+            log(f"cleanup: the order is {status(trade.order)}")
         sys.exit(1)
