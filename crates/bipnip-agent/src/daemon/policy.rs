@@ -883,9 +883,11 @@ mod tests {
         let full = Usage {
             fee_day_sat: u64::MAX,
             capacity_day_sat: u64::MAX,
+            bond_day_sat: u64::MAX,
             runs: 0,
         };
         assert_eq!(over(&policy, &ask(1, 1, 0), &full).len(), 2);
+        assert_eq!(over(&policy, &ask(1, 1, 1), &full).len(), 3);
     }
 
     #[test]
