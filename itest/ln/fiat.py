@@ -19,6 +19,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import uuid
 
 W = os.environ["W"]
 MCLI = os.environ["MCLI"]
@@ -70,8 +71,10 @@ def lnc(role, *args):
 
 def status(order):
     """The order's status as the instance's own database has it (read-only)."""
+    # The daemon keeps an order's id as a UUID's 16 bytes; text is looked for too.
     with sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=10) as db:
-        row = db.execute("SELECT status FROM orders WHERE id = ?", (order,)).fetchone()
+        row = db.execute("SELECT status FROM orders WHERE id = ? OR id = ?",
+                         (uuid.UUID(order).bytes, order)).fetchone()
     return row[0] if row else None
 
 
