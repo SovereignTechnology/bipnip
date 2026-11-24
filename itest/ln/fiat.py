@@ -105,6 +105,11 @@ class Trade:
         self.seen.append((role, message.get("action"), step))
         if not step or step in self.blocked:
             return
+        # A message can name a step before it carries what the step needs (a second PayInvoice
+        # comes with the invoice): wait for one that does.
+        if step == "pay_hold_invoice" and not payload.get("invoice"):
+            log(f"{self.name}: {role} was asked to pay with no invoice yet ({payload.get('kind')}); waiting")
+            return
         key = (role, step, payload.get("invoice"))
         if key in self.handled:
             return
@@ -118,6 +123,10 @@ class Trade:
             log(f"{self.name}: {role} pays the hold invoice ({payload.get('amount')} sat)")
         elif step == "add_invoice":
             amount = payload.get("amount") or (payload.get("order") or {}).get("sats_amount")
+            if not amount:
+                self.handled.discard(key)
+                log(f"{self.name}: {role} was asked for an invoice with no amount ({payload.get('kind')}); waiting")
+                return
             invoice = lnc(role, "addinvoice", "--amt", str(amount), "--memo", "bipnip fiat itest",
                           "--expiry", "3600")
             self.buyer_hash = invoice["r_hash"]
