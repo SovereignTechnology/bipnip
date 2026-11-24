@@ -55,15 +55,22 @@ fn price(order: &mostro_core::lease_order::LeaseOrder, capacity_sat: Option<u64>
     let capacity_sat = capacity_sat.unwrap_or(order.max_capacity_sat);
     let terms = order.terms_for(capacity_sat).ok()?;
     let fee_sat = terms.total_fee_sat().ok()?;
-    let per = u128::from(capacity_sat).checked_mul(u128::from(terms.duration_blocks))?;
-    let ppb = u128::from(fee_sat)
-        .checked_mul(1_000_000_000)?
-        .checked_div(per)?;
     Some(Price {
         capacity_sat,
         fee_sat,
-        ppb_per_block: u64::try_from(ppb).unwrap_or(u64::MAX),
+        ppb_per_block: ppb_per_block(fee_sat, capacity_sat, terms.duration_blocks)?,
     })
+}
+
+/// A lease's price as the book shows it: `fee_sat` for `capacity_sat` over `duration_blocks`,
+/// as the fee per sat of capacity per block in parts per billion (rounded down). `None` for
+/// no capacity or no blocks.
+pub fn ppb_per_block(fee_sat: u64, capacity_sat: u64, duration_blocks: u32) -> Option<u64> {
+    let per = u128::from(capacity_sat).checked_mul(u128::from(duration_blocks))?;
+    let ppb = u128::from(fee_sat)
+        .checked_mul(1_000_000_000)?
+        .checked_div(per)?;
+    Some(u64::try_from(ppb).unwrap_or(u64::MAX))
 }
 
 /// The book: `orders` from every instance, keeping those on `network` that fit `query`, sorted
