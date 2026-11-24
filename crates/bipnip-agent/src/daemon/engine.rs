@@ -219,11 +219,33 @@ impl Run {
     /// What starting this run would do with the node's money.
     fn ask(&self) -> Ask {
         match self {
-            // A seller opens a channel of at most the largest capacity offered, and pays nothing.
-            Run::Seller(run) => Ask {
-                capacity_sat: run.offered().max_capacity_sat,
-                ..Ask::default()
-            },
+            // A seller opens a channel of at most the largest capacity offered, pays nothing but
+            // the funding fee, and sells at the offer's price at that capacity (its lowest).
+            Run::Seller(run) => {
+                let offer = run.offered();
+                let proportional =
+                    u128::from(offer.max_capacity_sat) * u128::from(offer.fee_ppm) / 1_000_000;
+                let fee_sat = u64::try_from(proportional)
+                    .ok()
+                    .and_then(|fee| fee.checked_add(offer.fee_base_sat));
+                Ask {
+                    capacity_sat: offer.max_capacity_sat,
+                    feerate_sat_vb: run.feerate_sat_vb(),
+                    // A price that cannot be computed is taken as nothing, so it passes no floor.
+                    sale_ppb_per_block: Some(
+                        fee_sat
+                            .and_then(|fee| {
+                                crate::book::ppb_per_block(
+                                    fee,
+                                    offer.max_capacity_sat,
+                                    offer.duration_blocks,
+                                )
+                            })
+                            .unwrap_or(0),
+                    ),
+                    ..Ask::default()
+                }
+            }
             // A buyer pays the lease's whole fee and, where the order asks, locks a bond. A fee
             // that cannot be computed is taken as the largest there is, so it passes no limit.
             Run::Buyer(run) => Ask {
@@ -231,11 +253,14 @@ impl Run {
                 capacity_sat: 0,
                 bond_sat: run.bond_sat(),
                 peer: Some(run.contract().seller_node.to_string()),
+                ..Ask::default()
             },
-            // A ring member opens one channel and, where the ring asks, locks a bond.
+            // A ring member opens one channel, paying its funding fee, and, where the ring asks,
+            // locks a bond.
             Run::Ring(run) => Ask {
                 capacity_sat: run.terms().capacity_sat,
                 bond_sat: run.terms().bond_sat,
+                feerate_sat_vb: run.feerate_sat_vb(),
                 ..Ask::default()
             },
         }
@@ -1247,10 +1272,11 @@ impl Engine {
     }
 
     fn usage(&self, now: u64) -> Result<Usage, ApiError> {
-        let (fee_day_sat, capacity_day_sat) = self.policy.used_since(now).map_err(internal)?;
+        let used = self.policy.used_since(now).map_err(internal)?;
         Ok(Usage {
-            fee_day_sat,
-            capacity_day_sat,
+            fee_day_sat: used.fee_sat,
+            capacity_day_sat: used.capacity_sat,
+            bond_day_sat: used.bond_sat,
             runs: self.under_way(),
         })
     }

@@ -116,6 +116,9 @@ max_fee_per_lease_sat = 0        # a buyer's whole fee for one lease, upfront an
 max_fee_per_day_sat = 0          # all leases taken in a day
 max_capacity_per_day_sat = 0     # channels this agent opens in a day: leases sold, rings
 max_bond_sat = 0                 # the largest bond locked at an instance
+max_bond_per_day_sat = 0         # all bonds locked in a day
+max_feerate_sat_vb = 0           # the funding fee rate of a channel this agent opens: offers, rings
+# min_sale_ppb_per_block = 800   # the lowest price a lease sold may go at; unset: every offer parks
 max_runs = 0                     # runs under way at once (not finished, not only watched)
 allowed_peers = []               # node keys; empty means any
 min_seller_channels = 0          # a take parks when the seller's node shows fewer public channels
@@ -128,22 +131,25 @@ and published nothing: an offer's node binding, which ties the node to the agent
 goes out only once the offer is allowed.
 
 A request is weighed by what it would do with the node's money: the whole fee of a lease it takes, the
-capacity of the channel it would open (for an offer, the largest capacity offered), and the bond it would
-lock. That is checked twice:
+capacity of the channel it would open (for an offer, the largest capacity offered) and the fee rate its
+funding transaction would pay, the bond it would lock, and for an offer the price it sells at. The price
+is the fee per sat of capacity per block in parts per billion, as the order book shows it, at the largest
+capacity offered (where an offer is cheapest). That is checked twice:
 
 1. When the run is asked for, against the limits and against what the last 24 hours already used. Every
    run the agent starts is recorded with what it was granted (`<data_dir>/policy/`), before its first
    message leaves; the day's use is the sum of those records, so it holds across restarts. A run counts
    from the moment it starts, whether or not it ends up paying or opening.
 2. At the node. A run reaches the node only through its grant: the invoices it pays may add up to its fee
-   and its bond and no more, the channels it opens to the capacity it was granted and no more, and with
-   `allowed_peers` set it opens only to those. Routing fees are capped apart, per payment. A payment the
+   and its bond and no more, the channels it opens to the capacity and the funding fee rate it was
+   granted and no more, and with `allowed_peers` set it opens only to those. A grant written before fee
+   rates were weighed has none, and is not held to one. Routing fees are capped apart, per payment. A payment the
    node reports as failed gives its share back, so an invoice that expired and was replaced is not
    counted twice.
 
 An approval is for one request as it was shown: if the order has changed so that the request would now
-pay, open or lock more, or deal with another node, the approval is refused and the request must be asked
-again. An approval does not raise a limit.
+pay, open or lock more, fund at a higher fee rate, sell for less, or deal with another node, the approval
+is refused and the request must be asked again. An approval does not raise a limit.
 
 A run started by a one-shot command (`bipnip-agent lease …`, `ring …`) has no grant. The agent carries it
 on as that command would have; the person who typed it gave it its limits. Of the limits above, only

@@ -204,6 +204,19 @@ pub struct PolicyConfig {
     /// it joins nothing that asks for a bond.
     #[serde(default)]
     pub max_bond_sat: u64,
+    /// The most the bonds locked within a day may add up to, in satoshi. 0, the default, means
+    /// every request with a bond is parked.
+    #[serde(default)]
+    pub max_bond_per_day_sat: u64,
+    /// The highest fee rate the funding transaction of a channel this agent opens may pay, in
+    /// sat/vB. 0, the default, means every request that would open a channel is parked.
+    #[serde(default)]
+    pub max_feerate_sat_vb: u64,
+    /// The lowest price a lease this agent sells may go at: the fee per sat of capacity per
+    /// block, in parts per billion (as the order book shows it), at the largest capacity
+    /// offered. Unset, the default, means every offer is parked.
+    #[serde(default)]
+    pub min_sale_ppb_per_block: Option<u64>,
     /// How many runs may be under way at once.
     #[serde(default)]
     pub max_runs: u32,

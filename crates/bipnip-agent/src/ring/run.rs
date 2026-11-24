@@ -369,6 +369,11 @@ impl RingRun {
         &self.terms
     }
 
+    /// The fee rate our funding transaction will pay, in sat/vB.
+    pub fn feerate_sat_vb(&self) -> u64 {
+        self.feerate_sat_vb
+    }
+
     /// Where the run stands.
     pub fn state(&self) -> RingState {
         self.state

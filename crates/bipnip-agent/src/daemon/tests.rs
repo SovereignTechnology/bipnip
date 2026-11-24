@@ -641,12 +641,14 @@ async fn a_page_is_paired_held_to_its_scope_and_moves_nothing_by_itself() {
     let world = Arc::new(Mutex::new(World::default()));
     world.lock().expect("world").clock = Some(unix_now());
     let instance = Keys::generate().public_key();
-    // Limits that would let an offer through unasked: a page's is parked all the same.
+    // Limits that would let an offer through unasked (OFFER funds at 2 sat/vB and sells at about
+    // 810 ppb per block): a page's is parked all the same.
     let agent = Agent::with(
         "paged",
         &url,
         &instance,
-        "max_runs = 4\nmax_capacity_per_day_sat = 10000000",
+        "max_runs = 4\nmax_capacity_per_day_sat = 10000000\nmax_feerate_sat_vb = 2\n\
+         min_sale_ppb_per_block = 800",
         3,
         "\n[web]\n",
     );
