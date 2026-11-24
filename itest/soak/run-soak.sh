@@ -1,18 +1,21 @@
 #!/usr/bin/env bash
 # The soak: agents on LND, Core Lightning and LDK trade leases, rings and fiat through a real bipnipd
-# for hours or days, on a private signet whose blocks come at random, while processes are killed,
+# for hours or days, on a private chain whose blocks come at random, while processes are killed,
 # relays go away and the chain reorganises; an auditor checks what must always hold. Inside a VM:
 #
 #   kata-run --cwd ~/Projects/bipnip --net --timeout 10800 -- \
 #     env SOAK_HOURS=1 SOAK_BLOCK_SECS=30 bash itest/soak/run-soak.sh          (the smoke)
 #
-# and for days in the booty lab (sovtech/booty bipnip-soak/). Tunables (digits only):
+# and for days in the booty lab (sovtech/booty bipnip-soak/). SOAK_CHAIN is regtest (default) or
+# signet. Tunables (digits only):
 #   SOAK_HOURS (default 1), SOAK_BLOCK_SECS (mean block interval, default 600),
 #   SOAK_AUDIT_SECS (default 600), SOAK_FAULT_SECS (mean time between faults, default 1800),
 #   SOAK_SEED (default: the time). BIPNIPD_REV picks the instance.
 #
-# The chain is a signet whose challenge is OP_TRUE (51): blocks need no signature, so the soak mines
-# its own, at random intervals, from a wallet in this VM. Nothing here reaches another network.
+# The soak mines its own blocks, at random intervals, from a wallet in this VM. SOAK_CHAIN=signet makes
+# it a signet whose challenge is OP_TRUE (51: no signature needed), but LND v0.21.5 refuses a custom
+# signet with a bitcoind backend ("expected network Unknown BitcoinNet (3178222164), got SigNet"), so
+# regtest is the default: the same timing and faults, on regtest's rules. Nothing reaches another network.
 # Every key and credential is a throwaway value inside the VM.
 
 set -euo pipefail
@@ -48,7 +51,12 @@ BIPNIPD_REV=${BIPNIPD_REV:?set BIPNIPD_REV to the bipnipd commit to soak}
 # mostro-cli v0.17.1, for the fiat trades (as run-fiat.sh).
 MCLI_REV=0665895f0a9806756252bd34a0572416f7c13e61
 fetch() { curl -fsSL --retry 3 -o "$3" "$1"; echo "$2  $3" | sha256sum -c --quiet; }
-NET=signet
+NET=${SOAK_CHAIN:-regtest}
+case "$NET" in
+  regtest) RPCPORT=18443; LND_NET=(--bitcoin.regtest); CHALLENGE="" ;;
+  signet) RPCPORT=38332; LND_NET=(--bitcoin.signet --bitcoin.signetchallenge=51); CHALLENGE="signetchallenge=51" ;;
+  *) fail "SOAK_CHAIN must be regtest or signet" ;;
+esac
 
 log "tools"
 export DEBIAN_FRONTEND=noninteractive
@@ -95,19 +103,19 @@ wait "$BUILD_L" || { tail -30 "$W/build-ldk.log"; fail "LDK Server did not build
 wait "$BUILD_M" || { tail -30 "$W/build-m.log"; fail "mostro-cli did not build"; }
 AGENT=$W/target-ws/release/bipnip-agent
 
-log "bitcoind: a private signet (challenge OP_TRUE), no peers"
+log "bitcoind: a private $NET, no peers"
 cat > "$W/btc/bitcoin.conf" <<CONF
-signet=1
+$NET=1
 server=1
 fallbackfee=0.0002
-[signet]
-signetchallenge=51
+[$NET]
+$CHALLENGE
 connect=0
 listen=0
 dnsseed=0
 rpcuser=soak
 rpcpassword=soak
-rpcport=38332
+rpcport=$RPCPORT
 rpcbind=127.0.0.1
 rpcallowip=127.0.0.1
 zmqpubrawblock=tcp://127.0.0.1:28332
@@ -116,11 +124,11 @@ CONF
 bitcoind -datadir="$W/btc" -daemon
 BCLI="bitcoin-cli -datadir=$W/btc"
 wait_until 60 $BCLI getblockchaininfo
-[ "$($BCLI getblockchaininfo | jget chain)" = signet ] || fail "bitcoind is not on signet"
+[ "$($BCLI getblockchaininfo | jget chain)" = "$NET" ] || fail "bitcoind is not on $NET"
 $BCLI createwallet miner >/dev/null
 MADDR=$($BCLI -rpcwallet=miner getnewaddress)
 $BCLI generatetoaddress 1 "$MADDR" > "$W/first-block.out" 2>&1 \
-  || { cat "$W/first-block.out"; fail "this signet does not take a block mined here (generatetoaddress)"; }
+  || { cat "$W/first-block.out"; fail "this $NET does not take a block mined here (generatetoaddress)"; }
 $BCLI generatetoaddress 110 "$MADDR" >/dev/null
 mine() { $BCLI generatetoaddress "$1" "$MADDR" >/dev/null; }
 
@@ -128,8 +136,8 @@ log "LND: alice and bob (agents' nodes), carol (the instance's node and the paym
 declare -A RPC=([alice]=10009 [bob]=10010 [carol]=10011) REST=([alice]=8081 [bob]=8082 [carol]=8083) \
   P2P=([alice]=9735 [bob]=9736 [carol]=9737)
 lnd_cmd() { # name: the command line, one word a line (also handed to the driver for restarts)
-  printf '%s\n' lnd "--lnddir=$W/$1" --bitcoin.signet --bitcoin.signetchallenge=51 --bitcoin.node=bitcoind \
-    --bitcoind.rpchost=127.0.0.1:38332 --bitcoind.rpcuser=soak --bitcoind.rpcpass=soak \
+  printf '%s\n' lnd "--lnddir=$W/$1" "${LND_NET[@]}" --bitcoin.node=bitcoind \
+    "--bitcoind.rpchost=127.0.0.1:$RPCPORT" --bitcoind.rpcuser=soak --bitcoind.rpcpass=soak \
     --bitcoind.zmqpubrawblock=tcp://127.0.0.1:28332 --bitcoind.zmqpubrawtx=tcp://127.0.0.1:28333 \
     --noseedbackup "--rpclisten=127.0.0.1:${RPC[$1]}" "--restlisten=127.0.0.1:${REST[$1]}" \
     "--listen=127.0.0.1:${P2P[$1]}" "--alias=$1" --trickledelay=1000
@@ -141,7 +149,7 @@ for n in alice bob carol; do
 done
 lnc() { local n=$1; shift; lncli --lnddir="$W/$n" --network=$NET --rpcserver=127.0.0.1:${RPC[$n]} "$@"; }
 synced() { [ "$(lnc "$1" getinfo | jget synced_to_chain)" = "True" ]; }
-for n in alice bob carol; do wait_until 180 synced "$n" || { tail -20 "$W/$n/lnd.log"; fail "$n did not sync on signet"; }; done
+for n in alice bob carol; do wait_until 180 synced "$n" || { tail -20 "$W/$n/lnd.log"; fail "$n did not sync on $NET"; }; done
 mac() { echo "$W/$1/data/chain/bitcoin/$NET/admin.macaroon"; }
 
 log "Core Lightning with the hold plugin: chris (fee rates forced: a private chain has no estimates)"
@@ -149,7 +157,7 @@ CHRIS_P2P=9741
 mkdir -p "$W/chris"
 cln_cmd() {
   printf '%s\n' lightningd "--network=$NET" "--lightning-dir=$W/chris" --daemon "--log-file=$W/chris/log" \
-    --bitcoin-rpcconnect=127.0.0.1 --bitcoin-rpcport=38332 --bitcoin-rpcuser=soak \
+    --bitcoin-rpcconnect=127.0.0.1 "--bitcoin-rpcport=$RPCPORT" --bitcoin-rpcuser=soak \
     --bitcoin-rpcpassword=soak "--bitcoin-cli=$W/bin/bitcoin-cli" \
     "--addr=127.0.0.1:$CHRIS_P2P" --alias=chris --grpc-port=9751 \
     "--plugin=$HOLD" --hold-grpc-port=-1 --force-feerates=1000
@@ -178,7 +186,7 @@ level = "Debug"
 log_to_file = true
 
 [bitcoind]
-rpc_address = "127.0.0.1:38332"
+rpc_address = "127.0.0.1:$RPCPORT"
 rpc_user = "soak"
 rpc_password = "soak"
 CONF
@@ -186,7 +194,7 @@ CONF
 ERIN_CERT=$W/erin/data/tls.crt; ERIN_MAC=$W/erin/data/$NET/macaroons/admin.macaroon
 ldkw() { LDK_ADDR=127.0.0.1:$ERIN_GRPC LDK_CERT=$ERIN_CERT LDK_MAC=$ERIN_MAC "$W/target/release/ldk-wallet" "$@"; }
 erin_up() { test -s "$ERIN_CERT" && test -s "$ERIN_MAC" && ldkw id; }
-wait_until 180 erin_up || { tail -40 "$W/erin/server.log" | cut -c1-300; fail "erin did not come up on signet"; }
+wait_until 180 erin_up || { tail -40 "$W/erin/server.log" | cut -c1-300; fail "erin did not come up on $NET"; }
 
 declare -A ID
 for n in alice bob carol; do ID[$n]=$(lnc "$n" getinfo | jget identity_pubkey); done

@@ -442,7 +442,7 @@ def main():
             print(procs[name].log.read_text(errors="replace")[-2000:], flush=True)
             print(f"[soak] FAIL: {name} did not start", flush=True)
             sys.exit(1)
-    note("start", hours=HOURS, block_secs=BLOCK, fault_secs=FAULT, seed=SEED)
+    note("start", chain=NET, hours=HOURS, block_secs=BLOCK, fault_secs=FAULT, seed=SEED)
     threads = [threading.Thread(target=t, args=a, daemon=True) for t, a in
                [(miner, ()), (workload, ()), (fiat, ()), (faults, (procs,))]]
     for t in threads:
@@ -461,7 +461,7 @@ def main():
         audit(procs)
     audit(procs, final=True)
     money = [f for f in findings if f["money"]]
-    report = {"seed": SEED, "hours": HOURS, "block_secs": BLOCK, "stats": stats,
+    report = {"chain": NET, "seed": SEED, "hours": HOURS, "block_secs": BLOCK, "stats": stats,
               "findings": findings, "unfinished": under_way()}
     Path(f"{W}/soak/report.json").write_text(json.dumps(report, indent=1))
     print(json.dumps(report), flush=True)
