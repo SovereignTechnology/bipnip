@@ -201,9 +201,15 @@ for n in alice bob carol; do ID[$n]=$(lnc "$n" getinfo | jget identity_pubkey); 
 ID[chris]=$(clc getinfo | jget id); ID[erin]=$(ldkw id)
 
 log "fund every node"
-for n in alice bob carol; do $BCLI -rpcwallet=miner sendtoaddress "$(lnc "$n" newaddress p2wkh | jget address)" 5 >/dev/null; done
-$BCLI -rpcwallet=miner sendtoaddress "$(clc newaddr p2tr | jget p2tr)" 5 >/dev/null
-$BCLI -rpcwallet=miner sendtoaddress "$(ldkw address)" 5 >/dev/null
+# Every node opens channels again and again: each open needs a confirmed output of its own (LND,
+# for one, spends no unconfirmed change by default), so each gets several.
+for _ in 1 2 3 4 5 6; do
+  for n in alice bob; do $BCLI -rpcwallet=miner sendtoaddress "$(lnc "$n" newaddress p2wkh | jget address)" 1 >/dev/null; done
+  $BCLI -rpcwallet=miner sendtoaddress "$(clc newaddr p2tr | jget p2tr)" 1 >/dev/null
+  $BCLI -rpcwallet=miner sendtoaddress "$(ldkw address)" 1 >/dev/null
+  mine 1  # the miner's own change, confirmed: no long chain of unconfirmed sends
+done
+for _ in 1 2 3 4 5; do $BCLI -rpcwallet=miner sendtoaddress "$(lnc carol newaddress p2wkh | jget address)" 3 >/dev/null; done
 mine 6
 lnd_funded() { [ "$(lnc "$1" walletbalance | jget confirmed_balance)" -gt 0 ]; }
 chris_funded() { [ "$(clc listfunds | python3 -c 'import json,sys; print(sum(1 for o in json.load(sys.stdin)["outputs"] if o["status"] == "confirmed"))')" -gt 0 ]; }
