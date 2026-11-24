@@ -7,7 +7,8 @@
 #     env SOAK_MINUTES=20 SOAK_DRAIN_SECS=600 SOAK_BLOCK_SECS=30 bash itest/soak/run-soak.sh  (the smoke:
 #     a kata-run job lives an hour at most, setup included)
 #
-# and for days in the booty lab (sovtech/booty bipnip-soak/). SOAK_CHAIN is regtest (default) or
+# and for days in the booty lab (sovtech/booty bipnip-soak/), which sets SOAK_PREBUILT (the built
+# binaries), SOAK_HOLD and SOAK_BIPNIPD_SRC, and has nothing to download. SOAK_CHAIN is regtest (default) or
 # signet. Tunables (digits only):
 #   SOAK_MINUTES (default 60), SOAK_DRAIN_SECS (default 3600), SOAK_BLOCK_SECS (mean block interval,
 #   default 600),
@@ -50,7 +51,7 @@ HOLD_V=v0.3.3
 HOLD_SHA=f9d916430fb70a3d75089f2d1b88d5d71d4987ef79933035978c1f44aab84be5
 LDK_SERVER_REV=d7e7a2e708664af922c53c786ad6a5df622f5dd8
 # The instance: H1's integration branch (the v0.20.3 merge and every fix in review).
-BIPNIPD_REV=${BIPNIPD_REV:?set BIPNIPD_REV to the bipnipd commit to soak}
+BIPNIPD_REV=${BIPNIPD_REV:-}
 # mostro-cli v0.17.1, for the fiat trades (as run-fiat.sh).
 MCLI_REV=0665895f0a9806756252bd34a0572416f7c13e61
 fetch() { curl -fsSL --retry 3 -o "$3" "$1"; echo "$2  $3" | sha256sum -c --quiet; }
@@ -61,50 +62,69 @@ case "$NET" in
   *) fail "SOAK_CHAIN must be regtest or signet" ;;
 esac
 
-log "tools"
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get install -y -qq protobuf-compiler python3 curl xz-utils ca-certificates git cmake clang pkg-config \
-  libssl-dev build-essential libpq5 libsqlite3-0 libsodium23 zlib1g >/dev/null
+if [ -n "${SOAK_PREBUILT:-}" ]; then
+  # The booty lab (sovtech/booty bipnip-soak/): everything was built and checked beforehand, the VM has no
+  # network. bitcoind, lnd and lightningd are on PATH; the rest is in SOAK_PREBUILT.
+  B=$SOAK_PREBUILT
+  AGENT=$B/bipnip-agent MOSTROD=$B/mostrod LDK_SERVER=$B/ldk-server MCLI=$B/mostro-cli HELPERS=$B
+  HOLD=${SOAK_HOLD:-$B/hold}
+  BIPNIPD_SRC=${SOAK_BIPNIPD_SRC:?set SOAK_BIPNIPD_SRC to the bipnipd tree that was built}
+  for b in bitcoind bitcoin-cli lnd lncli lightningd lightning-cli python3; do
+    command -v "$b" >/dev/null || fail "no $b on PATH"
+  done
+  for b in "$AGENT" "$MOSTROD" "$LDK_SERVER" "$MCLI" "$HELPERS/test-relay" "$HELPERS/test-key" \
+    "$HELPERS/ldk-wallet" "$HOLD"; do [ -x "$b" ] || fail "no $b"; done
+  [ -f "$BIPNIPD_SRC/settings.tpl.toml" ] || fail "no settings template in $BIPNIPD_SRC"
+  log "prebuilt binaries from $B; bitcoind $(bitcoind -version | head -1 | awk '{print $NF}'), $(lnd --version | head -1)"
+else
+  [ -n "$BIPNIPD_REV" ] || fail "set BIPNIPD_REV to the bipnipd commit to soak"
+  log "tools"
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  apt-get install -y -qq protobuf-compiler python3 curl xz-utils ca-certificates git cmake clang pkg-config \
+    libssl-dev build-essential libpq5 libsqlite3-0 libsodium23 zlib1g >/dev/null
 
-log "downloads (sha256-pinned)"
-fetch "https://bitcoincore.org/bin/bitcoin-core-$BTC_V/bitcoin-$BTC_V-x86_64-linux-gnu.tar.gz" "$BTC_SHA" "$W/dl/btc.tgz"
-fetch "https://github.com/lightningnetwork/lnd/releases/download/$LND_V/lnd-linux-amd64-$LND_V.tar.gz" "$LND_SHA" "$W/dl/lnd.tgz"
-fetch "https://github.com/ElementsProject/lightning/releases/download/$CLN_V/clightning-$CLN_V-Ubuntu-22.04-amd64.tar.xz" "$CLN_SHA" "$W/dl/cln.txz"
-fetch "https://github.com/BoltzExchange/hold/releases/download/$HOLD_V/hold-linux-amd64.tar.gz" "$HOLD_SHA" "$W/dl/hold.tgz"
-tar xzf "$W/dl/btc.tgz" -C "$W/dl"; cp "$W/dl/bitcoin-$BTC_V/bin/"{bitcoind,bitcoin-cli} "$W/bin/"
-tar xzf "$W/dl/lnd.tgz" -C "$W/dl"; cp "$W/dl/lnd-linux-amd64-$LND_V/"{lnd,lncli} "$W/bin/"
-tar xJf "$W/dl/cln.txz" -C "$W/cln"
-tar xzf "$W/dl/hold.tgz" -C "$W/dl"
-HOLD=$(find "$W/dl" -type f -name 'hold-linux-amd64' | sed -n 1p); chmod +x "$HOLD"
-CLN_BIN=$(dirname "$(find "$W/cln" -type f -name lightningd | sed -n 1p)")
-export PATH=$W/bin:$CLN_BIN:$PATH
+  log "downloads (sha256-pinned)"
+  fetch "https://bitcoincore.org/bin/bitcoin-core-$BTC_V/bitcoin-$BTC_V-x86_64-linux-gnu.tar.gz" "$BTC_SHA" "$W/dl/btc.tgz"
+  fetch "https://github.com/lightningnetwork/lnd/releases/download/$LND_V/lnd-linux-amd64-$LND_V.tar.gz" "$LND_SHA" "$W/dl/lnd.tgz"
+  fetch "https://github.com/ElementsProject/lightning/releases/download/$CLN_V/clightning-$CLN_V-Ubuntu-22.04-amd64.tar.xz" "$CLN_SHA" "$W/dl/cln.txz"
+  fetch "https://github.com/BoltzExchange/hold/releases/download/$HOLD_V/hold-linux-amd64.tar.gz" "$HOLD_SHA" "$W/dl/hold.tgz"
+  tar xzf "$W/dl/btc.tgz" -C "$W/dl"; cp "$W/dl/bitcoin-$BTC_V/bin/"{bitcoind,bitcoin-cli} "$W/bin/"
+  tar xzf "$W/dl/lnd.tgz" -C "$W/dl"; cp "$W/dl/lnd-linux-amd64-$LND_V/"{lnd,lncli} "$W/bin/"
+  tar xJf "$W/dl/cln.txz" -C "$W/cln"
+  tar xzf "$W/dl/hold.tgz" -C "$W/dl"
+  HOLD=$(find "$W/dl" -type f -name 'hold-linux-amd64' | sed -n 1p); chmod +x "$HOLD"
+  CLN_BIN=$(dirname "$(find "$W/cln" -type f -name lightningd | sed -n 1p)")
+  export PATH=$W/bin:$CLN_BIN:$PATH
 
-log "builds: the instance (${BIPNIPD_REV:0:12}), LDK Server and mostro-cli beside the agent, the CLI and the helpers"
-git clone -q https://github.com/SovereignTechnology/bipnipd "$W/bipnipd"
-git -C "$W/bipnipd" checkout -q "$BIPNIPD_REV"
-git clone -q https://github.com/lightningdevkit/ldk-server "$W/ldk-server"
-git -C "$W/ldk-server" checkout -q "$LDK_SERVER_REV"
-git clone -q https://github.com/MostroP2P/mostro-cli "$W/mostro-cli"
-git -C "$W/mostro-cli" checkout -q "$MCLI_REV"
-# Each tree may pin its own toolchain; let rustup install them one at a time (two installs of the
-# same toolchain at once collide in its download directory).
-for tree in "$W/bipnipd" "$W/ldk-server" "$W/mostro-cli" "$HERE/../.." "$LN"; do
-  (cd "$tree" && cargo --version) > /dev/null || fail "no Rust toolchain for $tree"
-done
-cargo build --quiet --release --locked --manifest-path "$W/bipnipd/Cargo.toml" --bin mostrod --target-dir "$W/target-d" > "$W/build-d.log" 2>&1 &
-BUILD_D=$!
-(cd "$W/ldk-server" && cargo build --quiet --locked -p ldk-server --target-dir "$W/target-ldk") > "$W/build-ldk.log" 2>&1 &
-BUILD_L=$!
-(cd "$W/mostro-cli" && cargo build --quiet --release --locked --target-dir "$W/target-m") > "$W/build-m.log" 2>&1 &
-BUILD_M=$!
-cargo build --quiet --locked --release --manifest-path "$LN/Cargo.toml" --target-dir "$W/target"
-cargo build --quiet --locked --release --manifest-path "$HERE/../../Cargo.toml" -p bipnip-agent --features lnd,cln,ldk --target-dir "$W/target-ws"
-cargo build --quiet --locked --release --manifest-path "$HERE/../../Cargo.toml" -p bipnip-cli --target-dir "$W/target-ws"
-wait "$BUILD_D" || { tail -30 "$W/build-d.log"; fail "the instance did not build"; }
-wait "$BUILD_L" || { tail -30 "$W/build-ldk.log"; fail "LDK Server did not build"; }
-wait "$BUILD_M" || { tail -30 "$W/build-m.log"; fail "mostro-cli did not build"; }
-AGENT=$W/target-ws/release/bipnip-agent
+  log "builds: the instance (${BIPNIPD_REV:0:12}), LDK Server and mostro-cli beside the agent, the CLI and the helpers"
+  git clone -q https://github.com/SovereignTechnology/bipnipd "$W/bipnipd"
+  git -C "$W/bipnipd" checkout -q "$BIPNIPD_REV"
+  git clone -q https://github.com/lightningdevkit/ldk-server "$W/ldk-server"
+  git -C "$W/ldk-server" checkout -q "$LDK_SERVER_REV"
+  git clone -q https://github.com/MostroP2P/mostro-cli "$W/mostro-cli"
+  git -C "$W/mostro-cli" checkout -q "$MCLI_REV"
+  # Each tree may pin its own toolchain; let rustup install them one at a time (two installs of the
+  # same toolchain at once collide in its download directory).
+  for tree in "$W/bipnipd" "$W/ldk-server" "$W/mostro-cli" "$HERE/../.." "$LN"; do
+    (cd "$tree" && cargo --version) > /dev/null || fail "no Rust toolchain for $tree"
+  done
+  cargo build --quiet --release --locked --manifest-path "$W/bipnipd/Cargo.toml" --bin mostrod --target-dir "$W/target-d" > "$W/build-d.log" 2>&1 &
+  BUILD_D=$!
+  (cd "$W/ldk-server" && cargo build --quiet --locked -p ldk-server --target-dir "$W/target-ldk") > "$W/build-ldk.log" 2>&1 &
+  BUILD_L=$!
+  (cd "$W/mostro-cli" && cargo build --quiet --release --locked --target-dir "$W/target-m") > "$W/build-m.log" 2>&1 &
+  BUILD_M=$!
+  cargo build --quiet --locked --release --manifest-path "$LN/Cargo.toml" --target-dir "$W/target"
+  cargo build --quiet --locked --release --manifest-path "$HERE/../../Cargo.toml" -p bipnip-agent --features lnd,cln,ldk --target-dir "$W/target-ws"
+  cargo build --quiet --locked --release --manifest-path "$HERE/../../Cargo.toml" -p bipnip-cli --target-dir "$W/target-ws"
+  wait "$BUILD_D" || { tail -30 "$W/build-d.log"; fail "the instance did not build"; }
+  wait "$BUILD_L" || { tail -30 "$W/build-ldk.log"; fail "LDK Server did not build"; }
+  wait "$BUILD_M" || { tail -30 "$W/build-m.log"; fail "mostro-cli did not build"; }
+  AGENT=$W/target-ws/release/bipnip-agent MOSTROD=$W/target-d/release/mostrod
+  LDK_SERVER=$W/target-ldk/debug/ldk-server MCLI=$W/target-m/release/mostro-cli
+  HELPERS=$W/target/release BIPNIPD_SRC=$W/bipnipd
+fi
 
 log "bitcoind: a private $NET, no peers"
 cat > "$W/btc/bitcoin.conf" <<CONF
@@ -193,9 +213,9 @@ rpc_address = "127.0.0.1:$RPCPORT"
 rpc_user = "soak"
 rpc_password = "soak"
 CONF
-"$W/target-ldk/debug/ldk-server" "$W/erin/config.toml" > "$W/erin/server.log" 2>&1 &
+"$LDK_SERVER" "$W/erin/config.toml" > "$W/erin/server.log" 2>&1 &
 ERIN_CERT=$W/erin/data/tls.crt; ERIN_MAC=$W/erin/data/$NET/macaroons/admin.macaroon
-ldkw() { LDK_ADDR=127.0.0.1:$ERIN_GRPC LDK_CERT=$ERIN_CERT LDK_MAC=$ERIN_MAC "$W/target/release/ldk-wallet" "$@"; }
+ldkw() { LDK_ADDR=127.0.0.1:$ERIN_GRPC LDK_CERT=$ERIN_CERT LDK_MAC=$ERIN_MAC "$HELPERS/ldk-wallet" "$@"; }
 erin_up() { test -s "$ERIN_CERT" && test -s "$ERIN_MAC" && ldkw id; }
 wait_until 180 erin_up || { tail -40 "$W/erin/server.log" | cut -c1-300; fail "erin did not come up on $NET"; }
 
@@ -250,12 +270,12 @@ graph_full() { [ "$(lnc "$1" describegraph | python3 -c 'import json,sys;print(l
 for n in alice bob; do wait_until 300 graph_full "$n" || fail "$n's graph did not fill"; done
 
 log "the driver takes over: relays, the instance, the agents as daemons"
-read -r INSTANCE_NSEC INSTANCE_PUB < <("$W/target/release/test-key")
-read -r SOLVER_NSEC SOLVER_PUB < <("$W/target/release/test-key")
+read -r INSTANCE_NSEC INSTANCE_PUB < <("$HELPERS/test-key")
+read -r SOLVER_NSEC SOLVER_PUB < <("$HELPERS/test-key")
 mkdir -p "$W/instance"
 # The instance's own copy of carol's macaroon, owner-only: bipnipd refuses one others can read.
 install -m 600 "$(mac carol)" "$W/instance/admin.macaroon"
-python3 - "$W/bipnipd/settings.tpl.toml" "$W/instance/settings.toml" <<PY
+python3 - "$BIPNIPD_SRC/settings.tpl.toml" "$W/instance/settings.toml" <<PY
 import re, sys
 text = open(sys.argv[1]).read()
 values = {
@@ -318,9 +338,9 @@ python3 - "$W/soak/procs.json" <<PY
 import json, sys
 W = "$W"
 procs = {
-    "relay1": {"argv": [f"{W}/target/release/test-relay", "7777"], "ready": {"port": 7777}},
-    "relay2": {"argv": [f"{W}/target/release/test-relay", "7778"], "ready": {"port": 7778}},
-    "instance": {"argv": [f"{W}/target-d/release/mostrod", "--dirsettings", f"{W}/instance"],
+    "relay1": {"argv": ["$HELPERS/test-relay", "7777"], "ready": {"port": 7777}},
+    "relay2": {"argv": ["$HELPERS/test-relay", "7778"], "ready": {"port": 7778}},
+    "instance": {"argv": ["$MOSTROD", "--dirsettings", f"{W}/instance"],
                  "env": {"TERM": "xterm"}, "ready": {"log": "Scheduler Started"}},
 }
 for n in ["alice", "bob", "chris", "erin"]:
@@ -332,7 +352,7 @@ printf '%s\n' "$(lnd_cmd carol)" > "$W/soak/carol.argv"
 
 export W NET BCLI MADDR SOAK_MINUTES SOAK_DRAIN_SECS SOAK_BLOCK_SECS SOAK_AUDIT_SECS SOAK_FAULT_SECS SOAK_SEED
 export INSTANCE_PUB INSTANCE_NSEC SOLVER_NSEC SOLVER_PUB
-export MCLI="$W/target-m/release/mostro-cli" INSTANCE_DB="$W/instance/mostro.db"
+export MCLI INSTANCE_DB="$W/instance/mostro.db"
 LNC_SELLER="lncli --lnddir=$W/alice --network=$NET --rpcserver=127.0.0.1:${RPC[alice]}"
 LNC_BUYER="lncli --lnddir=$W/bob --network=$NET --rpcserver=127.0.0.1:${RPC[bob]}"
 LNC_CAROL="lncli --lnddir=$W/carol --network=$NET --rpcserver=127.0.0.1:${RPC[carol]}"
