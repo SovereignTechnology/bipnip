@@ -32,7 +32,7 @@ const fail = (message) => {
 // --- what the browser does that it should not -------------------------------------------------
 const seen = {};
 function watch(page, origin) {
-  const record = (seen[origin] = { csp: [], offOrigin: [], errors: [] });
+  const record = (seen[origin] = { csp: [], offOrigin: [], errors: [], failed: [] });
   page.on('console', (m) => {
     const text = m.text();
     if (/CSP-VIOLATION|Content[- ]Security[- ]Policy|Refused to/i.test(text)) record.csp.push(text.slice(0, 300));
@@ -43,6 +43,12 @@ function watch(page, origin) {
     const url = r.url();
     if (!url.startsWith(origin) && !url.startsWith('data:') && !url.startsWith('blob:')) {
       record.offOrigin.push(url.slice(0, 120));
+    }
+  });
+  // Which of the page's own requests failed, so a console error such as a bare 404 has a name.
+  page.on('response', (r) => {
+    if (r.status() >= 400 && r.url().startsWith(origin)) {
+      record.failed.push(`${r.status()} ${r.request().method()} ${r.url().slice(origin.length, origin.length + 120)}`);
     }
   });
   return page.addInitScript(() => {

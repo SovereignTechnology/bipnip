@@ -167,10 +167,16 @@ async fn route(st: &Arc<AppState>, req: Request) -> Response {
             return plain(StatusCode::NOT_FOUND, "unknown coordinator");
         };
         if st.connector.is_none() {
-            return plain(
+            // In the shape a coordinator's own refusals take, so the page reads it as one.
+            return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                "coordinators are off on this host (--no-tor)",
-            );
+                [
+                    (header::CONTENT_TYPE, "application/json"),
+                    (header::CACHE_CONTROL, "no-store"),
+                ],
+                r#"{"bad_request":"coordinators are off on this host (--no-tor)"}"#,
+            )
+                .into_response();
         }
         let target = match req.uri().query() {
             Some(q) => format!("{rest}?{q}"),
