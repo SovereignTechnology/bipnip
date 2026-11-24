@@ -13,7 +13,8 @@ Nostr-native peer-to-peer Lightning exchange) that keeps all of Mostro and adds:
 Everything travels over Nostr relays. Anyone who runs a node can run an instance; instances coordinate
 leases and rings but never hold lease money.
 
-Status: **M2 and the trust layer done on regtest; the web client's Liquidity tab (W1) in progress**. M0 (forks,
+Status: **M2, the trust layer and the web client's Liquidity tab (W1) done on regtest; hardening for
+real funds in progress**. M0 (forks,
 specs, spikes) is done. The LND backend passes its
 conformance run against real nodes; `bipnip-agent` can create a mnemonic, bind a node and publish the
 binding. A whole lease now runs end to end on regtest: a seller's agent offers liquidity on an instance,
