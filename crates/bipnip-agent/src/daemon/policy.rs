@@ -50,15 +50,35 @@ pub struct Ask {
     pub bond_sat: u64,
     /// The node it would lease from, when that is known at the start (66 hex).
     pub peer: Option<String>,
+    /// The fee rate of the funding transaction of a channel this node opens, in sat/vB; 0 when
+    /// it opens none. A grant or parked request written before this was weighed has none, and
+    /// reads as no limit, as it was then.
+    #[serde(default = "no_feerate_limit")]
+    pub feerate_sat_vb: u64,
+    /// For a lease sold: the lowest price it may go at, the fee per sat of capacity per block in
+    /// parts per billion (as the order book shows it), at the largest capacity offered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sale_ppb_per_block: Option<u64>,
+}
+
+fn no_feerate_limit() -> u64 {
+    u64::MAX
 }
 
 impl Ask {
-    /// True when `self` asks for no more than `shown` did, of the same peer: what an approval
-    /// of `shown` covers.
+    /// True when `self` asks for no more than `shown` did, of the same peer, and sells for no
+    /// less: what an approval of `shown` covers.
     pub fn within(&self, shown: &Ask) -> bool {
+        let sale_within = match (self.sale_ppb_per_block, shown.sale_ppb_per_block) {
+            (Some(now), Some(then)) => now >= then,
+            (None, None) => true,
+            _ => false,
+        };
         self.fee_sat <= shown.fee_sat
             && self.capacity_sat <= shown.capacity_sat
             && self.bond_sat <= shown.bond_sat
+            && self.feerate_sat_vb <= shown.feerate_sat_vb
+            && sale_within
             && self.peer == shown.peer
     }
 }
@@ -70,8 +90,21 @@ pub struct Usage {
     pub fee_day_sat: u64,
     /// Capacity of the channels this node was to open within the last day, in satoshi.
     pub capacity_day_sat: u64,
+    /// Bonds locked within the last day, in satoshi.
+    pub bond_day_sat: u64,
     /// Runs under way.
     pub runs: u32,
+}
+
+/// What the grants of the last day add up to.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DayUse {
+    /// Fees, in satoshi.
+    pub fee_sat: u64,
+    /// Capacity of channels this node was to open, in satoshi.
+    pub capacity_sat: u64,
+    /// Bonds, in satoshi.
+    pub bond_sat: u64,
 }
 
 /// Why a take from a seller whose node our graph shows as `graph` (public channels, their
@@ -134,6 +167,31 @@ pub fn over(policy: &PolicyConfig, ask: &Ask, usage: &Usage) -> Vec<String> {
             "the bond is {} sat; max_bond_sat is {}",
             ask.bond_sat, policy.max_bond_sat
         ));
+    }
+    if ask.bond_sat > 0
+        && usage.bond_day_sat.saturating_add(ask.bond_sat) > policy.max_bond_per_day_sat
+    {
+        reasons.push(format!(
+            "the bond is {} sat on top of {} in the last day; max_bond_per_day_sat is {}",
+            ask.bond_sat, usage.bond_day_sat, policy.max_bond_per_day_sat
+        ));
+    }
+    if ask.feerate_sat_vb > policy.max_feerate_sat_vb {
+        reasons.push(format!(
+            "its funding transaction would pay {} sat/vB; max_feerate_sat_vb is {}",
+            ask.feerate_sat_vb, policy.max_feerate_sat_vb
+        ));
+    }
+    if let Some(price) = ask.sale_ppb_per_block {
+        match policy.min_sale_ppb_per_block {
+            None => reasons.push(format!(
+                "it sells at {price} ppb per block; min_sale_ppb_per_block is not set"
+            )),
+            Some(floor) if price < floor => reasons.push(format!(
+                "it sells at {price} ppb per block; min_sale_ppb_per_block is {floor}"
+            )),
+            Some(_) => {}
+        }
     }
     if let Some(peer) = &ask.peer
         && !peer_allowed(policy, peer)
@@ -333,18 +391,19 @@ impl PolicyStore {
 
     /// What the grants of the last day add up to at `now`. A grant that cannot be read is an
     /// error, not a zero: a limit is never passed because a file was unreadable.
-    pub fn used_since(&self, now: u64) -> Result<(u64, u64), PolicyError> {
-        let (mut fee, mut capacity) = (0u64, 0u64);
+    pub fn used_since(&self, now: u64) -> Result<DayUse, PolicyError> {
+        let mut used = DayUse::default();
         for run in self.names("grant-")? {
             let Some(grant) = self.grant(&run)? else {
                 continue;
             };
             if grant.at.saturating_add(DAY_SECS) > now {
-                fee = fee.saturating_add(grant.ask.fee_sat);
-                capacity = capacity.saturating_add(grant.ask.capacity_sat);
+                used.fee_sat = used.fee_sat.saturating_add(grant.ask.fee_sat);
+                used.capacity_sat = used.capacity_sat.saturating_add(grant.ask.capacity_sat);
+                used.bond_sat = used.bond_sat.saturating_add(grant.ask.bond_sat);
             }
         }
-        Ok((fee, capacity))
+        Ok(used)
     }
 
     /// Stores a parked request.
@@ -564,6 +623,12 @@ impl LightningBackend for Guard<'_> {
             )));
         }
         let grant = self.snapshot();
+        if req.feerate_sat_vb > grant.ask.feerate_sat_vb {
+            return Err(refused(format!(
+                "this run was granted a funding fee rate of {} sat/vB; this asks for {}",
+                grant.ask.feerate_sat_vb, req.feerate_sat_vb
+            )));
+        }
         if grant.opened_sat.saturating_add(req.capacity_sat) > grant.ask.capacity_sat {
             return Err(refused(format!(
                 "this run was granted {} sat of channel capacity; {} are opened and this asks \
@@ -624,6 +689,9 @@ mod tests {
             max_fee_per_day_sat: 12_000,
             max_capacity_per_day_sat: 2_000_000,
             max_bond_sat: 20_000,
+            max_bond_per_day_sat: 30_000,
+            max_feerate_sat_vb: 10,
+            min_sale_ppb_per_block: Some(500),
             max_runs: 2,
             allowed_peers: Vec::new(),
             min_seller_channels: 0,
@@ -638,6 +706,17 @@ mod tests {
             capacity_sat,
             bond_sat,
             peer: None,
+            feerate_sat_vb: 0,
+            sale_ppb_per_block: None,
+        }
+    }
+
+    /// A lease offer's ask: capacity, funding fee rate and price.
+    fn sale(capacity_sat: u64, feerate_sat_vb: u64, ppb: u64) -> Ask {
+        Ask {
+            feerate_sat_vb,
+            sale_ppb_per_block: Some(ppb),
+            ..ask(0, capacity_sat, 0)
         }
     }
 
@@ -677,9 +756,90 @@ mod tests {
             "max_fee_per_day_sat",
             "max_capacity_per_day_sat",
             "max_bond_sat",
+            "max_bond_per_day_sat",
         ] {
             assert!(reasons.iter().any(|reason| reason.contains(key)), "{key}");
         }
+        // An offer: no fee rate is allowed and no sale price is set.
+        let reasons = over(&nothing, &sale(1, 1, 1_000_000), &idle);
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("max_feerate_sat_vb is 0")),
+            "{reasons:?}"
+        );
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("min_sale_ppb_per_block is not set")),
+            "{reasons:?}"
+        );
+    }
+
+    #[test]
+    fn the_funding_fee_rate_the_sale_price_and_a_days_bonds_are_weighed() {
+        let policy = policy();
+        let idle = Usage::default();
+        assert!(over(&policy, &sale(1_000_000, 10, 500), &idle).is_empty());
+        for (ask, usage, key) in [
+            (sale(1_000_000, 11, 500), idle, "max_feerate_sat_vb is 10"),
+            (
+                sale(1_000_000, 10, 499),
+                idle,
+                "min_sale_ppb_per_block is 500",
+            ),
+            (
+                ask(0, 0, 10_000),
+                Usage {
+                    bond_day_sat: 20_001,
+                    ..idle
+                },
+                "max_bond_per_day_sat",
+            ),
+        ] {
+            let reasons = over(&policy, &ask, &usage);
+            assert_eq!(reasons.len(), 1, "{key}: {reasons:?}");
+            assert!(reasons[0].contains(key), "{key}: {reasons:?}");
+        }
+        // A day's bonds stand in the way of a bond only.
+        let bonded = Usage {
+            bond_day_sat: 30_000,
+            ..idle
+        };
+        assert!(over(&policy, &ask(1_000, 0, 0), &bonded).is_empty());
+        assert!(
+            over(
+                &policy,
+                &ask(0, 0, 10_000),
+                &Usage {
+                    bond_day_sat: 20_000,
+                    ..idle
+                }
+            )
+            .is_empty()
+        );
+        // A floor of zero lets any price through, once someone has set it.
+        let any_price = PolicyConfig {
+            min_sale_ppb_per_block: Some(0),
+            ..policy
+        };
+        assert!(over(&any_price, &sale(1_000_000, 1, 0), &idle).is_empty());
+    }
+
+    #[test]
+    fn a_grant_or_request_stored_before_fee_rates_were_weighed_still_loads() {
+        let old = r#"{"fee_sat":0,"capacity_sat":500000,"bond_sat":0,"peer":null}"#;
+        let ask: Ask = serde_json::from_str(old).expect("an old ask");
+        assert_eq!(ask.feerate_sat_vb, u64::MAX, "no limit, as it was then");
+        assert_eq!(ask.sale_ppb_per_block, None);
+        // And what is written now says both.
+        let json = serde_json::to_string(&sale(1_000_000, 2, 810)).expect("json");
+        assert!(
+            json.contains("\"feerate_sat_vb\":2") && json.contains("\"sale_ppb_per_block\":810"),
+            "{json}"
+        );
+        let back: Ask = serde_json::from_str(&json).expect("back");
+        assert_eq!(back, sale(1_000_000, 2, 810));
     }
 
     #[test]
@@ -723,9 +883,11 @@ mod tests {
         let full = Usage {
             fee_day_sat: u64::MAX,
             capacity_day_sat: u64::MAX,
+            bond_day_sat: u64::MAX,
             runs: 0,
         };
         assert_eq!(over(&policy, &ask(1, 1, 0), &full).len(), 2);
+        assert_eq!(over(&policy, &ask(1, 1, 1), &full).len(), 3);
     }
 
     #[test]
@@ -784,6 +946,22 @@ mod tests {
         ] {
             assert!(!more.within(&shown), "{more:?}");
         }
+        // An offer approved as shown covers the same offer, a lower fee rate and a higher price;
+        // not a higher fee rate, a lower price, or the same request without a price.
+        let offer = sale(1_000_000, 2, 810);
+        assert!(offer.within(&offer));
+        assert!(sale(1_000_000, 1, 900).within(&offer));
+        for more in [
+            sale(1_000_000, 3, 810),
+            sale(1_000_000, 2, 809),
+            Ask {
+                sale_ppb_per_block: None,
+                ..offer.clone()
+            },
+        ] {
+            assert!(!more.within(&offer), "{more:?}");
+        }
+        assert!(!offer.within(&ask(0, 1_000_000, 0)));
     }
 
     #[test]
@@ -815,10 +993,15 @@ mod tests {
                 false,
             ))
             .expect("save");
-        assert_eq!(store.used_since(now), Ok((3_000, 400_000)));
+        let day = DayUse {
+            fee_sat: 3_000,
+            capacity_sat: 400_000,
+            bond_sat: 5_000,
+        };
+        assert_eq!(store.used_since(now), Ok(day));
         // Read again from disk by a new handle, as after a restart.
         let again = PolicyStore::open(&store.dir).expect("open");
-        assert_eq!(again.used_since(now), Ok((3_000, 400_000)));
+        assert_eq!(again.used_since(now), Ok(day));
         assert_eq!(
             again.grant("ring-02").expect("read").map(|g| g.approved),
             Some(true)
@@ -849,13 +1032,19 @@ mod tests {
                 false,
             ))
             .expect("save");
-        assert_eq!(store.used_since(now), Ok((3_000, 0)));
+        assert_eq!(
+            store.used_since(now),
+            Ok(DayUse {
+                fee_sat: 3_000,
+                ..DayUse::default()
+            })
+        );
         store.put_away_grant("buyer-01").expect("put away");
         store.put_away_grant("buyer-01").expect("twice is fine");
         store
             .put_away_grant("buyer-02")
             .expect("a run without a grant");
-        assert_eq!(store.used_since(now), Ok((0, 0)));
+        assert_eq!(store.used_since(now), Ok(DayUse::default()));
         assert_eq!(store.grant("buyer-01"), Ok(None));
         assert!(store.dir.join("done").join("grant-buyer-01.json").exists());
         assert!(store.put_away_grant("../x").is_err());
@@ -1040,7 +1229,11 @@ mod tests {
         };
         let stranger = format!("03{}", "33".repeat(32));
 
-        let grant = Grant::new("ring-0c".into(), 10, ask(0, 500_000, 0), false);
+        let at_2 = |capacity_sat| Ask {
+            feerate_sat_vb: 2,
+            ..ask(0, capacity_sat, 0)
+        };
+        let grant = Grant::new("ring-0c".into(), 10, at_2(500_000), false);
         let guard = Guard::new(&ours, &store, &policy, grant);
         assert!(
             guard
@@ -1048,6 +1241,16 @@ mod tests {
                 .await
                 .is_err()
         );
+        // Nor at a higher funding fee rate than granted.
+        let dearer = guard
+            .open_channel(&OpenRequest {
+                feerate_sat_vb: 3,
+                ..open(500_000, &theirs.id())
+            })
+            .await
+            .expect_err("a higher fee rate");
+        assert!(dearer.to_string().contains("fee rate"), "{dearer}");
+        assert_eq!(ours.world.lock().expect("world").channels.len(), 0);
         guard
             .open_channel(&open(500_000, &theirs.id()))
             .await
@@ -1059,7 +1262,7 @@ mod tests {
 
         // With a list of peers, a node outside it gets no channel, whatever was granted.
         policy.allowed_peers = vec![theirs.id()];
-        let grant = Grant::new("ring-0d".into(), 10, ask(0, 500_000, 0), true);
+        let grant = Grant::new("ring-0d".into(), 10, at_2(500_000), true);
         let guard = Guard::new(&ours, &store, &policy, grant);
         let refused = guard
             .open_channel(&open(100_000, &stranger))

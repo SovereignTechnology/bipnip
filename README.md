@@ -13,7 +13,8 @@ Nostr-native peer-to-peer Lightning exchange) that keeps all of Mostro and adds:
 Everything travels over Nostr relays. Anyone who runs a node can run an instance; instances coordinate
 leases and rings but never hold lease money.
 
-Status: **M2 and the trust layer done on regtest; the web client's Liquidity tab (W1) in progress**. M0 (forks,
+Status: **M2, the trust layer and the web client's Liquidity tab (W1) done on regtest; hardening for
+real funds in progress**. M0 (forks,
 specs, spikes) is done. The LND backend passes its
 conformance run against real nodes; `bipnip-agent` can create a mnemonic, bind a node and publish the
 binding. A whole lease now runs end to end on regtest: a seller's agent offers liquidity on an instance,
@@ -171,7 +172,10 @@ pubkey = "npub1…"
 max_fee_per_lease_sat = 5000     # a buyer's whole fee for one lease
 max_fee_per_day_sat = 20000      # all leases taken in a day
 max_capacity_per_day_sat = 3000000   # channels this agent opens in a day: leases sold, rings
+max_feerate_sat_vb = 10          # the funding fee rate of those channels
+min_sale_ppb_per_block = 800     # the lowest price a lease sold may go at, as the book shows it
 max_bond_sat = 50000
+max_bond_per_day_sat = 100000    # all bonds locked in a day
 max_runs = 4                     # leases and rings under way at once
 allowed_peers = []               # node keys; empty means any
 ```

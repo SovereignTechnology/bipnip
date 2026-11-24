@@ -580,6 +580,11 @@ impl SellerRun {
         &self.offer
     }
 
+    /// The fee rate its funding transaction will pay, in sat/vB.
+    pub fn feerate_sat_vb(&self) -> u64 {
+        self.config.feerate_sat_vb
+    }
+
     /// The order id, once the instance has given one.
     pub fn order_id(&self) -> Option<Uuid> {
         self.order_id

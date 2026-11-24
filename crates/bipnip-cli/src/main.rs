@@ -488,6 +488,15 @@ fn describe_parked(parked: &Value) -> String {
     if let Some(peer) = ask["peer"].as_str() {
         text.push_str(&format!(", with node {peer}"));
     }
+    // A fee rate of 0 opens nothing; one of u64::MAX was stored before fee rates were weighed.
+    match ask["feerate_sat_vb"].as_u64() {
+        Some(0) | None => {}
+        Some(u64::MAX) => text.push_str(", funding fee rate not recorded"),
+        Some(rate) => text.push_str(&format!(", fund its channel at up to {rate} sat/vB")),
+    }
+    if let Some(price) = ask["sale_ppb_per_block"].as_u64() {
+        text.push_str(&format!(", sell at no less than {price} ppb per block"));
+    }
     text.push('\n');
     for reason in parked["over"].as_array().into_iter().flatten() {
         text.push_str(&format!(
@@ -684,8 +693,18 @@ mod tests {
         }
         let own = json!({"approval": "3f2b", "method": "lease.offer", "params": {},
                          "ask": {"fee_sat": 0, "capacity_sat": 1_000_000, "bond_sat": 0,
-                                 "peer": null}, "over": []});
-        assert!(describe_parked(&own).contains("this machine"));
+                                 "peer": null, "feerate_sat_vb": 2,
+                                 "sale_ppb_per_block": 810}, "over": []});
+        let text = describe_parked(&own);
+        for part in [
+            "this machine",
+            "fund its channel at up to 2 sat/vB",
+            "sell at no less than 810 ppb per block",
+        ] {
+            assert!(text.contains(part), "{part:?} in {text}");
+        }
+        // A take opens nothing, and says nothing of fee rates.
+        assert!(!describe_parked(&parked).contains("sat/vB"));
     }
 
     #[test]

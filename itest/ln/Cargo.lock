@@ -1440,8 +1440,8 @@ dependencies = [
 
 [[package]]
 name = "mostro-core"
-version = "0.17.3"
-source = "git+https://github.com/SovereignTechnology/bipnip-core?rev=ef08e969502892499e922a988f84e2168b744ac4#ef08e969502892499e922a988f84e2168b744ac4"
+version = "0.17.4"
+source = "git+https://github.com/SovereignTechnology/bipnip-core?rev=ce20878c2a65ffde4f66a52000c5d5182dad0a70#ce20878c2a65ffde4f66a52000c5d5182dad0a70"
 dependencies = [
  "bitcoin",
  "chrono",
@@ -1839,7 +1839,7 @@ dependencies = [
  "once_cell",
  "socket2 0.5.10",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
