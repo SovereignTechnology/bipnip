@@ -20,6 +20,7 @@ set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 W=${ITEST_WORK:-/tmp/bipnip-mixed-itest}
 rm -rf "$W"; mkdir -p "$W"/{dl,bin,btc,cln}
+. "$HERE/cache.sh"   # $C: downloads and target dirs kept between runs (cache.sh)
 log() { printf '[itest %s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 fail() { log "FAIL: $*"; exit 1; }
 jget() { python3 -c 'import json,sys
@@ -39,7 +40,6 @@ HOLD_SHA=f9d916430fb70a3d75089f2d1b88d5d71d4987ef79933035978c1f44aab84be5
 LDK_SERVER_REV=d7e7a2e708664af922c53c786ad6a5df622f5dd8
 # The instance: the same revision run-lnd.sh uses.
 BIPNIPD_REV=028099e547a30a929fe0dcee36ef4d15d19a3b43
-fetch() { curl -fsSL --retry 3 -o "$3" "$1"; echo "$2  $3" | sha256sum -c --quiet; }
 
 log "tools"
 export DEBIAN_FRONTEND=noninteractive
@@ -60,16 +60,16 @@ CLN_BIN=$(dirname "$(find "$W/cln" -type f -name lightningd | sed -n 1p)")
 export PATH=$W/bin:$CLN_BIN:$PATH
 
 log "build: the test programs, the agent for all three kinds of node, LDK Server, the instance"
-cargo build --quiet --locked --release --manifest-path "$HERE/Cargo.toml" --target-dir "$W/target"
-cargo build --quiet --locked --release --manifest-path "$HERE/../../Cargo.toml" -p bipnip-agent --features lnd,cln,ldk --target-dir "$W/target-ws"
-AGENT=$W/target-ws/release/bipnip-agent
+cargo build --quiet --locked --release --manifest-path "$HERE/Cargo.toml" --target-dir "$C/target"
+cargo build --quiet --locked --release --manifest-path "$HERE/../../Cargo.toml" -p bipnip-agent --features lnd,cln,ldk --target-dir "$C/target-ws"
+AGENT=$C/target-ws/release/bipnip-agent
 git clone -q https://github.com/lightningdevkit/ldk-server "$W/ldk-server"
 git -C "$W/ldk-server" checkout -q "$LDK_SERVER_REV"
-( cd "$W/ldk-server" && cargo build --quiet --locked -p ldk-server --target-dir "$W/target-ldk" )
-LDK_SERVER=$W/target-ldk/debug/ldk-server
+( cd "$W/ldk-server" && cargo build --quiet --locked -p ldk-server --target-dir "$C/target-ldk" )
+LDK_SERVER=$C/target-ldk/debug/ldk-server
 git clone --quiet https://github.com/SovereignTechnology/bipnipd "$W/bipnipd"
 git -C "$W/bipnipd" checkout --quiet "$BIPNIPD_REV"
-cargo build --quiet --release --locked --manifest-path "$W/bipnipd/Cargo.toml" --bin mostrod --target-dir "$W/target-d"
+cargo build --quiet --release --locked --manifest-path "$W/bipnipd/Cargo.toml" --bin mostrod --target-dir "$C/target-d"
 
 log "bitcoind regtest"
 cat > "$W/btc/bitcoin.conf" <<CONF
@@ -149,7 +149,7 @@ rpc_password = "itest"
 CONF
 "$LDK_SERVER" "$W/erin/config.toml" > "$W/erin/server.log" 2>&1 &
 ERIN_CERT=$W/erin/data/tls.crt; ERIN_MAC=$W/erin/data/regtest/macaroons/admin.macaroon
-ldkw() { LDK_ADDR=127.0.0.1:$ERIN_GRPC LDK_CERT=$ERIN_CERT LDK_MAC=$ERIN_MAC "$W/target/release/ldk-wallet" "$@"; }
+ldkw() { LDK_ADDR=127.0.0.1:$ERIN_GRPC LDK_CERT=$ERIN_CERT LDK_MAC=$ERIN_MAC "$C/target/release/ldk-wallet" "$@"; }
 erin_up() { test -s "$ERIN_CERT" && test -s "$ERIN_MAC" && ldkw id; }
 wait_until 120 erin_up || { tail -40 "$W/erin/server.log" | cut -c1-300; fail "erin did not come up"; }
 
@@ -177,11 +177,11 @@ chris_chans() { [ "$(clc listpeerchannels | python3 -c 'import json,sys;print(su
 wait_until 180 alice_chans 2 || fail "alice does not have both channels with chris active"
 wait_until 180 chris_chans 2 || fail "chris does not have both channels with alice normal"
 
-"$W/target/release/test-relay" 7777 > "$W/relay.log" 2>&1 &
+"$C/target/release/test-relay" 7777 > "$W/relay.log" 2>&1 &
 wait_until 30 grep -q listening "$W/relay.log"
 
 log "instance: settings and start"
-read -r INSTANCE_NSEC INSTANCE_PUB < <("$W/target/release/test-key")
+read -r INSTANCE_NSEC INSTANCE_PUB < <("$C/target/release/test-key")
 mkdir -p "$W/instance"
 # The daemon's own template, with this run's node, relay, key and database. The price source is
 # pointed at a closed local port: this run makes no outside calls and trades no fiat.
@@ -208,7 +208,7 @@ text += "\n[liquidity]\nbonds = true\nmax_bond_sat = 100000\nlease_bond_window_s
 open(sys.argv[2], "w").write(text)
 PY
 chmod 600 "$W/instance/settings.toml"
-TERM=xterm "$W/target-d/release/mostrod" --dirsettings "$W/instance" > "$W/instance/mostrod.log" 2>&1 < /dev/null &
+TERM=xterm "$C/target-d/release/mostrod" --dirsettings "$W/instance" > "$W/instance/mostrod.log" 2>&1 < /dev/null &
 INSTANCE_PID=$!
 instance_log() { sed 's/\x1b\[[0-9;]*[A-Za-z]//g' "$W/instance/mostrod.log" | tail -"${1:-40}" | sed 's/^/  instance: /'; }
 wait_until 120 grep -q "Scheduler Started" "$W/instance/mostrod.log" \
