@@ -21,6 +21,7 @@ set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 W=${ITEST_WORK:-/tmp/bipnip-fiat-itest}
 rm -rf "$W"; mkdir -p "$W"/{dl,bin,btc,instance}
+. "$HERE/cache.sh"   # $C: downloads and target dirs kept between runs (cache.sh)
 log() { printf '[itest %s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 fail() { log "FAIL: $*"; exit 1; }
 jget() { python3 -c 'import json,sys
@@ -37,7 +38,6 @@ LND_SHA=2127d4794ea9cbd98e762ba16283615158743646d2d6d2a5bf88664dd6255ce7
 BIPNIPD_REV=${BIPNIPD_REV:-342990f254a40d350084147a4eed481366408d49}
 # mostro-cli v0.17.1, upstream's command-line client (mostro-core 0.17.3 on the wire).
 MCLI_REV=0665895f0a9806756252bd34a0572416f7c13e61
-fetch() { curl -fsSL --retry 3 -o "$3" "$1"; echo "$2  $3" | sha256sum -c --quiet; }
 
 log "tools"
 export DEBIAN_FRONTEND=noninteractive
@@ -64,12 +64,12 @@ for tree in "$W/bipnipd" "$W/mostro-cli" "$HERE"; do
   (cd "$tree" && cargo --version) > /dev/null || fail "no Rust toolchain for $tree"
 done
 cargo build --quiet --release --locked --manifest-path "$W/bipnipd/Cargo.toml" --bin mostrod \
-  --target-dir "$W/target-d" > "$W/build-d.log" 2>&1 &
+  --target-dir "$C/target-d" > "$W/build-d.log" 2>&1 &
 BUILD_D=$!
-(cd "$W/mostro-cli" && cargo build --quiet --release --locked --target-dir "$W/target-m") \
+(cd "$W/mostro-cli" && cargo build --quiet --release --locked --target-dir "$C/target-m") \
   > "$W/build-m.log" 2>&1 &
 BUILD_M=$!
-cargo build --quiet --release --manifest-path "$HERE/Cargo.toml" --target-dir "$W/target" \
+cargo build --quiet --release --manifest-path "$HERE/Cargo.toml" --target-dir "$C/target" \
   --bin test-relay --bin test-key
 wait "$BUILD_D" || { tail -30 "$W/build-d.log"; fail "the instance did not build"; }
 wait "$BUILD_M" || { tail -30 "$W/build-m.log"; fail "mostro-cli did not build"; }
@@ -126,12 +126,12 @@ active() { [ "$(lnc "$1" listchannels --active_only | python3 -c 'import json,sy
 wait_until 120 active carol 2 || fail "the channels did not become active"
 
 log "the relay"
-"$W/target/release/test-relay" 7777 > "$W/relay.log" 2>&1 &
+"$C/target/release/test-relay" 7777 > "$W/relay.log" 2>&1 &
 wait_until 30 bash -c 'exec 3<>/dev/tcp/127.0.0.1/7777' || fail "the relay did not start"
 
 log "instance: settings and start"
-read -r INSTANCE_NSEC INSTANCE_PUB < <("$W/target/release/test-key")
-read -r SOLVER_NSEC SOLVER_PUB < <("$W/target/release/test-key")
+read -r INSTANCE_NSEC INSTANCE_PUB < <("$C/target/release/test-key")
+read -r SOLVER_NSEC SOLVER_PUB < <("$C/target/release/test-key")
 # The daemon's own template, with this run's node, relay, key and database. Orders here name their
 # amount in sats, so no price is looked up: the price source is a closed local port. A 1 % fee, so
 # the amounts the instance asks for are checked with a fee in them.
@@ -155,12 +155,12 @@ for key, value in values.items():
 open(sys.argv[2], "w").write(text)
 PY
 chmod 600 "$W/instance/settings.toml"
-TERM=xterm "$W/target-d/release/mostrod" --dirsettings "$W/instance" > "$W/instance/mostrod.log" 2>&1 < /dev/null &
+TERM=xterm "$C/target-d/release/mostrod" --dirsettings "$W/instance" > "$W/instance/mostrod.log" 2>&1 < /dev/null &
 instance_log() { sed 's/\x1b\[[0-9;]*[A-Za-z]//g' "$W/instance/mostrod.log" | tail -"${1:-40}" | sed 's/^/  instance: /'; }
 wait_until 120 grep -q "Scheduler Started" "$W/instance/mostrod.log" || { instance_log; fail "the instance did not start"; }
 
 export W INSTANCE_NSEC SOLVER_NSEC SOLVER_PUB
-export MCLI="$W/target-m/release/mostro-cli" INSTANCE_DB="$W/instance/mostro.db"
+export MCLI="$C/target-m/release/mostro-cli" INSTANCE_DB="$W/instance/mostro.db"
 LNC_SELLER=$(lncmd alice)
 LNC_BUYER=$(lncmd bob)
 export LNC_SELLER LNC_BUYER

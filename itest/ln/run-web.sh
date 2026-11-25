@@ -23,6 +23,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/../.." && pwd)
 W=${ITEST_WORK:-/tmp/bipnip-web-itest}
 rm -rf "$W"; mkdir -p "$W"/{dl,bin,btc,shots}
+. "$HERE/cache.sh"   # $C: downloads and target dirs kept between runs (cache.sh)
 chmod 755 "$W"
 log() { printf '[itest %s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 fail() { log "FAIL: $*"; dump; exit 1; }
@@ -49,7 +50,6 @@ BIPNIPD_REV=028099e547a30a929fe0dcee36ef4d15d19a3b43
 BIPNIP_WEB_REV=${BIPNIP_WEB_REV:-4b2a6006dc33c0055d8c846d5aa421fe713dc6a1}
 # Playwright: the release W0 ran with.
 PW=1.64.1
-fetch() { curl -fsSL --retry 3 -o "$3" "$1"; echo "$2  $3" | sha256sum -c --quiet; }
 
 log "tools"
 export DEBIAN_FRONTEND=noninteractive
@@ -84,14 +84,14 @@ export PATH=$W/bin:$PATH
 
 log "build: the agent (LND), the command line, the web host, the test relay and key, the instance"
 cargo build --quiet --release --manifest-path "$REPO/Cargo.toml" -p bipnip-agent -p bipnip-cli \
-  -p bipnip-webhost --features bipnip-agent/lnd --target-dir "$W/target-ws"
+  -p bipnip-webhost --features bipnip-agent/lnd --target-dir "$C/target-ws"
 cargo build --quiet --release --manifest-path "$HERE/Cargo.toml" --bin test-relay --bin test-key \
-  --target-dir "$W/target"
+  --target-dir "$C/target"
 git clone --quiet https://github.com/SovereignTechnology/bipnipd "$W/bipnipd"
 git -C "$W/bipnipd" checkout --quiet "$BIPNIPD_REV"
-cargo build --quiet --release --locked --manifest-path "$W/bipnipd/Cargo.toml" --bin mostrod --target-dir "$W/target-d"
-AGENT=$W/target-ws/release/bipnip-agent
-CLI=$W/target-ws/release/bipnip
+cargo build --quiet --release --locked --manifest-path "$W/bipnipd/Cargo.toml" --bin mostrod --target-dir "$C/target-d"
+AGENT=$C/target-ws/release/bipnip-agent
+CLI=$C/target-ws/release/bipnip
 
 log "bitcoind regtest"
 cat > "$W/btc/bitcoin.conf" <<CONF
@@ -143,9 +143,9 @@ pay_channel() { [ "$(lnc alice listchannels | python3 -c 'import json,sys; print
 wait_until 90 pay_channel || fail "the channel alice -> bob did not become active"
 
 log "the test relay and the instance"
-"$W/target/release/test-relay" 7777 > "$W/relay.log" 2>&1 &
+"$C/target/release/test-relay" 7777 > "$W/relay.log" 2>&1 &
 wait_until 30 grep -q listening "$W/relay.log"
-read -r INSTANCE_NSEC INSTANCE_PUB < <("$W/target/release/test-key")
+read -r INSTANCE_NSEC INSTANCE_PUB < <("$C/target/release/test-key")
 mkdir -p "$W/instance"
 python3 - "$W/bipnipd/settings.tpl.toml" "$W/instance/settings.toml" <<PY
 import re, sys
@@ -168,7 +168,7 @@ text += "\n[liquidity]\nrequire_seller_in_graph = false\n"
 open(sys.argv[2], "w").write(text)
 PY
 chmod 600 "$W/instance/settings.toml"
-TERM=xterm "$W/target-d/release/mostrod" --dirsettings "$W/instance" > "$W/instance/mostrod.log" 2>&1 < /dev/null &
+TERM=xterm "$C/target-d/release/mostrod" --dirsettings "$W/instance" > "$W/instance/mostrod.log" 2>&1 < /dev/null &
 wait_until 120 grep -q "Scheduler Started" "$W/instance/mostrod.log" || fail "the instance did not start"
 
 log "the web host's own user, and the web door's directory"
@@ -203,9 +203,12 @@ agent_conf alice "max_runs = 4" "
 socket = \"$DOOR_DIR/web.sock\"
 socket_mode = 0o660
 allow_uids = [$WEB_UID]"
-# Bob offers and proposes from his command line without being asked.
+# Bob offers and proposes from his command line without being asked: up to 10 sat/vB for a channel he
+# opens, and at any price (a limit left unset parks what it covers, bipnip #54).
 agent_conf bob "max_runs = 4
-max_capacity_per_day_sat = 10000000"
+max_capacity_per_day_sat = 10000000
+max_feerate_sat_vb = 10
+min_sale_ppb_per_block = 0"
 for n in alice bob; do "$AGENT" --config "$W/$n-d.toml" init > /dev/null; done
 bip() { local n=$1; shift; "$CLI" --socket "$W/$n-agent/agent.sock" "$@"; }
 for n in alice bob; do
@@ -225,7 +228,7 @@ log "the web host, as bipweb, on the VM's address and on loopback"
 wait "$WEB_BUILD" || { tail -40 "$W/web-build.log"; fail "bipnip-web did not build"; }
 install -d -m 755 /opt/bipnip-web
 rm -rf /opt/bipnip-web/dist; cp -r "$W/web/dist" /opt/bipnip-web/dist; chmod -R a+rX /opt/bipnip-web
-install -m 755 "$W/target-ws/release/bipnip-webhost" /opt/bipnip-web/bipnip-webhost
+install -m 755 "$C/target-ws/release/bipnip-webhost" /opt/bipnip-web/bipnip-webhost
 # The address the VM reaches out from (a UDP connect sends nothing). Not `ip`: the image has none.
 IP=$(python3 -c 'import socket
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

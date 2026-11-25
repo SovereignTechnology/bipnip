@@ -11,6 +11,7 @@ set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 W=${ITEST_WORK:-/tmp/bipnip-ln-itest}
 rm -rf "$W"; mkdir -p "$W"/{dl,bin,btc}
+. "$HERE/cache.sh"   # $C: downloads and target dirs kept between runs (cache.sh)
 log() { printf '[itest %s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 jget() { python3 -c 'import json,sys
 d=json.load(sys.stdin)
@@ -22,7 +23,6 @@ BTC_V=30.4
 BTC_SHA=051a18c595d9a27df23cb7187ff9fb343e90943cb142af751e12787806500c3d
 LND_V=v0.21.5-beta
 LND_SHA=2127d4794ea9cbd98e762ba16283615158743646d2d6d2a5bf88664dd6255ce7
-fetch() { curl -fsSL --retry 3 -o "$3" "$1"; echo "$2  $3" | sha256sum -c --quiet; }
 
 log "tools"
 export DEBIAN_FRONTEND=noninteractive
@@ -39,14 +39,14 @@ tar xzf "$W/dl/lnd.tgz" -C "$W/dl"; cp "$W/dl/lnd-linux-amd64-$LND_V/"{lnd,lncli
 export PATH=$W/bin:$PATH
 
 log "unit tests and clippy of bipnip-ln with the lnd feature"
-cargo clippy --quiet --manifest-path "$HERE/../../Cargo.toml" -p bipnip-ln --features lnd --all-targets --target-dir "$W/target-ws" -- -D warnings
-cargo test --manifest-path "$HERE/../../Cargo.toml" -p bipnip-ln --features lnd --target-dir "$W/target-ws" > "$W/unit.log" 2>&1 \
+cargo clippy --quiet --manifest-path "$HERE/../../Cargo.toml" -p bipnip-ln --features lnd --all-targets --target-dir "$C/target-ws" -- -D warnings
+cargo test --manifest-path "$HERE/../../Cargo.toml" -p bipnip-ln --features lnd --target-dir "$C/target-ws" > "$W/unit.log" 2>&1 \
   || { tail -40 "$W/unit.log"; exit 1; }
 grep -E '^test result' "$W/unit.log"
 
 log "build the conformance program"
-cargo clippy --quiet --manifest-path "$HERE/Cargo.toml" --target-dir "$W/target" -- -D warnings
-cargo build --quiet --release --manifest-path "$HERE/Cargo.toml" --target-dir "$W/target"
+cargo clippy --quiet --manifest-path "$HERE/Cargo.toml" --target-dir "$C/target" -- -D warnings
+cargo build --quiet --release --manifest-path "$HERE/Cargo.toml" --target-dir "$C/target"
 
 log "bitcoind regtest"
 cat > "$W/btc/bitcoin.conf" <<CONF
@@ -105,7 +105,7 @@ A_ADDR=https://127.0.0.1:${RPC[alice]} A_CERT=$W/alice/tls.cert A_MAC=$(mac alic
 B_ADDR=https://127.0.0.1:${RPC[bob]} B_CERT=$W/bob/tls.cert B_MAC=$(mac bob) \
 B_P2P=127.0.0.1:${P2P[bob]} HASHES="$(pair),$(pair),$(pair)" \
 MINE="$W/mine.sh" CLOSE="$W/close-alice.sh" \
-  "$W/target/release/ln-conformance"
+  "$C/target/release/ln-conformance"
 
 # --- a whole lease between the two nodes ------------------------------------------------------
 log "fund the seller (bob) on chain"
@@ -117,13 +117,13 @@ log "lease end to end"
 A_ADDR=https://127.0.0.1:${RPC[alice]} A_CERT=$W/alice/tls.cert A_MAC=$(mac alice) \
 B_ADDR=https://127.0.0.1:${RPC[bob]} B_CERT=$W/bob/tls.cert B_MAC=$(mac bob) \
 A_P2P=127.0.0.1:${P2P[alice]} MINE="$W/mine.sh" \
-  "$W/target/release/lease-e2e"
+  "$C/target/release/lease-e2e"
 
 # --- the agent, end to end: init, bind + publish, verify from a second agent, revoke -----------
 log "build bipnip-agent with LND support"
-cargo build --quiet --release --manifest-path "$HERE/../../Cargo.toml" -p bipnip-agent --features lnd --target-dir "$W/target-ws"
-AGENT=$W/target-ws/release/bipnip-agent
-"$W/target/release/test-relay" 7777 > "$W/relay.log" 2>&1 &
+cargo build --quiet --release --manifest-path "$HERE/../../Cargo.toml" -p bipnip-agent --features lnd --target-dir "$C/target-ws"
+AGENT=$C/target-ws/release/bipnip-agent
+"$C/target/release/test-relay" 7777 > "$W/relay.log" 2>&1 &
 wait_until 30 grep -q listening "$W/relay.log"
 
 agent_conf() { # name
@@ -191,7 +191,7 @@ BIPNIPD_REV=028099e547a30a929fe0dcee36ef4d15d19a3b43
 log "build the instance (bipnipd ${BIPNIPD_REV:0:12})"
 git clone --quiet https://github.com/SovereignTechnology/bipnipd "$W/bipnipd"
 git -C "$W/bipnipd" checkout --quiet "$BIPNIPD_REV"
-cargo build --quiet --release --locked --manifest-path "$W/bipnipd/Cargo.toml" --bin mostrod --target-dir "$W/target-d"
+cargo build --quiet --release --locked --manifest-path "$W/bipnipd/Cargo.toml" --bin mostrod --target-dir "$C/target-d"
 
 log "a third node (carol) for the instance"
 RPC[carol]=10011; REST[carol]=8083; P2P[carol]=9737
@@ -204,7 +204,7 @@ lnd --lnddir="$W/carol" --bitcoin.regtest --bitcoin.node=bitcoind \
 wait_until 120 synced carol || { log "carol did not sync"; tail -20 "$W/carol/lnd.log"; exit 1; }
 
 log "instance: settings and start"
-read -r INSTANCE_NSEC INSTANCE_PUB < <("$W/target/release/test-key")
+read -r INSTANCE_NSEC INSTANCE_PUB < <("$C/target/release/test-key")
 mkdir -p "$W/instance"
 # The daemon's own template, with this run's node, relay, key and database. The price source is
 # pointed at a closed local port: this run makes no outside calls and trades no fiat.
@@ -232,7 +232,7 @@ text += "\n[liquidity]\nbonds = true\nmax_bond_sat = 100000\nlease_bond_window_s
 open(sys.argv[2], "w").write(text)
 PY
 chmod 600 "$W/instance/settings.toml"
-TERM=xterm "$W/target-d/release/mostrod" --dirsettings "$W/instance" > "$W/instance/mostrod.log" 2>&1 < /dev/null &
+TERM=xterm "$C/target-d/release/mostrod" --dirsettings "$W/instance" > "$W/instance/mostrod.log" 2>&1 < /dev/null &
 INSTANCE_PID=$!
 instance_log() { sed 's/\x1b\[[0-9;]*[A-Za-z]//g' "$W/instance/mostrod.log" | tail -"${1:-40}" | sed 's/^/  instance: /'; }
 wait_until 120 grep -q "Scheduler Started" "$W/instance/mostrod.log" \
@@ -666,8 +666,8 @@ log "INSTANCE LEASE BOND E2E PASS: two leases with a buyer's bond through a real
 
 # --- the agents as daemons, driven by the bipnip command line ------------------------------------
 log "daemon: build the bipnip command line"
-cargo build --quiet --release --manifest-path "$HERE/../../Cargo.toml" -p bipnip-cli --target-dir "$W/target-ws"
-CLI=$W/target-ws/release/bipnip
+cargo build --quiet --release --manifest-path "$HERE/../../Cargo.toml" -p bipnip-cli --target-dir "$C/target-ws"
+CLI=$C/target-ws/release/bipnip
 daemon_conf() { # name, policy lines
   cat > "$W/$1-d.toml" <<CONF
 network = "regtest"
@@ -689,11 +689,13 @@ CONF
 }
 # Bob may have runs under way but has no allowance to open channels: what he starts is parked.
 daemon_conf bob "max_runs = 4"
-# Alice may pay 2100 sat for a lease, 2100 a day, and open 250000 sat of channels a day.
+# Alice may pay 2100 sat for a lease, 2100 a day, and open 250000 sat of channels a day, at up to
+# 10 sat/vB (a limit left unset parks every channel she would open, bipnip #54).
 daemon_conf alice "max_runs = 4
 max_fee_per_lease_sat = 2100
 max_fee_per_day_sat = 2100
-max_capacity_per_day_sat = 250000"
+max_capacity_per_day_sat = 250000
+max_feerate_sat_vb = 10"
 declare -A DPID
 bip() { local n=$1; shift; "$CLI" --socket "$W/$n-agent/agent.sock" "$@"; }
 start_daemon() { # name
@@ -742,7 +744,10 @@ bip bob approvals | python3 -c '
 import json, sys
 a = json.load(sys.stdin)["approvals"]
 assert len(a) == 1 and a[0]["approval"] == sys.argv[1] and a[0]["method"] == "lease.offer", a
-assert a[0]["ask"] == {"fee_sat": 0, "capacity_sat": 600000, "bond_sat": 0, "peer": None}, a
+# The funding transaction at 2 sat/vB; the price is 2200 sat (1000 + 2000 ppm of 600000) for 600000 sat
+# over 144 blocks, in parts per billion, rounded down: 25462.
+assert a[0]["ask"] == {"fee_sat": 0, "capacity_sat": 600000, "bond_sat": 0, "peer": None,
+                       "feerate_sat_vb": 2, "sale_ppb_per_block": 25462}, a
 ' "$APPROVAL" || { daemon_dump; fail "the parked offer is not listed as it was asked"; }
 bip bob lease list | grep -q "state=offering\|state=open" && { daemon_dump; fail "a parked offer was started"; }
 bip bob approve --yes "$APPROVAL" > "$W/d-approve.out" 2> "$W/d-approve.err" || { daemon_dump; fail "the approval did not start the offer"; }
@@ -928,7 +933,7 @@ grep -q "RulesNotMet" "$W/daemon-alice.out" "$W/daemon-alice.err" || { daemon_du
 
 log "trust: one book over two instances, one of them silent, and a relay that is down"
 stop_daemon alice
-read -r _ SILENT_PUB < <("$W/target/release/test-key")
+read -r _ SILENT_PUB < <("$C/target/release/test-key")
 sed -e 's|^relays = \["ws://127.0.0.1:7777"\]$|relays = ["ws://127.0.0.1:7777", "ws://127.0.0.1:7778"]|' \
   -e "s|^\[policy\]\$|[[instance]]\npubkey = \"$SILENT_PUB\"\npow = 0\n\n[policy]|" \
   "$W/alice-d.toml" > "$W/alice-book.toml"

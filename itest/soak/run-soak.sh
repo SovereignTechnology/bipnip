@@ -26,6 +26,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 LN=$HERE/../ln
 W=${SOAK_WORK:-/tmp/bipnip-soak}
 rm -rf "$W"; mkdir -p "$W"/{dl,bin,btc,cln,soak}
+. "$LN/cache.sh"   # $C: downloads and target dirs kept between runs (cache.sh)
 log() { printf '[soak %s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 fail() { log "FAIL: $*"; exit 1; }
 jget() { python3 -c 'import json,sys
@@ -54,7 +55,6 @@ LDK_SERVER_REV=d7e7a2e708664af922c53c786ad6a5df622f5dd8
 BIPNIPD_REV=${BIPNIPD_REV:-}
 # mostro-cli v0.17.1, for the fiat trades (as run-fiat.sh).
 MCLI_REV=0665895f0a9806756252bd34a0572416f7c13e61
-fetch() { curl -fsSL --retry 3 -o "$3" "$1"; echo "$2  $3" | sha256sum -c --quiet; }
 NET=${SOAK_CHAIN:-regtest}
 case "$NET" in
   regtest) RPCPORT=18443; LND_NET=(--bitcoin.regtest); CHALLENGE="" ;;
@@ -109,21 +109,21 @@ else
   for tree in "$W/bipnipd" "$W/ldk-server" "$W/mostro-cli" "$HERE/../.." "$LN"; do
     (cd "$tree" && cargo --version) > /dev/null || fail "no Rust toolchain for $tree"
   done
-  cargo build --quiet --release --locked --manifest-path "$W/bipnipd/Cargo.toml" --bin mostrod --target-dir "$W/target-d" > "$W/build-d.log" 2>&1 &
+  cargo build --quiet --release --locked --manifest-path "$W/bipnipd/Cargo.toml" --bin mostrod --target-dir "$C/target-d" > "$W/build-d.log" 2>&1 &
   BUILD_D=$!
-  (cd "$W/ldk-server" && cargo build --quiet --locked -p ldk-server --target-dir "$W/target-ldk") > "$W/build-ldk.log" 2>&1 &
+  (cd "$W/ldk-server" && cargo build --quiet --locked -p ldk-server --target-dir "$C/target-ldk") > "$W/build-ldk.log" 2>&1 &
   BUILD_L=$!
-  (cd "$W/mostro-cli" && cargo build --quiet --release --locked --target-dir "$W/target-m") > "$W/build-m.log" 2>&1 &
+  (cd "$W/mostro-cli" && cargo build --quiet --release --locked --target-dir "$C/target-m") > "$W/build-m.log" 2>&1 &
   BUILD_M=$!
-  cargo build --quiet --locked --release --manifest-path "$LN/Cargo.toml" --target-dir "$W/target"
-  cargo build --quiet --locked --release --manifest-path "$HERE/../../Cargo.toml" -p bipnip-agent --features lnd,cln,ldk --target-dir "$W/target-ws"
-  cargo build --quiet --locked --release --manifest-path "$HERE/../../Cargo.toml" -p bipnip-cli --target-dir "$W/target-ws"
+  cargo build --quiet --locked --release --manifest-path "$LN/Cargo.toml" --target-dir "$C/target"
+  cargo build --quiet --locked --release --manifest-path "$HERE/../../Cargo.toml" -p bipnip-agent --features lnd,cln,ldk --target-dir "$C/target-ws"
+  cargo build --quiet --locked --release --manifest-path "$HERE/../../Cargo.toml" -p bipnip-cli --target-dir "$C/target-ws"
   wait "$BUILD_D" || { tail -30 "$W/build-d.log"; fail "the instance did not build"; }
   wait "$BUILD_L" || { tail -30 "$W/build-ldk.log"; fail "LDK Server did not build"; }
   wait "$BUILD_M" || { tail -30 "$W/build-m.log"; fail "mostro-cli did not build"; }
-  AGENT=$W/target-ws/release/bipnip-agent MOSTROD=$W/target-d/release/mostrod
-  LDK_SERVER=$W/target-ldk/debug/ldk-server MCLI=$W/target-m/release/mostro-cli
-  HELPERS=$W/target/release BIPNIPD_SRC=$W/bipnipd
+  AGENT=$C/target-ws/release/bipnip-agent MOSTROD=$C/target-d/release/mostrod
+  LDK_SERVER=$C/target-ldk/debug/ldk-server MCLI=$C/target-m/release/mostro-cli
+  HELPERS=$C/target/release BIPNIPD_SRC=$W/bipnipd
 fi
 
 log "bitcoind: a private $NET, no peers"

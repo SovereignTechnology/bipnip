@@ -20,6 +20,7 @@ set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 W=${ITEST_WORK:-/tmp/bipnip-ldk-itest}
 rm -rf "$W"; mkdir -p "$W"/{dl,bin,btc}
+. "$HERE/cache.sh"   # $C: downloads and target dirs kept between runs (cache.sh)
 log() { printf '[itest %s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 fail() { log "FAIL: $*"; exit 1; }
 jget() { python3 -c 'import json,sys
@@ -34,7 +35,6 @@ LND_V=v0.21.5-beta
 LND_SHA=2127d4794ea9cbd98e762ba16283615158743646d2d6d2a5bf88664dd6255ce7
 # The revision bipnip-ln's `ldk` feature takes its client from.
 LDK_SERVER_REV=d7e7a2e708664af922c53c786ad6a5df622f5dd8
-fetch() { curl -fsSL --retry 3 -o "$3" "$1"; echo "$2  $3" | sha256sum -c --quiet; }
 
 log "tools"
 export DEBIAN_FRONTEND=noninteractive
@@ -49,21 +49,21 @@ tar xzf "$W/dl/lnd.tgz" -C "$W/dl"; cp "$W/dl/lnd-linux-amd64-$LND_V/"{lnd,lncli
 export PATH=$W/bin:$PATH
 
 log "unit tests and clippy of bipnip-ln and the agent with the lnd and ldk features"
-cargo clippy --quiet --locked --manifest-path "$HERE/../../Cargo.toml" -p bipnip-ln -p bipnip-agent --features bipnip-ln/lnd,bipnip-ln/ldk,bipnip-agent/lnd,bipnip-agent/ldk --all-targets --target-dir "$W/target-ws" -- -D warnings
-cargo test --locked --manifest-path "$HERE/../../Cargo.toml" -p bipnip-ln --features lnd,ldk --target-dir "$W/target-ws" > "$W/unit.log" 2>&1 \
+cargo clippy --quiet --locked --manifest-path "$HERE/../../Cargo.toml" -p bipnip-ln -p bipnip-agent --features bipnip-ln/lnd,bipnip-ln/ldk,bipnip-agent/lnd,bipnip-agent/ldk --all-targets --target-dir "$C/target-ws" -- -D warnings
+cargo test --locked --manifest-path "$HERE/../../Cargo.toml" -p bipnip-ln --features lnd,ldk --target-dir "$C/target-ws" > "$W/unit.log" 2>&1 \
   || { tail -40 "$W/unit.log"; exit 1; }
 grep -E '^test result' "$W/unit.log"
 
 log "build the conformance programs"
-cargo clippy --quiet --locked --manifest-path "$HERE/Cargo.toml" --target-dir "$W/target" -- -D warnings
-cargo build --quiet --locked --release --manifest-path "$HERE/Cargo.toml" --target-dir "$W/target"
+cargo clippy --quiet --locked --manifest-path "$HERE/Cargo.toml" --target-dir "$C/target" -- -D warnings
+cargo build --quiet --locked --release --manifest-path "$HERE/Cargo.toml" --target-dir "$C/target"
 
 log "LDK Server at $LDK_SERVER_REV: fetch and build"
 git clone -q https://github.com/lightningdevkit/ldk-server "$W/ldk-server"
 git -C "$W/ldk-server" checkout -q "$LDK_SERVER_REV"
 [ "$(git -C "$W/ldk-server" rev-parse HEAD)" = "$LDK_SERVER_REV" ] || fail "not the pinned LDK Server revision"
-( cd "$W/ldk-server" && cargo build --quiet --locked -p ldk-server --target-dir "$W/target-ldk" )
-LDK_SERVER=$W/target-ldk/debug/ldk-server
+( cd "$W/ldk-server" && cargo build --quiet --locked -p ldk-server --target-dir "$C/target-ldk" )
+LDK_SERVER=$C/target-ldk/debug/ldk-server
 
 log "bitcoind regtest"
 cat > "$W/btc/bitcoin.conf" <<CONF
@@ -130,7 +130,7 @@ CONF
 done
 ldk_cert() { echo "$W/$1/data/tls.crt"; }
 ldk_mac() { echo "$W/$1/data/regtest/macaroons/admin.macaroon"; }
-ldkw() { local n=$1; shift; LDK_ADDR=127.0.0.1:${GRPC[$n]} LDK_CERT=$(ldk_cert "$n") LDK_MAC=$(ldk_mac "$n") "$W/target/release/ldk-wallet" "$@"; }
+ldkw() { local n=$1; shift; LDK_ADDR=127.0.0.1:${GRPC[$n]} LDK_CERT=$(ldk_cert "$n") LDK_MAC=$(ldk_mac "$n") "$C/target/release/ldk-wallet" "$@"; }
 ldk_up() { test -s "$(ldk_cert "$1")" && test -s "$(ldk_mac "$1")" && ldkw "$1" id; }
 for n in dave erin; do
   wait_until 120 ldk_up "$n" || { tail -40 "$W/$n/server.log" | cut -c1-300; fail "$n did not come up"; }
@@ -164,19 +164,19 @@ A_BACKEND=lnd A_ADDR=https://127.0.0.1:${RPC[alice]} A_CERT=$W/alice/tls.cert A_
 B_BACKEND=ldk B_ADDR=127.0.0.1:${GRPC[dave]} B_CERT=$(ldk_cert dave) B_MAC=$(ldk_mac dave) \
 B_P2P=127.0.0.1:${LP2P[dave]} HASHES="$(pair),$(pair),$(pair)" \
 MINE="$W/mine.sh" CLOSE="$W/close-alice.sh" \
-  "$W/target/release/ln-conformance" || { ldk_dump 60; fail "conformance with an LDK payee"; }
+  "$C/target/release/ln-conformance" || { ldk_dump 60; fail "conformance with an LDK payee"; }
 
 log "conformance 2: LDK pays (erin), LND is paid (bob)"
 A_BACKEND=ldk A_ADDR=127.0.0.1:${GRPC[erin]} A_CERT=$(ldk_cert erin) A_MAC=$(ldk_mac erin) \
 B_BACKEND=lnd B_ADDR=https://127.0.0.1:${RPC[bob]} B_CERT=$W/bob/tls.cert B_MAC=$(mac bob) \
 B_P2P=127.0.0.1:${P2P[bob]} HASHES="$(pair),$(pair),$(pair)" \
 MINE="$W/mine.sh" \
-  "$W/target/release/ln-conformance" || { ldk_dump 60; fail "conformance with an LDK payer"; }
+  "$C/target/release/ln-conformance" || { ldk_dump 60; fail "conformance with an LDK payer"; }
 
 log "lease end to end: an LDK buyer (erin), an LND seller (bob)"
 A_BACKEND=ldk A_ADDR=127.0.0.1:${GRPC[erin]} A_CERT=$(ldk_cert erin) A_MAC=$(ldk_mac erin) \
 B_BACKEND=lnd B_ADDR=https://127.0.0.1:${RPC[bob]} B_CERT=$W/bob/tls.cert B_MAC=$(mac bob) \
 A_P2P=127.0.0.1:${LP2P[erin]} MINE="$W/mine.sh" \
-  "$W/target/release/lease-e2e" || { ldk_dump 60; fail "a lease with an LDK buyer"; }
+  "$C/target/release/lease-e2e" || { ldk_dump 60; fail "a lease with an LDK buyer"; }
 
 log "LDK E2E PASS: the conformance steps with LND paying an LDK Server and an LDK Server paying LND, and a whole lease bought by an LDK node from an LND node"

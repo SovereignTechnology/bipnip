@@ -19,6 +19,7 @@ set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 W=${ITEST_WORK:-/tmp/bipnip-cln-itest}
 rm -rf "$W"; mkdir -p "$W"/{dl,bin,btc,cln}
+. "$HERE/cache.sh"   # $C: downloads and target dirs kept between runs (cache.sh)
 log() { printf '[itest %s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 fail() { log "FAIL: $*"; exit 1; }
 jget() { python3 -c 'import json,sys
@@ -38,7 +39,6 @@ CLN_SHA=e1e0a7e89b55060e2470d8568ba535a3124d6823c628def548cadeef4279c491
 # asset as read on 2026-11-17 (spikes/cln-m3).
 HOLD_V=v0.3.3
 HOLD_SHA=f9d916430fb70a3d75089f2d1b88d5d71d4987ef79933035978c1f44aab84be5
-fetch() { curl -fsSL --retry 3 -o "$3" "$1"; echo "$2  $3" | sha256sum -c --quiet; }
 
 log "tools"
 export DEBIAN_FRONTEND=noninteractive
@@ -59,14 +59,14 @@ CLN_BIN=$(dirname "$(find "$W/cln" -type f -name lightningd | sed -n 1p)")
 export PATH=$W/bin:$CLN_BIN:$PATH
 
 log "unit tests and clippy of bipnip-ln and the agent with the lnd, ldk and cln features"
-cargo clippy --quiet --locked --manifest-path "$HERE/../../Cargo.toml" -p bipnip-ln -p bipnip-agent --features bipnip-ln/lnd,bipnip-ln/ldk,bipnip-ln/cln,bipnip-agent/lnd,bipnip-agent/ldk,bipnip-agent/cln --all-targets --target-dir "$W/target-ws" -- -D warnings
-cargo test --locked --manifest-path "$HERE/../../Cargo.toml" -p bipnip-ln --features lnd,ldk,cln --target-dir "$W/target-ws" > "$W/unit.log" 2>&1 \
+cargo clippy --quiet --locked --manifest-path "$HERE/../../Cargo.toml" -p bipnip-ln -p bipnip-agent --features bipnip-ln/lnd,bipnip-ln/ldk,bipnip-ln/cln,bipnip-agent/lnd,bipnip-agent/ldk,bipnip-agent/cln --all-targets --target-dir "$C/target-ws" -- -D warnings
+cargo test --locked --manifest-path "$HERE/../../Cargo.toml" -p bipnip-ln --features lnd,ldk,cln --target-dir "$C/target-ws" > "$W/unit.log" 2>&1 \
   || { tail -40 "$W/unit.log"; exit 1; }
 grep -E '^test result' "$W/unit.log"
 
 log "build the conformance programs"
-cargo clippy --quiet --locked --manifest-path "$HERE/Cargo.toml" --target-dir "$W/target" -- -D warnings
-cargo build --quiet --locked --release --manifest-path "$HERE/Cargo.toml" --target-dir "$W/target"
+cargo clippy --quiet --locked --manifest-path "$HERE/Cargo.toml" --target-dir "$C/target" -- -D warnings
+cargo build --quiet --locked --release --manifest-path "$HERE/Cargo.toml" --target-dir "$C/target"
 
 log "bitcoind regtest"
 cat > "$W/btc/bitcoin.conf" <<CONF
@@ -168,25 +168,25 @@ A_BACKEND=lnd A_ADDR=https://127.0.0.1:${RPC[alice]} A_CERT=$W/alice/tls.cert A_
 B_BACKEND=cln B_ADDR=$(cln_sock carol) \
 B_P2P=127.0.0.1:${CP2P[carol]} HASHES="$(pair),$(pair),$(pair)" \
 MINE="$W/mine.sh" CLOSE="$W/close-alice.sh" \
-  "$W/target/release/ln-conformance" || { cln_dump 60; fail "conformance with a Core Lightning payee"; }
+  "$C/target/release/ln-conformance" || { cln_dump 60; fail "conformance with a Core Lightning payee"; }
 
 log "conformance 2: Core Lightning pays (frank), LND is paid (bob)"
 A_BACKEND=cln A_ADDR=$(cln_sock frank) \
 B_BACKEND=lnd B_ADDR=https://127.0.0.1:${RPC[bob]} B_CERT=$W/bob/tls.cert B_MAC=$(mac bob) \
 B_P2P=127.0.0.1:${P2P[bob]} HASHES="$(pair),$(pair),$(pair)" \
 MINE="$W/mine.sh" CLOSE="$W/close-frank.sh" \
-  "$W/target/release/ln-conformance" || { cln_dump 60; fail "conformance with a Core Lightning payer"; }
+  "$C/target/release/ln-conformance" || { cln_dump 60; fail "conformance with a Core Lightning payer"; }
 
 log "lease end to end: an LND buyer (alice), a Core Lightning seller (carol)"
 A_BACKEND=lnd A_ADDR=https://127.0.0.1:${RPC[alice]} A_CERT=$W/alice/tls.cert A_MAC=$(mac alice) \
 B_BACKEND=cln B_ADDR=$(cln_sock carol) \
 A_P2P=127.0.0.1:${P2P[alice]} MINE="$W/mine.sh" \
-  "$W/target/release/lease-e2e" || { cln_dump 60; fail "a lease with a Core Lightning seller"; }
+  "$C/target/release/lease-e2e" || { cln_dump 60; fail "a lease with a Core Lightning seller"; }
 
 log "lease end to end: a Core Lightning buyer (frank), an LND seller (bob)"
 A_BACKEND=cln A_ADDR=$(cln_sock frank) \
 B_BACKEND=lnd B_ADDR=https://127.0.0.1:${RPC[bob]} B_CERT=$W/bob/tls.cert B_MAC=$(mac bob) \
 A_P2P=127.0.0.1:${CP2P[frank]} MINE="$W/mine.sh" \
-  "$W/target/release/lease-e2e" || { cln_dump 60; fail "a lease with a Core Lightning buyer"; }
+  "$C/target/release/lease-e2e" || { cln_dump 60; fail "a lease with a Core Lightning buyer"; }
 
 log "CLN E2E PASS: the conformance steps with LND paying Core Lightning and Core Lightning paying LND (hold invoices through the hold plugin), and whole leases sold by a Core Lightning node to an LND node and by an LND node to a Core Lightning node"
