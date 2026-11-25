@@ -181,7 +181,7 @@ mkdir -p "$W/chris"
 cln_cmd() {
   printf '%s\n' lightningd "--network=$NET" "--lightning-dir=$W/chris" --daemon "--log-file=$W/chris/log" \
     --bitcoin-rpcconnect=127.0.0.1 "--bitcoin-rpcport=$RPCPORT" --bitcoin-rpcuser=soak \
-    --bitcoin-rpcpassword=soak "--bitcoin-cli=$W/bin/bitcoin-cli" \
+    --bitcoin-rpcpassword=soak "--bitcoin-cli=$(command -v bitcoin-cli)" \
     "--addr=127.0.0.1:$CHRIS_P2P" --alias=chris --grpc-port=9751 \
     "--plugin=$HOLD" --hold-grpc-port=-1 --force-feerates=1000
 }
