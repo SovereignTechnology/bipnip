@@ -108,6 +108,11 @@ async fn host() -> SocketAddr {
 
 /// A host whose page requests go to the agent's web door `agent`, if given.
 async fn host_with(agent: Option<AgentLink>) -> SocketAddr {
+    host_built(agent, true).await
+}
+
+/// The same, with coordinators reached (`tor`) or off, as with `--no-tor`.
+async fn host_built(agent: Option<AgentLink>, tor: bool) -> SocketAddr {
     let coordinator = mock_coordinator().await;
     let dist = dist(coordinator.port());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -122,7 +127,11 @@ async fn host_with(agent: Option<AgentLink>) -> SocketAddr {
         coordinators: Coordinators::from_federation_json(&read("static/federation.json"))
             .expect("federation"),
         allowed: Allowed::new(vec![addr.to_string()]),
-        connector: Some(Arc::new(LoopbackForTests)),
+        connector: if tor {
+            Some(Arc::new(LoopbackForTests))
+        } else {
+            None
+        },
         agent,
     });
     tokio::spawn(async move { axum::serve(listener, router(state)).await.expect("serve") });
@@ -559,6 +568,22 @@ async fn what_is_not_a_page_of_this_origin_asking_never_reaches_the_agent() {
         agent.seen(),
         Vec::<String>::new(),
         "the agent was never reached"
+    );
+}
+
+#[tokio::test]
+async fn without_tor_a_coordinator_route_refuses_in_json_the_page_can_read() {
+    let addr = host_built(None, false).await;
+    let (status, headers, body) = call(addr, "GET", "/mainnet/temple/api/info/", &[], "").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(hv(&headers, "content-type"), "application/json");
+    assert_eq!(hv(&headers, "cache-control"), "no-store");
+    let answer: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+    assert!(
+        answer["bad_request"]
+            .as_str()
+            .is_some_and(|m| m.contains("--no-tor")),
+        "{answer}"
     );
 }
 

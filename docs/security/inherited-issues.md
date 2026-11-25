@@ -21,6 +21,26 @@ Also, by design rather than a filed issue: escrow preimages (fiat trades) sit in
 bipnipd keeps the database 0600 and adds encryption at rest for the preimage column (M1). Lease and ring
 preimages never reach the instance (ADR 0003).
 
+## Status on 2026-11-25
+
+bipnipd main has Mostro v0.20.3 merged (bipnipd #13). All eight issues are still open upstream.
+
+| # | where it stands |
+|---|---|
+| 807 | **Gated only:** the RPC is off by default and binds to 127.0.0.1, and v0.20.3 checks an optional `auth_token` on the mutating RPCs. The refusal to start with the RPC on and no token, planned for M1 above, was **not built**: an operator who turns the RPC on without a token gets unauthenticated admin RPCs on loopback. Upstream PR #877 is still open. A fork-only refusal (like #1014's) is the project owner's call. |
+| 1102 | Fixed on bipnipd #14 (both event loops refuse the daemon key as a solver; the RPC keeps it). Waits for the owner's read. |
+| 808 | Audited 2026-11-24: the sites the issue names now use compare-and-swap, and no write that precedes a publish is left with its failure swallowed (the dispute auto-close publishes only after a successful write; the Cashu path is off). Nothing to change. |
+| 904 | Fixed on bipnipd #2. Waits for the owner's read. Its concurrency test failed once in a full parallel run and passes alone (noted on #2). |
+| 836 | Upstream PR #842 (open) drops the log lines that pair two user keys; v0.20.3 stopped logging DM payloads and receiver keys (#1123). Take #842 when it merges. |
+| 1078 | Fixed on bipnipd #17 (`keep_watching`: subscribe again when a stream ends, until the invoice is final or nothing waits on it). Waits for the owner's read. |
+| 1014 | Fixed, fork-only, on bipnipd main (#16): no start while the settings, `.env`, macaroon or database can be read by another user, or the settings directory written by one. |
+| 954 | Fixed on bipnipd #3. Waits for the owner's read. |
+| preimages at rest | Sealed on bipnipd #18 (NIP-44 to the daemon's own key, bound to the row; fiat escrow, anti-abuse and liquidity bonds; cleartext sealed at startup). Waits for the owner's read. |
+
+Every fix in review runs together on bipnipd branch `soak/noissue-h1` in the week-long soak (`itest/soak/`,
+on booty since 2026-11-25), and the fiat flow is checked end to end with upstream's `mostro-cli`
+(`itest/ln/run-fiat.sh`).
+
 ## Status on 2026-11-15
 
 Checked with the duplicate guard before any work (`guard-pr-duplicate.py MostroP2P/mostro N`):
