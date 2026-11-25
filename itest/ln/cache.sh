@@ -30,8 +30,11 @@ fetch() {
     cp "$kept" "$dest"
     return 0
   fi
-  curl -fsSL --retry 3 -o "$dest" "$url"
-  echo "$sha  $dest" | sha256sum -c --quiet
-  # Kept only once checked, and moved into place whole.
-  cp "$dest" "$kept.new" && mv -f "$kept.new" "$kept"
+  # Explicit returns: the check must fail the call where `set -e` is off too (an `if fetch …`), as the
+  # one-line fetch these scripts had before it did.
+  curl -fsSL --retry 3 -o "$dest" "$url" || return 1
+  echo "$sha  $dest" | sha256sum -c --quiet || return 1
+  # Kept only once checked, and moved into place whole. A name an earlier job left at $kept.new (a link to
+  # some file this job may write) is removed first, so cp makes a new file instead of writing through it.
+  rm -f "$kept.new" && cp "$dest" "$kept.new" && mv -f "$kept.new" "$kept"
 }
