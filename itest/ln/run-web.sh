@@ -203,9 +203,12 @@ agent_conf alice "max_runs = 4" "
 socket = \"$DOOR_DIR/web.sock\"
 socket_mode = 0o660
 allow_uids = [$WEB_UID]"
-# Bob offers and proposes from his command line without being asked.
+# Bob offers and proposes from his command line without being asked: up to 10 sat/vB for a channel he
+# opens, and at any price (a limit left unset parks what it covers, bipnip #54).
 agent_conf bob "max_runs = 4
-max_capacity_per_day_sat = 10000000"
+max_capacity_per_day_sat = 10000000
+max_feerate_sat_vb = 10
+min_sale_ppb_per_block = 0"
 for n in alice bob; do "$AGENT" --config "$W/$n-d.toml" init > /dev/null; done
 bip() { local n=$1; shift; "$CLI" --socket "$W/$n-agent/agent.sock" "$@"; }
 for n in alice bob; do

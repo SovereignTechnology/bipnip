@@ -689,11 +689,13 @@ CONF
 }
 # Bob may have runs under way but has no allowance to open channels: what he starts is parked.
 daemon_conf bob "max_runs = 4"
-# Alice may pay 2100 sat for a lease, 2100 a day, and open 250000 sat of channels a day.
+# Alice may pay 2100 sat for a lease, 2100 a day, and open 250000 sat of channels a day, at up to
+# 10 sat/vB (a limit left unset parks every channel she would open, bipnip #54).
 daemon_conf alice "max_runs = 4
 max_fee_per_lease_sat = 2100
 max_fee_per_day_sat = 2100
-max_capacity_per_day_sat = 250000"
+max_capacity_per_day_sat = 250000
+max_feerate_sat_vb = 10"
 declare -A DPID
 bip() { local n=$1; shift; "$CLI" --socket "$W/$n-agent/agent.sock" "$@"; }
 start_daemon() { # name
@@ -742,7 +744,10 @@ bip bob approvals | python3 -c '
 import json, sys
 a = json.load(sys.stdin)["approvals"]
 assert len(a) == 1 and a[0]["approval"] == sys.argv[1] and a[0]["method"] == "lease.offer", a
-assert a[0]["ask"] == {"fee_sat": 0, "capacity_sat": 600000, "bond_sat": 0, "peer": None}, a
+# The funding transaction at 2 sat/vB; the price is 2200 sat (1000 + 2000 ppm of 600000) for 600000 sat
+# over 144 blocks, in parts per billion, rounded down: 25462.
+assert a[0]["ask"] == {"fee_sat": 0, "capacity_sat": 600000, "bond_sat": 0, "peer": None,
+                       "feerate_sat_vb": 2, "sale_ppb_per_block": 25462}, a
 ' "$APPROVAL" || { daemon_dump; fail "the parked offer is not listed as it was asked"; }
 bip bob lease list | grep -q "state=offering\|state=open" && { daemon_dump; fail "a parked offer was started"; }
 bip bob approve --yes "$APPROVAL" > "$W/d-approve.out" 2> "$W/d-approve.err" || { daemon_dump; fail "the approval did not start the offer"; }
