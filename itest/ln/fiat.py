@@ -48,7 +48,11 @@ def cli(who, *args, json_out=True, admin_nsec=None, timeout=120):
     if admin_nsec:
         env["ADMIN_NSEC"] = admin_nsec
     argv = [MCLI, *(["--output", "json"] if json_out else []), *args]
-    done = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=timeout)
+    try:
+        done = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # A failure of the step, not of the driver: the caller fails it and the cleanup still runs.
+        return 124, None, f"mostro-cli {' '.join(args[:2])} did not finish within {timeout:.0f} s"
     doc = None
     if json_out:
         try:
@@ -124,19 +128,24 @@ class Trade:
         deadline = time.time() + STEP_SECS
         first = True
         while True:
+            left = deadline - time.time()  # every send and wait fits in what is left of STEP_SECS
             if not first:
+                if left <= 0:
+                    raise Fail(f"{role}: mostro-cli {' '.join(args)} was not answered within {STEP_SECS} s: "
+                               f"{text.strip()[-600:]}")
                 self.resent += 1  # counted only when a request really goes again
             first = False
-            code, doc, text = cli(role, *args)
+            code, doc, text = cli(role, *args, timeout=max(1, min(120, left)))
             if code == 0 and doc and doc.get("status") == "ok":
                 return doc.get("data") or {}
             if landed():  # an earlier try landed, and this one was refused for the status it left
                 return {}
-            if not unanswered(doc) or time.time() > deadline:
+            if not unanswered(doc):
                 raise Fail(f"{role}: mostro-cli {' '.join(args)} failed ({code}): {text.strip()[-600:]}")
             log(f"{self.name}: {role}'s {args[0]} {args[1]} was not answered; checking the order before sending it again")
-            for _ in range(5):
-                time.sleep(2)
+            until = min(deadline, time.time() + 10)
+            while time.time() < until:
+                time.sleep(max(0, min(2, until - time.time())))
                 if landed():
                     return {}
 
