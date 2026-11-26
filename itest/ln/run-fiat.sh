@@ -173,8 +173,14 @@ export MOSTRO_PUBKEY="$INSTANCE_PUB" RELAYS="ws://127.0.0.1:7777" POW=0
 
 log "mostro-cli: identities for the seller, the buyer and a solver"
 python3 "$HERE/fiat.py" setup || { instance_log 60; fail "setup"; }
+# The test relay (nostr-sdk's local relay) takes 60 events a minute per connection, and the instance sends
+# all of its replies over one: five trades back to back run past that, and the refused replies leave a
+# trade unanswered. A pause between trades lets the allowance refill, as a person's pace would.
+n=0
 for step in ${FIAT_STEPS:-sell buy cancel dispute gap}; do
   case "$step" in sell|buy|cancel|dispute|gap) ;; *) fail "FIAT_STEPS: no trade called $step" ;; esac
+  [ "$n" -eq 0 ] || sleep 30
+  n=$((n + 1))
   log "trade: $step"
   python3 "$HERE/fiat.py" "$step" || { instance_log 80; fail "the $step trade"; }
 done
