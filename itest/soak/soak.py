@@ -317,20 +317,37 @@ def restart(proc, down_secs):
         finding("did-not-come-back", False, process=proc.name)
 
 
+def carol_peers():
+    code, out, _ = run([*LNC["carol"], "listpeers"])
+    return {p["pub_key"] for p in json.loads(out).get("peers", [])} if code == 0 else set()
+
+
 def restart_carol():
     quiet_until["carol"] = time.time() + 900
+    before = carol_peers()
     run([*LNC["carol"], "stop"])
     time.sleep(rng.uniform(10, 60))
     argv = Path(f"{W}/soak/carol.argv").read_text().split("\n")
     subprocess.Popen([a for a in argv if a], stdout=open(f"{W}/carol/lnd.log", "a"), stderr=subprocess.STDOUT,
                      stdin=subprocess.DEVNULL, start_new_session=True)
     deadline = time.time() + 300
-    while time.time() < deadline:
+    while True:
         code, out, _ = run([*LNC["carol"], "getinfo"])
         if code == 0 and json.loads(out).get("synced_to_chain"):
+            break
+        if time.time() > deadline:
+            finding("did-not-come-back", True, process="carol (the instance's LND)")
             return
         time.sleep(5)
-    finding("did-not-come-back", True, process="carol (the instance's LND)")
+    # Every peer she had must reconnect: an HTLC on the channel of one that does not is stranded until it
+    # expires, and shows only hours later as htlc-stuck (#65).
+    deadline = time.time() + 300
+    while before - carol_peers():
+        if time.time() > deadline:
+            finding("peers-not-back", False, process="carol (the instance's LND)",
+                    missing=len(before - carol_peers()), had=len(before))
+            return
+        time.sleep(5)
 
 
 def faults(procs):

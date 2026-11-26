@@ -244,7 +244,9 @@ wait_until 180 chris_funded || fail "chris's wallet did not see its funds"
 wait_until 240 erin_funded || fail "erin's wallet did not see its funds"
 
 log "the payment mesh: every agent's node and carol open 2000000 sat channels to each other"
-for n in alice bob; do lnc "$n" connect "${ID[carol]}@127.0.0.1:${P2P[carol]}" >/dev/null 2>&1 || true; done
+# Persistent: carol cannot dial alice and bob back (they announce no address), so they must redial her
+# after she restarts (#65).
+for n in alice bob; do lnc "$n" connect --perm "${ID[carol]}@127.0.0.1:${P2P[carol]}" >/dev/null 2>&1 || true; done
 clc connect "${ID[carol]}" 127.0.0.1 "${P2P[carol]}" >/dev/null 2>&1 || true
 lnc carol connect "${ID[chris]}@127.0.0.1:$CHRIS_P2P" >/dev/null 2>&1 || true
 lnc carol connect "${ID[erin]}@127.0.0.1:$ERIN_P2P" >/dev/null 2>&1 || true
