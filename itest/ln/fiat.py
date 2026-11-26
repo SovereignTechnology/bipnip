@@ -122,7 +122,11 @@ class Trade:
         goes again until it does, for up to STEP_SECS. Returns the reply's data, or {} when an
         earlier try is the one that landed."""
         deadline = time.time() + STEP_SECS
+        first = True
         while True:
+            if not first:
+                self.resent += 1  # counted only when a request really goes again
+            first = False
             code, doc, text = cli(role, *args)
             if code == 0 and doc and doc.get("status") == "ok":
                 return doc.get("data") or {}
@@ -130,8 +134,7 @@ class Trade:
                 return {}
             if not unanswered(doc) or time.time() > deadline:
                 raise Fail(f"{role}: mostro-cli {' '.join(args)} failed ({code}): {text.strip()[-600:]}")
-            self.resent += 1
-            log(f"{self.name}: {role}'s {args[0]} {args[1]} was not answered; checking the order, then sending it again")
+            log(f"{self.name}: {role}'s {args[0]} {args[1]} was not answered; checking the order before sending it again")
             for _ in range(5):
                 time.sleep(2)
                 if landed():
@@ -370,15 +373,17 @@ def gap():
     os.kill(pid, signal.SIGSTOP)
     log(f"gap: the instance is stopped for {GAP_SECS} s; the seller releases")
     thaw = threading.Timer(GAP_SECS, os.kill, (pid, signal.SIGCONT))
+    before = trade.resent
     thaw.start()
     try:
         trade.release("seller")
     finally:
         thaw.cancel()
         os.kill(pid, signal.SIGCONT)
-    if not trade.resent:
-        raise Fail("gap: the release was answered while the instance was stopped, so the gap tested nothing")
-    log(f"gap: the seller sent the release {trade.resent + 1} times")
+    again = trade.resent - before
+    if not again:
+        raise Fail("gap: the release was never sent again, so the gap tested nothing")
+    log(f"gap: the seller sent the release {again + 1} times")
     trade.drive(lambda s: s == "success", "paid out to the buyer")
     trade.hold_ends("SUCCEEDED")
     paid = trade.buyer_paid()
