@@ -244,9 +244,7 @@ wait_until 180 chris_funded || fail "chris's wallet did not see its funds"
 wait_until 240 erin_funded || fail "erin's wallet did not see its funds"
 
 log "the payment mesh: every agent's node and carol open 2000000 sat channels to each other"
-# Persistent: carol cannot dial alice and bob back (they announce no address), so they must redial her
-# after she restarts (#65).
-for n in alice bob; do lnc "$n" connect --perm "${ID[carol]}@127.0.0.1:${P2P[carol]}" >/dev/null 2>&1 || true; done
+for n in alice bob; do lnc "$n" connect "${ID[carol]}@127.0.0.1:${P2P[carol]}" >/dev/null 2>&1 || true; done
 clc connect "${ID[carol]}" 127.0.0.1 "${P2P[carol]}" >/dev/null 2>&1 || true
 lnc carol connect "${ID[chris]}@127.0.0.1:$CHRIS_P2P" >/dev/null 2>&1 || true
 lnc carol connect "${ID[erin]}@127.0.0.1:$ERIN_P2P" >/dev/null 2>&1 || true
@@ -273,8 +271,18 @@ mine 6
 graph_full() { [ "$(lnc "$1" describegraph | python3 -c 'import json,sys;print(len(json.load(sys.stdin)["edges"]))')" -ge 8 ]; }
 for n in alice bob; do wait_until 300 graph_full "$n" || fail "$n's graph did not fill"; done
 
-# The driver restarts carol as a fault. Each of her channel peers must then reconnect, or every HTLC on
-# their channels is stranded until it expires (#65). Prove it once before the driver takes over.
+# A node announcement replaces the addresses a peer redials that node at. One that lists none cancels
+# the redial for good, and after a restart the channel stays down (#65). Each side of the mesh must
+# know where to find the other.
+announced() { # viewer, node: the viewer's graph holds an address for the node
+  [ "$(lnc "$1" getnodeinfo --pub_key "${ID[$2]}" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["node"]["addresses"]))')" -ge 1 ]; }
+for pair in alice:carol bob:carol carol:alice carol:bob; do
+  wait_until 120 announced "${pair%%:*}" "${pair##*:}" \
+    || fail "${pair%%:*}'s graph has no address for ${pair##*:}: a restart would leave their channel down (#65)"
+done
+
+# Smoke: the driver restarts carol as a fault, and each of her channel peers must then reconnect, or
+# every HTLC on their channels is stranded until it expires (#65).
 log "carol restarts once: all eight of her mesh channels must come back"
 lnc carol stop >/dev/null
 wait "${LND_PID[carol]}" || true
