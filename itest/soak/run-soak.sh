@@ -165,10 +165,12 @@ lnd_cmd() { # name: the command line, one word a line (also handed to the driver
     --noseedbackup "--rpclisten=127.0.0.1:${RPC[$1]}" "--restlisten=127.0.0.1:${REST[$1]}" \
     "--listen=127.0.0.1:${P2P[$1]}" "--alias=$1" --trickledelay=1000
 }
+declare -A LND_PID
 for n in alice bob carol; do
   mkdir -p "$W/$n"
   mapfile -t cmd < <(lnd_cmd "$n")
   "${cmd[@]}" > "$W/$n/lnd.log" 2>&1 &
+  LND_PID[$n]=$!
 done
 lnc() { local n=$1; shift; lncli --lnddir="$W/$n" --network=$NET --rpcserver=127.0.0.1:${RPC[$n]} "$@"; }
 synced() { [ "$(lnc "$1" getinfo | jget synced_to_chain)" = "True" ]; }
@@ -268,6 +270,19 @@ wait_until 300 carol_chans || { lnc carol listchannels | head -40; fail "carol d
 mine 6
 graph_full() { [ "$(lnc "$1" describegraph | python3 -c 'import json,sys;print(len(json.load(sys.stdin)["edges"]))')" -ge 8 ]; }
 for n in alice bob; do wait_until 300 graph_full "$n" || fail "$n's graph did not fill"; done
+
+# The driver restarts carol as a fault. Each of her channel peers must then reconnect, or every HTLC on
+# their channels is stranded until it expires (#65). Prove it once before the driver takes over.
+log "carol restarts once: all eight of her mesh channels must come back"
+lnc carol stop >/dev/null
+wait "${LND_PID[carol]}" || true
+mapfile -t cmd < <(lnd_cmd carol)
+"${cmd[@]}" >> "$W/carol/lnd.log" 2>&1 &
+wait_until 180 synced carol || { tail -20 "$W/carol/lnd.log"; fail "carol did not sync after her restart"; }
+wait_until 300 carol_chans || {
+  lnc carol listpeers | python3 -c 'import json,sys; print("  carol has", len(json.load(sys.stdin)["peers"]), "peers")'
+  fail "carol's mesh channels did not all come back after her restart: a peer does not reconnect"
+}
 
 log "the driver takes over: relays, the instance, the agents as daemons"
 read -r INSTANCE_NSEC INSTANCE_PUB < <("$HELPERS/test-key")
