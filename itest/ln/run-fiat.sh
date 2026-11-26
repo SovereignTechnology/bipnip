@@ -13,7 +13,11 @@
 #   2. a buy order: made by the buyer, taken by the seller, released, paid out;
 #   3. a cooperative cancel once the sats are held: the hold invoice is canceled, the buyer gets nothing;
 #   4. a dispute: the seller does not release, the buyer opens a dispute, and a solver (added with the
-#      instance's key) takes it and settles it for the buyer.
+#      instance's key) takes it and settles it for the buyer;
+#   5. a gap: the instance is stopped across the seller's release, which is lost; the seller sends it
+#      again once the instance answers, and the trade pays out (#63).
+#
+# FIAT_STEPS picks trades (default: all five, in order), e.g. FIAT_STEPS=gap.
 #
 # Every key and credential here is a throwaway regtest value inside the VM.
 
@@ -156,10 +160,11 @@ open(sys.argv[2], "w").write(text)
 PY
 chmod 600 "$W/instance/settings.toml"
 TERM=xterm "$C/target-d/release/mostrod" --dirsettings "$W/instance" > "$W/instance/mostrod.log" 2>&1 < /dev/null &
+INSTANCE_PID=$!
 instance_log() { sed 's/\x1b\[[0-9;]*[A-Za-z]//g' "$W/instance/mostrod.log" | tail -"${1:-40}" | sed 's/^/  instance: /'; }
 wait_until 120 grep -q "Scheduler Started" "$W/instance/mostrod.log" || { instance_log; fail "the instance did not start"; }
 
-export W INSTANCE_NSEC SOLVER_NSEC SOLVER_PUB
+export W INSTANCE_NSEC SOLVER_NSEC SOLVER_PUB INSTANCE_PID
 export MCLI="$C/target-m/release/mostro-cli" INSTANCE_DB="$W/instance/mostro.db"
 LNC_SELLER=$(lncmd alice)
 LNC_BUYER=$(lncmd bob)
@@ -168,9 +173,11 @@ export MOSTRO_PUBKEY="$INSTANCE_PUB" RELAYS="ws://127.0.0.1:7777" POW=0
 
 log "mostro-cli: identities for the seller, the buyer and a solver"
 python3 "$HERE/fiat.py" setup || { instance_log 60; fail "setup"; }
-for step in sell buy cancel dispute; do
+for step in ${FIAT_STEPS:-sell buy cancel dispute gap}; do
+  case "$step" in sell|buy|cancel|dispute|gap) ;; *) fail "FIAT_STEPS: no trade called $step" ;; esac
   log "trade: $step"
   python3 "$HERE/fiat.py" "$step" || { instance_log 80; fail "the $step trade"; }
 done
 
-log "FIAT E2E PASS: upstream mostro-cli traded on a bipnip instance with real LND nodes: a sell and a buy paid out, a cooperative cancel returned the held sats, and a dispute was settled by a solver"
+[ -z "${FIAT_STEPS:-}" ] || { log "FIAT E2E PASS, these trades only: $FIAT_STEPS"; exit 0; }
+log "FIAT E2E PASS: upstream mostro-cli traded on a bipnip instance with real LND nodes: a sell and a buy paid out, a cooperative cancel returned the held sats, a dispute was settled by a solver, and a release lost while the instance was stopped was sent again and paid out"

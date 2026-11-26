@@ -7,17 +7,21 @@ Run by run-fiat.sh inside a throwaway regtest VM, never anywhere else. Standard 
 
     fiat.py setup                 local identities for seller, buyer and solver; the solver is added
     fiat.py sell|buy|cancel|dispute
+    fiat.py gap                   a sell with the instance stopped across the seller's release
 
 The environment names the pieces (set by run-fiat.sh): W, MCLI, INSTANCE_DB, INSTANCE_NSEC,
-SOLVER_NSEC, SOLVER_PUB, LNC_SELLER and LNC_BUYER (lncli command lines).
+SOLVER_NSEC, SOLVER_PUB, LNC_SELLER and LNC_BUYER (lncli command lines); `gap` also needs
+INSTANCE_PID.
 """
 
 import json
 import os
 import shlex
+import signal
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import uuid
 
@@ -145,13 +149,16 @@ class Trade:
             ok(role, "order", "fiat-sent", "--order", self.order, "--yes")
             log(f"{self.name}: {role} says the fiat was sent")
         elif step == "release":
-            ok(role, "order", "release", "--order", self.order, "--yes")
-            log(f"{self.name}: {role} released")
+            self.release(role)
         elif step == "rate":
             code, _, text = cli(role, "order", "rate", "--order", self.order, "--rating", "5", "--yes")
             log(f"{self.name}: {role} rated" if code == 0 else f"{self.name}: {role} could not rate: {text[-200:]}")
         else:
             raise Fail(f"{self.name}: the instance asked {role} for {step}, which this run never expects")
+
+    def release(self, role):
+        ok(role, "order", "release", "--order", self.order, "--yes")
+        log(f"{self.name}: {role} released")
 
     def drive(self, until, what):
         """Answers both sides until `until(status)` holds; fails after STEP_SECS."""
@@ -284,8 +291,36 @@ def dispute():
     log(f"dispute: the hold invoice was settled by the solver's decision and the buyer received {paid} sat")
 
 
+GAP_SECS = 40
+
+
+def gap():
+    """The instance stops answering across the seller's release, as when it restarts (#63). Upstream
+    Mostro subscribes to new events only and drops a request more than 10 s old, so a release sent
+    while it is stopped is lost, and mostro-cli calls it `uncertain`. The trade must still end."""
+    pid = int(os.environ["INSTANCE_PID"])
+    trade = Trade("gap", maker="seller")
+    trade.blocked = {"release"}
+    trade.open("sell")
+    trade.take("buyer", "take-sell")
+    trade.drive(lambda s: s == "fiat-sent", "the buyer says the fiat was sent")
+    os.kill(pid, signal.SIGSTOP)
+    log(f"gap: the instance is stopped for {GAP_SECS} s; the seller releases")
+    thaw = threading.Timer(GAP_SECS, os.kill, (pid, signal.SIGCONT))
+    thaw.start()
+    try:
+        trade.release("seller")
+    finally:
+        thaw.cancel()
+        os.kill(pid, signal.SIGCONT)
+    trade.drive(lambda s: s == "success", "paid out to the buyer")
+    trade.hold_ends("SUCCEEDED")
+    paid = trade.buyer_paid()
+    log(f"gap: the release landed after the instance came back and the buyer's node received {paid} sat")
+
+
 if __name__ == "__main__":
-    steps = {"setup": setup, "sell": sell, "buy": buy, "cancel": cancel, "dispute": dispute}
+    steps = {"setup": setup, "sell": sell, "buy": buy, "cancel": cancel, "dispute": dispute, "gap": gap}
     try:
         steps[sys.argv[1]]()
     except Fail as e:
