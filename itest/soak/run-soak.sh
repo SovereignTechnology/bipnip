@@ -163,7 +163,7 @@ lnd_cmd() { # name: the command line, one word a line (also handed to the driver
     "--bitcoind.rpchost=127.0.0.1:$RPCPORT" --bitcoind.rpcuser=soak --bitcoind.rpcpass=soak \
     --bitcoind.zmqpubrawblock=tcp://127.0.0.1:28332 --bitcoind.zmqpubrawtx=tcp://127.0.0.1:28333 \
     --noseedbackup "--rpclisten=127.0.0.1:${RPC[$1]}" "--restlisten=127.0.0.1:${REST[$1]}" \
-    "--listen=127.0.0.1:${P2P[$1]}" "--alias=$1" --trickledelay=1000
+    "--listen=127.0.0.1:${P2P[$1]}" "--externalip=127.0.0.1:${P2P[$1]}" "--alias=$1" --trickledelay=1000
 }
 declare -A LND_PID
 for n in alice bob carol; do
