@@ -7,17 +7,21 @@ Run by run-fiat.sh inside a throwaway regtest VM, never anywhere else. Standard 
 
     fiat.py setup                 local identities for seller, buyer and solver; the solver is added
     fiat.py sell|buy|cancel|dispute
+    fiat.py gap                   a sell with the instance stopped across the seller's release
 
 The environment names the pieces (set by run-fiat.sh): W, MCLI, INSTANCE_DB, INSTANCE_NSEC,
-SOLVER_NSEC, SOLVER_PUB, LNC_SELLER and LNC_BUYER (lncli command lines).
+SOLVER_NSEC, SOLVER_PUB, LNC_SELLER and LNC_BUYER (lncli command lines); `gap` also needs
+INSTANCE_PID.
 """
 
 import json
 import os
 import shlex
+import signal
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import uuid
 
@@ -44,7 +48,11 @@ def cli(who, *args, json_out=True, admin_nsec=None, timeout=120):
     if admin_nsec:
         env["ADMIN_NSEC"] = admin_nsec
     argv = [MCLI, *(["--output", "json"] if json_out else []), *args]
-    done = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=timeout)
+    try:
+        done = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # A failure of the step, not of the driver: the caller fails it and the cleanup still runs.
+        return 124, None, f"mostro-cli {' '.join(args[:2])} did not finish within {timeout:.0f} s"
     doc = None
     if json_out:
         try:
@@ -69,13 +77,29 @@ def lnc(role, *args):
     return json.loads(done.stdout)
 
 
-def status(order):
-    """The order's status as the instance's own database has it (read-only)."""
+def lookup(table, column, key_column, order):
+    """One column of the row for `order`, as the instance's own database has it (read-only). Table
+    and column names come from this file only."""
     # The daemon keeps an order's id as a UUID's 16 bytes; text is looked for too.
     with sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=10) as db:
-        row = db.execute("SELECT status FROM orders WHERE id = ? OR id = ?",
+        row = db.execute(f"SELECT {column} FROM {table} WHERE {key_column} = ? OR {key_column} = ?",
                          (uuid.UUID(order).bytes, order)).fetchone()
     return row[0] if row else None
+
+
+def status(order):
+    return lookup("orders", "status", "id", order)
+
+
+CANCELED = ("canceled", "cooperatively-canceled")
+# mostro-cli's error codes for a request the instance never answered (#63).
+UNANSWERED = {"reply_timeout", "relay_connection_failed"}
+
+
+def unanswered(doc):
+    """mostro-cli sent the request and heard nothing back: the instance was down, stalled or out of
+    reach, and may or may not have acted on it."""
+    return bool(doc) and (doc.get("status") == "uncertain" or (doc.get("error") or {}).get("code") in UNANSWERED)
 
 
 class Trade:
@@ -92,6 +116,46 @@ class Trade:
         self.hold = None  # (payment hash, lncli process paying it)
         self.buyer_hash = None
         self.blocked = set()  # next steps this scenario does not answer
+        self.resent = 0  # requests sent again after the instance did not answer
+
+    def act(self, role, landed, *args):
+        """Sends a request that moves the held trade on, the way a careful client does (#63). The
+        instance reads only new events and drops a request more than 10 s old (upstream Mostro), so
+        one sent while it is down or stalled is lost for good, and mostro-cli calls it `uncertain`.
+        The order is then checked: `landed()` says the step happened; if it did not, the request
+        goes again until it does, for up to STEP_SECS. Returns the reply's data, or {} when an
+        earlier try is the one that landed."""
+        deadline = time.time() + STEP_SECS
+        first = True
+        while True:
+            left = deadline - time.time()  # every send and wait fits in what is left of STEP_SECS
+            if not first:
+                if left <= 0:
+                    raise Fail(f"{role}: mostro-cli {' '.join(args)} was not answered within {STEP_SECS} s: "
+                               f"{text.strip()[-600:]}")
+                self.resent += 1  # counted only when a request really goes again
+            first = False
+            code, doc, text = cli(role, *args, timeout=max(1, min(120, left)))
+            if code == 0 and doc and doc.get("status") == "ok":
+                return doc.get("data") or {}
+            if landed():  # an earlier try landed, and this one was refused for the status it left
+                return {}
+            if not unanswered(doc):
+                raise Fail(f"{role}: mostro-cli {' '.join(args)} failed ({code}): {text.strip()[-600:]}")
+            log(f"{self.name}: {role}'s {args[0]} {args[1]} was not answered; checking the order before sending it again")
+            until = min(deadline, time.time() + 10)
+            while time.time() < until:
+                time.sleep(max(0, min(2, until - time.time())))
+                if landed():
+                    return {}
+
+    def canceled_by(self, role):
+        """The role's cancel landed: the order is canceled, or the role asked for a cooperative one."""
+        assert role in ("seller", "buyer")
+        return status(self.order) in CANCELED or bool(lookup("orders", f"{role}_cooperativecancel", "id", self.order))
+
+    def cancel(self, role):
+        self.act(role, lambda: self.canceled_by(role), "order", "cancel", "--order", self.order, "--yes")
 
     def open(self, side):
         args = ["order", "new", "--side", side, "--currency", "USD", "--fiat-amount", "10",
@@ -138,20 +202,25 @@ class Trade:
             invoice = lnc(role, "addinvoice", "--amt", str(amount), "--memo", "bipnip fiat itest",
                           "--expiry", "7200")
             self.buyer_hash = invoice["r_hash"]
-            ok(role, "order", "add-invoice", "--order", self.order, "--invoice",
-               invoice["payment_request"], "--yes")
+            self.act(role, lambda: lookup("orders", "buyer_invoice", "id", self.order) is not None,
+                     "order", "add-invoice", "--order", self.order, "--invoice", invoice["payment_request"], "--yes")
             log(f"{self.name}: {role} sent an invoice for {amount} sat")
         elif step == "fiat_sent":
-            ok(role, "order", "fiat-sent", "--order", self.order, "--yes")
+            self.act(role, lambda: status(self.order) in ("fiat-sent", "dispute", "settled-hold-invoice", "success"),
+                     "order", "fiat-sent", "--order", self.order, "--yes")
             log(f"{self.name}: {role} says the fiat was sent")
         elif step == "release":
-            ok(role, "order", "release", "--order", self.order, "--yes")
-            log(f"{self.name}: {role} released")
+            self.release(role)
         elif step == "rate":
             code, _, text = cli(role, "order", "rate", "--order", self.order, "--rating", "5", "--yes")
             log(f"{self.name}: {role} rated" if code == 0 else f"{self.name}: {role} could not rate: {text[-200:]}")
         else:
             raise Fail(f"{self.name}: the instance asked {role} for {step}, which this run never expects")
+
+    def release(self, role):
+        self.act(role, lambda: status(self.order) in ("settled-hold-invoice", "success"),
+                 "order", "release", "--order", self.order, "--yes")
+        log(f"{self.name}: {role} released")
 
     def drive(self, until, what):
         """Answers both sides until `until(status)` holds; fails after STEP_SECS."""
@@ -246,7 +315,7 @@ def cancel():
     trade.take("buyer", "take-sell")
     trade.drive(lambda s: s == "active", "held: the seller paid and the buyer sent an invoice")
     for role in ("seller", "buyer"):
-        ok(role, "order", "cancel", "--order", trade.order, "--yes")
+        trade.cancel(role)
         log(f"cancel: {role} asks to cancel")
     trade.drive(lambda s: s in ("cooperatively-canceled", "canceled"), "canceled by both")
     trade.hold_ends("FAILED")
@@ -260,8 +329,12 @@ def dispute():
     trade.open("sell")
     trade.take("buyer", "take-sell")
     trade.drive(lambda s: s == "fiat-sent", "the buyer says the fiat was sent; the seller does not release")
-    data = ok("buyer", "dispute", "open", "--order", trade.order, "--yes")
-    dispute_id = data["dispute_id"]
+    data = trade.act("buyer", lambda: status(trade.order) == "dispute", "dispute", "open", "--order", trade.order, "--yes")
+    dispute_id = data.get("dispute_id") or lookup("disputes", "id", "order_id", trade.order)
+    if isinstance(dispute_id, bytes):
+        dispute_id = str(uuid.UUID(bytes=dispute_id))
+    if not dispute_id:
+        raise Fail("dispute: the order is in dispute but no dispute row names it")
     log(f"dispute: the buyer opened dispute {dispute_id}")
     solver = os.environ["SOLVER_NSEC"]
     deadline = time.time() + STEP_SECS
@@ -273,9 +346,18 @@ def dispute():
             raise Fail(f"dispute: the solver could not take it: {text.strip()[-600:]}")
         time.sleep(3)
     log("dispute: the solver took it")
-    code, _, text = cli("solver", "admsettle", "-o", trade.order, json_out=False, admin_nsec=solver)
-    if code != 0:
-        raise Fail(f"dispute: the solver could not settle: {text.strip()[-600:]}")
+    # Sent again until it lands, like every step that moves a held trade on (#63).
+    settled = ("settled-hold-invoice", "success", "settled-by-admin", "completed-by-admin")
+    deadline = time.time() + STEP_SECS
+    while True:
+        code, _, text = cli("solver", "admsettle", "-o", trade.order, json_out=False, admin_nsec=solver)
+        if code == 0 or status(trade.order) in settled:
+            break
+        if time.time() > deadline:
+            raise Fail(f"dispute: the solver could not settle: {text.strip()[-600:]}")
+        trade.resent += 1
+        log("dispute: the solver's settle was not answered; sending it again")
+        time.sleep(5)
     log("dispute: the solver settled it for the buyer")
     trade.blocked = {"release", "fiat_sent"}
     trade.drive(lambda s: s in ("success", "settled-by-admin", "completed-by-admin"), "settled by the solver")
@@ -284,17 +366,55 @@ def dispute():
     log(f"dispute: the hold invoice was settled by the solver's decision and the buyer received {paid} sat")
 
 
+GAP_SECS = 40
+
+
+def gap():
+    """The instance stops answering across the seller's release, as when it restarts (#63). Upstream
+    Mostro subscribes to new events only and drops a request more than 10 s old, so a release sent
+    while it is stopped is lost, and mostro-cli calls it `uncertain`. The trade must still end."""
+    pid = int(os.environ["INSTANCE_PID"])
+    trade = Trade("gap", maker="seller")
+    trade.blocked = {"release"}
+    trade.open("sell")
+    trade.take("buyer", "take-sell")
+    trade.drive(lambda s: s == "fiat-sent", "the buyer says the fiat was sent")
+    os.kill(pid, signal.SIGSTOP)
+    log(f"gap: the instance is stopped for {GAP_SECS} s; the seller releases")
+    thaw = threading.Timer(GAP_SECS, os.kill, (pid, signal.SIGCONT))
+    before = trade.resent
+    thaw.start()
+    try:
+        trade.release("seller")
+    finally:
+        thaw.cancel()
+        os.kill(pid, signal.SIGCONT)
+    again = trade.resent - before
+    if not again:
+        raise Fail("gap: the release was never sent again, so the gap tested nothing")
+    log(f"gap: the seller sent the release {again + 1} times")
+    trade.drive(lambda s: s == "success", "paid out to the buyer")
+    trade.hold_ends("SUCCEEDED")
+    paid = trade.buyer_paid()
+    log(f"gap: the release landed after the instance came back and the buyer's node received {paid} sat")
+
+
 if __name__ == "__main__":
-    steps = {"setup": setup, "sell": sell, "buy": buy, "cancel": cancel, "dispute": dispute}
+    steps = {"setup": setup, "sell": sell, "buy": buy, "cancel": cancel, "dispute": dispute, "gap": gap}
     try:
         steps[sys.argv[1]]()
     except Fail as e:
         log(f"FAIL: {e}")
-        # Leave nothing open: a pending order of one side's would refuse that side's next take.
+        # Leave nothing open: a pending order of one side's would refuse that side's next take, and a
+        # held one keeps the seller's sats with nobody left to act (#63). Both sides cancel, each
+        # until it lands; a cooperative cancel gives the seller's sats back.
         trade = Trade.current
         if trade is not None and trade.order:
             for who in ("seller", "buyer"):
-                code, _, text = cli(who, "order", "cancel", "--order", trade.order, "--yes")
-                log(f"cleanup: {who} cancel of {trade.order}: " + ("ok" if code == 0 else text.strip()[-160:]))
+                try:
+                    trade.cancel(who)
+                    log(f"cleanup: {who} cancel of {trade.order}: ok")
+                except Fail as e:
+                    log(f"cleanup: {who} cancel of {trade.order}: {str(e)[-160:]}")
             log(f"cleanup: the order is {status(trade.order)}")
         sys.exit(1)
