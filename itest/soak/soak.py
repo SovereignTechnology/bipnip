@@ -317,7 +317,28 @@ def restart(proc, down_secs):
         finding("did-not-come-back", False, process=proc.name)
 
 
+def carol_peers():
+    """carol's connected peers, or None when listpeers fails, which is not the same as no peers."""
+    code, out, _ = run([*LNC["carol"], "listpeers"])
+    if code != 0:
+        return None
+    try:
+        return {p["pub_key"] for p in json.loads(out).get("peers", [])}
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
 def restart_carol():
+    for _ in range(3):
+        before = carol_peers()
+        if before is not None:
+            break
+        time.sleep(5)
+    else:
+        # Without the peers she has now there is nothing to check her recovery against: skip this
+        # restart rather than make one that goes unchecked.
+        note("fault-error", what="carol", error="listpeers failed before the restart; restart skipped")
+        return
     quiet_until["carol"] = time.time() + 900
     run([*LNC["carol"], "stop"])
     time.sleep(rng.uniform(10, 60))
@@ -325,12 +346,30 @@ def restart_carol():
     subprocess.Popen([a for a in argv if a], stdout=open(f"{W}/carol/lnd.log", "a"), stderr=subprocess.STDOUT,
                      stdin=subprocess.DEVNULL, start_new_session=True)
     deadline = time.time() + 300
-    while time.time() < deadline:
+    while True:
         code, out, _ = run([*LNC["carol"], "getinfo"])
         if code == 0 and json.loads(out).get("synced_to_chain"):
+            break
+        if time.time() > deadline:
+            finding("did-not-come-back", True, process="carol (the instance's LND)")
             return
         time.sleep(5)
-    finding("did-not-come-back", True, process="carol (the instance's LND)")
+    # Every peer she had must reconnect: an HTLC on the channel of one that does not is stranded until it
+    # expires, and shows only hours later as htlc-stuck (#65).
+    deadline = time.time() + 300
+    missing, failed = before, False
+    while True:
+        now = carol_peers()  # a failed query means not back yet, never back
+        failed = now is None
+        if not failed:
+            missing = before - now
+            if not missing:
+                return
+        if time.time() > deadline:
+            finding("peers-not-back", False, process="carol (the instance's LND)",
+                    missing=len(missing), had=len(before), query_failed=failed)
+            return
+        time.sleep(5)
 
 
 def faults(procs):
